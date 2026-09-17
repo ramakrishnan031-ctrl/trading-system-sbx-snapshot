@@ -15,7 +15,7 @@
 - **Byte-exact:** line-ending conversion is disabled for this repository (`.git/info/attributes`: `* -text`); every committed blob equals the VM's bytes (sha256 verified file by file). File modes: executable bits copied from the VM.
 
 ## 3. Contents
-- **1395 files** including this manifest; **23,966,042 bytes** before this manifest.
+- **1418 files** including this manifest; **24,176,123 bytes** before this manifest.
 - `_machine/` -- machine state that lives OUTSIDE the tree, captured as text:
   - `_machine/bare-repo-hooks/post-receive`
   - `_machine/bare-repo-hooks/post-receive.pre-cron-framework.bak`
@@ -30,6 +30,7 @@
   - `_machine/systemd/trading-watchman.service.txt`
   (`crontab_ubuntu.txt` = `crontab -l`; `systemd/*.txt` = `systemctl cat <unit>` incl. drop-ins; `bare-repo-hooks/` = the hooks INSTALLED in the bare repository, which may differ from `deploy/hooks/`.)
 - **Kept IN by explicit instruction although they are data files:** `config/instruments.csv` (reference data) · `config/cron_registry.yaml`.
+- **Reference data added in commit 2 (17-Sep ~20:50 IST, instruction D3):** the 23 CSVs under `config/reference_data/` and `tests/fixtures/reference_data/` -- read again from the VM (sizes identical to the 20:06 inventory), split by CONTENT: all 23 are genuine reference data (17 index-member symbol lists, the NSE security master with symbol / company / series / lot / ISIN / face value, 5 small test fixtures of the same kinds); no account identifiers, no trade, P&L or position fields; every credential scan clean. The 34 docs screenshots STAY OUT (unscannable).
 
 ## 4. Credential scan -- values never printed, never copied off the VM
 - **VM-side (in memory, on the VM):** 25 distinct secret values from `.env`, two pre-rotation `.env` backups under `/home/ubuntu/preserved/`, `data_store/session/zerodha_token.json` (`access_token`, `api_key`), `data_store/session/gui_secret_key`, plus 14 more values harvested from `/home/ubuntu/.gemini` (2,406 files read) under Zerodha/Telegram/webhook/SMTP key names of several accounts. Shape rules: PEM private keys · Telegram bot tokens · GitHub/AWS/Slack tokens · quoted assignment literals. `.docx`/zip members decompressed and scanned.
@@ -58,10 +59,11 @@
   - **G8 -- bare token shapes with no key name** (32-char base32 TOTP seeds; 32-char lowercase non-hex alphanumerics, so md5 hashes are not flagged; 32-char mixed-case alphanumerics; 16-char lowercase API-key shapes): 67 hits -- 1 real (the same TOTP secret, already excluded); 57 inside two base64 `data:image/webp` URIs in dashboard HTML templates; 8 CamelCase test identifiers; 1 scanner-test fixture.
 - **Name-rule false positives, adjudicated:** `docs/audit/critical_alert_stream_audit_25jul2026.md` (a document about alerts, not an alert copy) and `tests/unit/test_gui_secret_key.py` (test code) matched an exclusion NAME pattern; both are code/documentation and scanned clean -- kept.
 - **Files the tree's own `.gitignore` hides, added deliberately** (they are machine files and scanned clean): `config/instruments.csv` · `docs/system_manuals/chartink_mounted_strategies.docx` · `docs/system_manuals/config_file_guide.docx` · `docs/system_manuals/trading_System_v2_runbook.docx` · `memory/token_workflow_confirmed_21-Jun-2026.md` · `_machine/bare-repo-hooks/post-receive.pre-cron-framework.bak`.
+- ⚠️ **EXCLUSION IS NOT REMEDIATION.** The files excluded here for credential content STILL EXIST on the machine (and, for the three LFL836-key files, on the PC and in git history) -- keeping them out of this repository only means the snapshot did not make the exposure worse. Dealing with the exposure is the owner's decision, separate from this snapshot.
 - **Limits:** the PRODUCTION VM's own `.env` was NOT read (production access not yet approved) -- a credential that exists ONLY there is covered by the shape rules alone. Image content cannot be scanned for credentials -- the screenshots under `docs/` are excluded for that reason.
 
 ## 5. EVERY exclusion, by name
-**3,939 files, 18,208,797,188 bytes, not in this repository.** Nothing is omitted silently: each class below lists every file with its size.
+**3,916 files, 18,208,587,107 bytes, not in this repository.** Nothing is omitted silently: each class below lists every file with its size.
 
 | Class (what the files hold / why excluded) | Files | Bytes |
 |---|---:|---:|
@@ -77,7 +79,6 @@
 | screenshot image under docs/ -- content not credential-scannable; may show real trade data -- left OUT until asked | 34 | 8,105,678 |
 | runtime data file (CSV/JSON/HTML/state) -- trade history, account identifiers | 203 | 1,288,070 |
 | alert copy (sentinel) -- alert text, account tags | 53 | 967,897 |
-| reference data -- left OUT until asked (card Q4) | 23 | 210,081 |
 | data file (CSV/JSON/HTML) -- may carry trade history or account identifiers | 10 | 204,213 |
 | CONTAINS A CREDENTIAL VALUE (a real-looking Zerodha API key, account LFL836) -- found by the value scan | 3 | 33,105 |
 | CONTAINS A CREDENTIAL VALUE (a real Telegram channel ID; the card counts chat IDs as credentials) -- found by the PC-side value scan | 3 | 30,128 |
@@ -4015,34 +4016,6 @@
 | `data_store/critical_alert_20260917_180001_de4ecbfe.delivered` | 1,164 |
 | `data_store/critical_alert_20260917_184511_12465676.delivered` | 7,198 |
 | `data_store/critical_alert_20260917_185002_30f2b30c.delivered` | 53,136 |
-
-### reference data -- left OUT until asked (card Q4)
-
-| Path | Bytes |
-|---|---:|
-| `config/reference_data/index_members/fno_symbols.csv` | 1,669 |
-| `config/reference_data/index_members/nifty100.csv` | 806 |
-| `config/reference_data/index_members/nifty50.csv` | 415 |
-| `config/reference_data/index_members/nifty_auto.csv` | 138 |
-| `config/reference_data/index_members/nifty_bank.csv` | 129 |
-| `config/reference_data/index_members/nifty_fin_services.csv` | 179 |
-| `config/reference_data/index_members/nifty_fmcg.csv` | 125 |
-| `config/reference_data/index_members/nifty_healthcare.csv` | 184 |
-| `config/reference_data/index_members/nifty_it.csv` | 72 |
-| `config/reference_data/index_members/nifty_metal.csv` | 132 |
-| `config/reference_data/index_members/nifty_midcap_select.csv` | 224 |
-| `config/reference_data/index_members/nifty_next50.csv` | 398 |
-| `config/reference_data/index_members/nifty_oil_gas.csv` | 106 |
-| `config/reference_data/index_members/nifty_pharma.csv` | 187 |
-| `config/reference_data/index_members/nifty_private_bank.csv` | 105 |
-| `config/reference_data/index_members/nifty_psu_bank.csv` | 96 |
-| `config/reference_data/index_members/nifty_realty.csv` | 92 |
-| `config/reference_data/security_master_file.csv` | 204,514 |
-| `tests/fixtures/reference_data/index_members/fno_symbols.csv` | 21 |
-| `tests/fixtures/reference_data/index_members/nifty_bank.csv` | 25 |
-| `tests/fixtures/reference_data/index_members/nifty_it.csv` | 20 |
-| `tests/fixtures/reference_data/index_members/nifty_private_bank.csv` | 16 |
-| `tests/fixtures/reference_data/security_master_small.csv` | 428 |
 
 ### data file (CSV/JSON/HTML) -- may carry trade history or account identifiers
 
