@@ -1,0 +1,155 @@
+# config/security.yaml — VM Security Manager (Phase 1)
+#
+# Read DIRECTLY by scripts/security_monitor.py (yaml.safe_load), NOT by the
+# trading app's config_loader. This is deliberate: SystemConfig uses
+# extra="forbid", so a `security:` key in system_config.yaml would break
+# main.py startup. The security watcher is standalone, so it owns this file.
+#
+# Alert-ONLY. Nothing here blocks access — key-only SSH is the gate.
+
+security:
+  enabled: true
+
+  # Active sessions: ALERT (never block) if exceeded. Rama may run a couple of
+  # multiplexed sessions (PowerShell + VS Code Claude); 2 is a soft signal.
+  max_active_sessions: 2
+
+  # Failed/invalid login rate per hour. Baseline is ~145/hr from the botnet;
+  # alert only on a clear anomaly (≈3.5x). Tune from real data.
+  failed_login_spike_threshold: 500
+
+  # Root login probes per hour (constant internet noise, blocked by key-auth).
+  root_probe_spike_threshold: 400
+
+  # Alert on a successful key login from a not-previously-seen IP. Rama's IPs
+  # change (Jio/Airtel) so this is a "was this you?" nudge, NOT a block.
+  new_ip_alert: true
+
+  # Alert on non-whitelisted sudo commands (INFO).
+  sudo_alert: true
+  sudo_whitelist_prefixes:        # exact VM paths (verified 19-Jun)
+    - /usr/bin/systemctl
+    - /bin/systemctl
+    - /usr/bin/fail2ban-client
+    - /usr/sbin/augenrules
+    - /usr/sbin/auditctl
+    - /usr/sbin/ausearch
+    - /usr/bin/journalctl
+    - /usr/bin/grep
+    - /usr/bin/tail
+    - /usr/bin/cat
+    - /usr/bin/ss    # security_monitor's own established_ssh_connections() (needs sudo for the pid column)
+    - /usr/bin/ps    # security_monitor's own process_start_and_user() (session-alert "since ?" fallback)
+
+  # Don't re-alert the same identity (same new key/IP/file-hash) within this
+  # many seconds. 6h = one nudge, not a 60s stream.
+  realert_cooldown_sec: 21600
+
+  # 26-Jul-2026 (SS-B). The cooldown above is only the FIRST interval. A condition
+  # that is merely STILL PRESENT backs off along this ladder -- multiples of
+  # realert_cooldown_sec, per repeat, last value capped -- and every repeat after
+  # the first is downgraded out of CRITICAL. Left as config so the shape can be
+  # retuned without a deploy: [1, 4, 28] = 6h, then 24h, then 7d forever.
+  # Rationale: the pre-SS-B ledger re-fired at full CRITICAL every 6h forever, which
+  # is how ONE stale SSH baseline produced 37 CRITICAL emails -- 45% of the whole
+  # delivered stream -- over 9 days and two key rotations.
+  realert_backoff_multipliers: [1, 4, 28]
+
+  # How long a condition must be ABSENT before its return counts as a RECURRENCE
+  # ("true again", alerted immediately at full severity) rather than a flicker in a
+  # continuing episode. The watcher passes every ~60s, so 300s tolerates a few
+  # missed passes. Set too low and a flapping condition re-earns CRITICAL every few
+  # minutes; too high and a real recurrence is read as persistence.
+  realert_presence_gap_sec: 300
+
+  # 26-Jul-2026 — the ONE check in this watcher that is not about security.
+  # config/nse_holidays_<year>.yaml is a HARD boot requirement (load_all() raises
+  # ConfigMissingError if it is absent, MEASURED), but only NSE can supply the
+  # dates and only Rama can commit them. So the watcher — the one process that is
+  # always on, independent of cron AND of the trading service — asks for it.
+  #   alert      : master switch. false = no reminder at all.
+  #   lead_days  : days back from 31-Dec at which the NEXT year's file becomes
+  #                due. 16 => the reminder opens on 15-Dec, matching the window
+  #                Rama reserves for this. The suite's tripwire fires earlier
+  #                (1-Dec) on purpose: developer first, then the email.
+  #   final_days : days back from 31-Dec at which it ESCALATES. 3 => 28-Dec.
+  #                This is a second CRITICAL, on purpose. One email is thin cover
+  #                for an outage with a known date, and the backoff downgrades
+  #                everything after the first notice out of CRITICAL — so without
+  #                this, missing ONE message on 15-Dec means the next thing you
+  #                hear is a service that will not start.
+  #                It is NOT a way around the "never CRITICAL twice" rule: the
+  #                key carries a PHASE, and a phase has three possible values
+  #                ever, so this can raise at most three CRITICALs per file per
+  #                year. Putting the DATE in the key instead was measured at 17.
+  #                Must stay BELOW lead_days or you get one escalation, not two.
+  # The CURRENT year's file is due unconditionally — if that one is missing the
+  # boot is already dead and nothing else on the box will say so.
+  # It clears itself: the file existing IS the resolution.
+  holiday_calendar_alert: true
+  holiday_calendar_lead_days: 16
+  holiday_calendar_final_days: 3
+
+  # Known-good SSH baseline. check_authorized_keys alerts if the count grows or
+  # a non-matching fingerprint appears. This committed value is the DEFAULT; an
+  # operator override (data_store/security/ssh_key_baseline.json, written by
+  # scripts/approve_ssh_keys.py) takes precedence when present and survives
+  # deploys. After ANY legitimate SSH key rotation, run `approve_ssh_keys --apply`.
+  # 28-Jun-2026: baseline updated DrHT9… -> uDRN8… for Rama's LEGITIMATE key
+  # rotation (Airtel/Tamil-Nadu IP 223.237.190.224, ED25519 "oracle-vm-2026").
+  #
+  # 26-Jul-2026: deliberate SSH re-baseline after a legitimate key rotation.
+  # uDRN8BJT... -> 9WRshnFM... (ED25519, comment "trading-vm"). Rama confirmed he
+  # renamed the old keys, created new ones under the same filenames, registered
+  # and authorised them on the VM, and deleted the old files. Evidence matches:
+  # authorized_keys was rewritten 23-Jul 21:47:26 down to a SINGLE line, the old
+  # key BRi6UmV8... was last accepted 23-Jul 21:34 and the new one first accepted
+  # 21:45:57, and 9WRshnFM... is the key every current session authenticates with.
+  # NOTE this is the DEFAULT/fallback only: approve_ssh_keys.py --apply wrote the
+  # operator override at 2026-07-26T00:24:00+05:30, and the override REPLACES this
+  # value while it exists (apply_operator_ssh_baseline). It is updated here so the
+  # committed fallback is CORRECT if the override is ever lost (data_store is not
+  # git-tracked) -- a stale fallback would restart the 6-hourly CRITICAL loop.
+  # It is NOT blanked, because an empty allow-list makes check_authorized_keys
+  # skip the unexpected-key test entirely (`if allowed:`) -- silently disabling
+  # the check is worse than a wrong value.
+  expected_ssh_keys: 1
+  expected_key_fingerprint: "SHA256:9WRshnFMWRlLCWRPMp5VIdaTUlpIj5dILraFNvilGzg"
+
+  # Auth source (ubuntu is in group adm → readable without sudo).
+  authlog_path: /var/log/auth.log
+  sentinel_dir: data_store
+
+  # Sensitive files: content-hash watched (hash, not mtime, so a no-op git
+  # deploy does not false-alarm). authorized_keys is handled by its own check.
+  watched_files:
+    - { path: /home/ubuntu/.ssh/authorized_keys, severity: CRITICAL, label: ssh_authorized_keys }
+    - { path: /etc/ssh/sshd_config,              severity: CRITICAL, label: sshd_config }
+    - { path: /etc/ssh/sshd_config.d/99-trading-security.conf, severity: CRITICAL, label: sshd_hardening_dropin }
+    - { path: /etc/sudoers,                      severity: CRITICAL, label: sudoers }
+    - { path: /etc/systemd/system/trading-system.service, severity: CRITICAL, label: unit_trading }
+    - { path: /etc/systemd/system/security-watcher.service, severity: CRITICAL, label: unit_security }
+    - { path: /home/ubuntu/systems/trading-system/.env, severity: CRITICAL, label: dotenv }
+    - { path: /home/ubuntu/systems/trading-system/config/system_config.yaml, severity: WARNING, label: system_config }
+    - { path: /home/ubuntu/systems/trading-system/config/accounts.csv, severity: WARNING, label: accounts_csv }
+
+# ─────────────────────────────────────────────────────────────────────────────
+# PHASE 2 — Copy protection (VM->PC).  TOP-LEVEL key (sibling of `security:`),
+# read by scripts/copy_gate.py + scripts/request_copy.py, and the on/off-switch
+# transition is watched by scripts/security_monitor.py.
+#
+# Model: VM->PC copies are BLOCKED by default. To copy, mint a short-lived token
+# with `request-copy <reason>`; the copy-guard wrapper (/usr/local/bin/{scp,
+# sftp,rsync}) checks it. A hard TIME-LOCK 18:00-08:00 overrides EVERYTHING
+# (even the off switch / a live token). Disabling `enabled` raises a CRITICAL
+# alert. A raw scp run without a token is caught by the auditd bypass check.
+# ─────────────────────────────────────────────────────────────────────────────
+copy_protection:
+  enabled: true                 # master switch (default ON). OFF -> CRITICAL alert (who/when).
+  token_ttl_minutes: 15         # how long a request-copy token stays valid
+  time_lock_start: 18           # 18:00 IST — nightly hard block begins (ABSOLUTE)
+  time_lock_end: 8              # 08:00 IST — nightly hard block ends
+  max_sessions_for_copy: 2      # > this many active SSH sessions -> copy blocked
+  token_path: /home/ubuntu/systems/trading-system/data_store/security/copy_token.json
+  audit_log_path: /home/ubuntu/systems/trading-system/data_store/security/copy_audit.log
+  sentinel_dir: data_store

@@ -1,0 +1,767 @@
+# Cron Job Registry — SINGLE EXECUTABLE SOURCE OF TRUTH (Phase 3).
+# Read by core/cron_registry.py; generates deploy/cron/trading-system.cron
+# via scripts/generate_crontab.py --generate. Edit jobs HERE, regenerate.
+# Generation fields (cron_expression/command/env_wrapper/log_target/marker_name)
+# are authoritative; `schedule` is documentation. enabled:false = not generated.
+
+jobs:
+  log_cleanup:
+    script: find logs -name '*.log' -mtime +30 -delete
+    schedule: 00:00 daily
+    type: shell
+    critical: false
+    market_day_only: false
+    cadence: daily
+    monitored: false
+    enabled: true
+    personal_tooling: false
+    cron_expression: 0 0 * * *
+    command: find /home/ubuntu/systems/trading-system/logs -name '*.log' -mtime +30 -delete
+    env_wrapper: none
+    marker_name: log_cleanup
+  db_backup:
+    script: sqlite3 trading_system.db .backup backups/trading_system-<date>.db
+    schedule: 01:00 daily
+    type: shell
+    critical: true
+    market_day_only: false
+    cadence: daily
+    monitored: false
+    enabled: true
+    personal_tooling: false
+    cron_expression: 0 1 * * *
+    command: sqlite3 /home/ubuntu/systems/trading-system/data_store/trading_system.db ".backup /home/ubuntu/systems/trading-system/data_store/backups/trading_system-$(date +\%Y-\%m-\%d).db"
+    env_wrapper: none
+    log_target: '>> /home/ubuntu/systems/trading-system/logs/cron-db-backup.log 2>&1'
+    marker_name: db_backup
+  analytics_backup:
+    script: sqlite3 analytics.db .backup backups/analytics-<date>.db
+    schedule: 01:05 daily
+    type: shell
+    critical: true
+    market_day_only: false
+    cadence: daily
+    monitored: false
+    enabled: true
+    personal_tooling: false
+    cron_expression: 5 1 * * *
+    command: sqlite3 /home/ubuntu/systems/trading-system/data_store/analytics.db ".backup /home/ubuntu/systems/trading-system/data_store/backups/analytics-$(date +\%Y-\%m-\%d).db"
+    env_wrapper: none
+    log_target: '>> /home/ubuntu/systems/trading-system/logs/cron-db-backup.log 2>&1'
+    marker_name: analytics_backup
+  backup_retention:
+    script: scripts/backup_retention.py --apply (category-aware keep-N reaper; replaces find -mtime +7)
+    schedule: 02:00 daily
+    type: python
+    critical: false
+    market_day_only: false
+    cadence: daily
+    monitored: true
+    enabled: true
+    personal_tooling: false
+    cron_expression: 0 2 * * *
+    command: scripts/backup_retention.py --apply
+    env_wrapper: python
+    log_target: '>> logs/cron-backup-retention.log 2>&1'
+    marker_name: backup_retention
+  evidence_backup:
+    script: scripts/backup_evidence.py (Batch 1 forward evidence -> data_store/backups/evidence/; a SAME-DISK copy, NOT off-box)
+    schedule: 01:10 daily
+    type: python
+    critical: false
+    market_day_only: false
+    cadence: daily
+    monitored: true
+    enabled: true
+    personal_tooling: false
+    cron_expression: 10 1 * * *
+    command: scripts/backup_evidence.py
+    env_wrapper: python
+    log_target: '>> logs/cron-evidence-backup.log 2>&1'
+    marker_name: evidence_backup
+  sentinel_retention:
+    script: find data_store critical_alert_*.delivered -mtime +7 -delete (never *.flag)
+    schedule: 02:05 daily
+    type: shell
+    critical: false
+    market_day_only: false
+    cadence: daily
+    monitored: false
+    enabled: true
+    personal_tooling: false
+    cron_expression: 5 2 * * *
+    command: find /home/ubuntu/systems/trading-system/data_store -maxdepth 1 -name "critical_alert_*.delivered" -mtime +7 -delete
+    env_wrapper: none
+    log_target: '>> /home/ubuntu/systems/trading-system/logs/cron-sentinel-retention.log 2>&1'
+    marker_name: sentinel_retention
+  output_retention:
+    # keep-N reaper for reports/output + logs: retain the newest 7 per family,
+    # ranked by the DATE IN THE FILENAME. That is 7 TRADING days by construction
+    # (these producers only write on trading days) -- an mtime rule cannot say
+    # that: `-mtime +7` spans a weekend and keeps ~5 trading days, fewer across a
+    # holiday cluster, so it under-retains by a margin that varies with the
+    # calendar. Filename-ranked also fixes the mtime-drift case (alert_watcher_
+    # 2026-07-28.log carried an mtime of 01-Aug). Keep-N makes the emptying case
+    # structurally impossible; CAP 25/run still guards over-deletion (~4x the
+    # ~6/day steady state). Excludes .gitkeep (git-tracked), .holiday_notified_*
+    # (state) and cron-*.log (append-mode, undated). Refuses anything matching no
+    # family, and anything undated inside a family. NOT a backups job --
+    # data_store/backups stays with backup_retention, data_store/v3/*.jsonl is
+    # never touched.
+    script: scripts/output_retention.py --apply (keep newest 7 per family by filename date; cap 25)
+    schedule: 02:10 daily
+    type: python
+    critical: false
+    market_day_only: false
+    cadence: daily
+    monitored: true
+    enabled: true
+    personal_tooling: false
+    cron_expression: 10 2 * * *
+    command: scripts/output_retention.py --apply
+    env_wrapper: python
+    log_target: '>> logs/cron-output-retention.log 2>&1'
+    marker_name: output_retention
+  db_retention:
+    script: 'scripts/db_retention.py  (Sun: --vacuum)'
+    schedule: 02:30 daily
+    type: python
+    critical: false
+    market_day_only: false
+    cadence: daily
+    monitored: false
+    enabled: true
+    personal_tooling: false
+    cron_expression: 30 2 * * 1-6
+    command: scripts/db_retention.py
+    env_wrapper: python
+    log_target: '>> logs/cron-db-retention.log 2>&1'
+    marker_name: db_retention
+  db_retention_vacuum:
+    script: 'scripts/db_retention.py  (Sun: --vacuum)'
+    schedule: 02:30 daily
+    type: python
+    critical: false
+    market_day_only: false
+    cadence: daily
+    monitored: false
+    enabled: true
+    personal_tooling: false
+    cron_expression: 30 2 * * 0
+    command: scripts/db_retention.py --vacuum
+    env_wrapper: python
+    log_target: '>> logs/cron-db-retention.log 2>&1'
+    marker_name: db_retention
+  token_cleanup:
+    script: rm -f data_store/session/zerodha_token.json
+    schedule: 05:00 daily
+    type: shell
+    critical: false
+    market_day_only: false
+    cadence: daily
+    monitored: false
+    enabled: true
+    personal_tooling: false
+    cron_expression: 0 5 * * *
+    command: rm -f /home/ubuntu/systems/trading-system/data_store/session/zerodha_token.json
+    env_wrapper: none
+    marker_name: token_cleanup
+  cron_officer_briefing:
+    script: scripts/cron_officer.py --briefing
+    schedule: 09:20 daily
+    type: python
+    critical: true
+    market_day_only: false
+    cadence: daily
+    monitored: true
+    enabled: true
+    personal_tooling: false
+    cron_expression: 20 9 * * *
+    command: scripts/cron_officer.py --briefing
+    env_wrapper: python
+    log_target: '>> logs/cron-officer.log 2>&1'
+  disk_monitor:
+    script: scripts/disk_monitor.py
+    schedule: hourly
+    type: python
+    critical: false
+    market_day_only: false
+    cadence: hourly
+    monitored: false
+    enabled: true
+    personal_tooling: false
+    cron_expression: 0 * * * *
+    command: scripts/disk_monitor.py
+    env_wrapper: python_nopath
+    log_target: '>> logs/cron-disk-monitor.log 2>&1'
+    marker_name: disk_monitor
+  auto_refresh_token:
+    script: scripts/auto_refresh_token.py
+    schedule: 08:15 Mon-Fri
+    type: python
+    critical: true
+    market_day_only: true
+    cadence: market_day
+    monitored: true
+    enabled: true
+    personal_tooling: false
+    cron_expression: 15 8 * * 1-5
+    command: scripts/auto_refresh_token.py
+    env_wrapper: python
+    log_target: '>> logs/cron-auto-token.log 2>&1'
+  monitoring_canary:
+    # 15-Jul-2026 monitoring hardening: DAILY self-test of the alert plumbing (email /
+    # telegram / sentinel ingestion / dashboard). QUIET when healthy; a Telegram WARNING on
+    # any failure (falls back to a CRITICAL sentinel if Telegram is down too). The email
+    # check FAILS until ALERT_SMTP_PASSWORD is restored — that is the canary working, not a bug.
+    script: scripts/monitoring_canary.py
+    schedule: 08:20 daily
+    type: python
+    critical: false
+    market_day_only: false
+    cadence: daily
+    monitored: true
+    enabled: true
+    personal_tooling: false
+    cron_expression: 20 8 * * *
+    command: scripts/monitoring_canary.py
+    env_wrapper: python
+    log_target: '>> logs/cron-monitoring-canary.log 2>&1'
+  preflight_phase_a:
+    script: python -m scripts.preflight.orchestrator --phase A
+    schedule: 08:30 Mon-Fri
+    type: python
+    critical: false
+    market_day_only: true
+    cadence: market_day
+    monitored: true
+    detection_method: exit_code_file
+    enabled: true
+    personal_tooling: false
+    cron_expression: 30 8 * * 1-5
+    command: -m scripts.preflight.orchestrator --phase A
+    env_wrapper: python
+    log_target: '>> logs/preflight.log 2>&1'
+    marker_name: preflight_phase_a
+  preflight_phase_b:
+    script: python -m scripts.preflight.orchestrator --phase B
+    schedule: 09:14 Mon-Fri
+    type: python
+    critical: false
+    market_day_only: true
+    cadence: market_day
+    monitored: true
+    detection_method: exit_code_file
+    enabled: true
+    personal_tooling: false
+    cron_expression: 14 9 * * 1-5
+    command: -m scripts.preflight.orchestrator --phase B
+    env_wrapper: python
+    log_target: '>> logs/preflight.log 2>&1'
+    marker_name: preflight_phase_b
+  preflight_phase_c:
+    script: python -m scripts.preflight.orchestrator --phase C --watch-sec 285
+    schedule: 09:15 Mon-Fri
+    type: python
+    critical: false
+    market_day_only: true
+    cadence: market_day
+    monitored: true
+    detection_method: exit_code_file
+    enabled: true
+    personal_tooling: false
+    cron_expression: 15 9 * * 1-5
+    command: -m scripts.preflight.orchestrator --phase C --watch-sec 285
+    env_wrapper: python
+    log_target: '>> logs/preflight.log 2>&1'
+    marker_name: preflight_phase_c
+  fetch_fno_ban:
+    script: scripts/fetch_fno_ban.py
+    schedule: 08:35 Mon-Fri
+    type: python
+    critical: false
+    market_day_only: true
+    cadence: market_day
+    monitored: true
+    enabled: true
+    personal_tooling: false
+    cron_expression: 35 8 * * 1-5
+    command: scripts/fetch_fno_ban.py
+    env_wrapper: python
+    log_target: '>> logs/cron-fno-ban.log 2>&1'
+  gemini_premarket_brief:
+    script: scripts/gemini_premarket_brief.py
+    schedule: 08:55 Mon-Fri
+    type: python
+    critical: false
+    market_day_only: true
+    cadence: market_day
+    monitored: true
+    enabled: true
+    personal_tooling: false
+    cron_expression: 55 8 * * 1-5
+    command: scripts/gemini_premarket_brief.py
+    env_wrapper: python
+    log_target: '>> logs/cron-premarket-brief.log 2>&1'
+  refresh_instruments:
+    script: scripts/refresh_instruments.py --account VBB097
+    schedule: 09:00 Mon-Fri
+    type: python
+    critical: true
+    market_day_only: true
+    cadence: market_day
+    monitored: true
+    enabled: true
+    personal_tooling: false
+    cron_expression: 0 9 * * 1-5
+    command: scripts/refresh_instruments.py --account VBB097
+    env_wrapper: python
+    log_target: '>> logs/cron-refresh-instruments.log 2>&1'
+  capture_metrics:
+    script: scripts/capture_metrics_baseline.py
+    schedule: '*/5 09-15 Mon-Fri'
+    type: python
+    critical: false
+    market_day_only: true
+    cadence: intraday
+    monitored: false
+    enabled: true
+    personal_tooling: false
+    cron_expression: '*/5 9-15 * * 1-5'
+    command: scripts/capture_metrics_baseline.py
+    env_wrapper: python
+    log_target: '>> logs/cron-metrics.log 2>&1'
+    marker_name: capture_metrics
+  liveness_probe:
+    # 17-Jul-2026: trading-system.service died at 08:16:09 with a CLEAN exit 0 and took 0
+    # trades on a live day; nothing noticed for the whole session, because NOTHING watched
+    # this unit's liveness (monitoring_canary's respawn probe watches alert-watcher, its
+    # dashboard probe watches gui-dashboard). One CRITICAL per incident, deduped on the
+    # unit's InactiveEnterTimestamp. SILENT on holidays, on an operator SOFT_KILL/HARD_KILL
+    # park, and outside [09:00,16:00). The window is the schedule: the first run at 09:00 is
+    # after the 08:15 token -> ~08:30 premarket boot chain (so a slow start is never a false
+    # alarm) and 15 min before the 09:15 open; the last run at 15:55 is before 16:00, where
+    # the EOD self-exit becomes legitimate. monitored:false matches capture_metrics — a
+    # 5-minute job cannot be heartbeat-expected. See docs/audit/liveness_alarm_17jul2026.md.
+    script: scripts/liveness_probe.py
+    schedule: '*/5 09-15 Mon-Fri'
+    type: python
+    critical: false
+    market_day_only: true
+    cadence: intraday
+    monitored: false
+    enabled: true
+    personal_tooling: false
+    cron_expression: '*/5 9-15 * * 1-5'
+    command: scripts/liveness_probe.py
+    env_wrapper: python
+    log_target: '>> logs/cron-liveness.log 2>&1'
+  fetch_daily_candles:
+    script: scripts/fetch_daily_candles.py
+    schedule: 15:40 Mon-Fri
+    type: python
+    critical: false
+    market_day_only: true
+    cadence: market_day
+    monitored: true
+    enabled: true
+    personal_tooling: false
+    cron_expression: 40 15 * * 1-5
+    command: scripts/fetch_daily_candles.py
+    env_wrapper: python_nopath
+    log_target: '>> logs/cron-candle-fetch.log 2>&1'
+    marker_name: fetch_daily_candles
+  reconstruct_excursions:
+    script: scripts/reconstruct_excursions.py --daily
+    schedule: 15:50 Mon-Fri
+    type: python
+    critical: false
+    market_day_only: true
+    cadence: market_day
+    monitored: true
+    enabled: true
+    personal_tooling: false
+    cron_expression: 50 15 * * 1-5
+    command: scripts/reconstruct_excursions.py --daily
+    env_wrapper: python_nopath
+    log_target: '>> logs/cron-excursions.log 2>&1'
+    marker_name: reconstruct_excursions
+  forward_shadow_record:
+    # RESEARCH recorder (records only; no orders, no config change, off the hot path).
+    # 18:15 = well after the 15:30-17:05 EOD window + the 15:40/15:50 candle backfills.
+    # Rate-limited (reuses the broker RateLimiter, <=3 req/sec) + fail-safe & fail-LOUD
+    # (a crash raises a Telegram sentinel; it can never affect trading). Idempotent.
+    script: scripts/forward_shadow_record.py
+    schedule: 18:15 Mon-Fri
+    type: python
+    critical: false
+    market_day_only: true
+    cadence: market_day
+    monitored: true
+    enabled: true
+    personal_tooling: false
+    cron_expression: 15 18 * * 1-5
+    command: scripts/forward_shadow_record.py
+    env_wrapper: python_nopath
+    log_target: '>> logs/cron-forward-shadow.log 2>&1'
+    marker_name: forward_shadow_record
+  sr_detector_backfill:
+    script: scripts/sr_detector_backfill.py
+    schedule: 15:58 Mon-Fri
+    type: python
+    critical: false
+    market_day_only: true
+    cadence: market_day
+    monitored: true
+    detection_method: exit_code_file
+    enabled: true
+    personal_tooling: false
+    cron_expression: 58 15 * * 1-5
+    command: scripts/sr_detector_backfill.py
+    env_wrapper: python_nopath
+    log_target: '>> logs/cron-sr-detector-backfill.log 2>&1'
+    marker_name: sr_detector_backfill
+  control_tower:
+    script: ops/control_tower/runner.py
+    schedule: 17:05 Mon-Fri
+    type: python
+    critical: false
+    market_day_only: true
+    cadence: market_day
+    monitored: true
+    enabled: true
+    personal_tooling: false
+    cron_expression: 5 17 * * 1-5
+    command: ops/control_tower/runner.py
+    env_wrapper: python_nopath
+    log_target: '>> logs/cron-control-tower.log 2>&1'
+    marker_name: control_tower
+  reconcile_positions:
+    script: scripts/reconcile_positions.py --account VBB097
+    schedule: 15:45 Mon-Fri
+    type: python
+    critical: true
+    market_day_only: true
+    cadence: market_day
+    monitored: true
+    enabled: true
+    personal_tooling: false
+    cron_expression: 45 15 * * 1-5
+    command: scripts/reconcile_positions.py --account VBB097
+    env_wrapper: python
+    log_target: '>> logs/cron-reconcile-positions.log 2>&1'
+  eod_cleanup:
+    script: scripts/eod_cleanup.py
+    schedule: 15:50 Mon-Fri
+    type: python
+    critical: false
+    market_day_only: true
+    cadence: market_day
+    monitored: true
+    enabled: true
+    personal_tooling: false
+    cron_expression: 50 15 * * 1-5
+    command: scripts/eod_cleanup.py
+    env_wrapper: python
+    log_target: '>> logs/cron-eod-cleanup.log 2>&1'
+  eod_verify:
+    script: scripts/eod_verify.py
+    schedule: 15:55 Mon-Fri
+    type: python
+    critical: true
+    market_day_only: true
+    cadence: market_day
+    monitored: true
+    enabled: true
+    personal_tooling: false
+    cron_expression: 55 15 * * 1-5
+    command: scripts/eod_verify.py
+    env_wrapper: python
+    log_target: '>> logs/cron-eod-verify.log 2>&1'
+  # P1 (02-Jul): broker-authoritative EOD reconcile — runs @15:58 (after reconcile_positions
+  # @15:45 + settle) with its OWN creds so it verifies even if the process was down at 15:17.
+  # SHADOW alongside eod_verify (config eod_reconcile.authoritative=false); at cutover this
+  # becomes authoritative and eod_verify is retired.
+  eod_broker_reconcile:
+    script: scripts/eod_broker_reconcile.py
+    schedule: 15:58 Mon-Fri
+    type: python
+    critical: true
+    market_day_only: true
+    cadence: market_day
+    monitored: true
+    enabled: true
+    personal_tooling: false
+    cron_expression: 58 15 * * 1-5
+    command: scripts/eod_broker_reconcile.py
+    env_wrapper: python
+    log_target: '>> logs/cron-eod-broker-reconcile.log 2>&1'
+  # daily_review — DELETED 01-Jul-2026 (Phase C cutover); superseded by daily_trade_review
+  # (16:07). Entry removed entirely (not disabled) per Rama's directive; the module is
+  # `git rm`-ed so git history is the rollback. Its output (reports/daily/) had NO consumer.
+  wal_checkpoint:
+    script: scripts/wal_checkpoint.py
+    schedule: 16:00 Mon-Fri
+    type: python
+    critical: false
+    market_day_only: true
+    cadence: market_day
+    monitored: true
+    enabled: true
+    personal_tooling: false
+    cron_expression: 0 16 * * 1-5
+    command: scripts/wal_checkpoint.py
+    env_wrapper: python_nopath
+    log_target: '>> logs/wal_checkpoint.log 2>&1'
+  generate_screened_csv:
+    script: scripts/generate_screened_stocks_csv.py
+    schedule: 16:01 Mon-Fri
+    type: python
+    critical: false
+    market_day_only: true
+    cadence: market_day
+    monitored: true
+    enabled: true
+    personal_tooling: false
+    cron_expression: 1 16 * * 1-5
+    command: scripts/generate_screened_stocks_csv.py
+    env_wrapper: python_nopath
+    log_target: '>> logs/cron-screened-stocks.log 2>&1'
+  # RETIRED 29-Aug-2026. The bake-in below ran its course: daily_trade_review has
+  # produced the same day's report at 16:07 since 01-Jul-2026, and its three
+  # remaining unique sheets -- Capital, Candles, Telegram -- were PORTED into it
+  # before this was switched off, so retiring loses no coverage.
+  #   enabled:false   -> generate_crontab omits it; the 16:05 line disappears.
+  #   monitored:false -> the Cron Officer stops expecting a heartbeat, so a job
+  #                      that no longer runs cannot be reported MISSED. (It was
+  #                      heartbeating correctly -- 44 SUCCESS rows, 30-Jun..28-Aug
+  #                      -- so this is a retirement, not a defect.)
+  # reports/daily_report.py is intentionally LEFT IN PLACE and still runnable by
+  # hand (`python -m reports.daily_report --date YYYY-MM-DD`), which is how the
+  # pre-02-Jul archived xlsx would be regenerated if ever needed.
+  daily_report:
+    script: python -m reports.daily_report  (RETIRED 29-Aug-2026; module kept, runnable by hand)
+    schedule: 16:05 Mon-Fri
+    type: python
+    critical: false
+    market_day_only: true
+    cadence: market_day
+    monitored: false
+    enabled: false
+    personal_tooling: false
+    cron_expression: 5 16 * * 1-5
+    command: -m reports.daily_report
+    env_wrapper: python_nopath
+    log_target: '>> logs/daily_report.log 2>&1'
+  # ADDED 01-Jul-2026 (Phase C cutover) — the redesigned DB-pure report, supersedes
+  # the deleted daily_review and eventually daily_report (kept in parallel for a
+  # short bake-in). Runs 16:07 = AFTER excursion reconstruction (15:50), eod_verify
+  # (15:55), wal_checkpoint (16:00) and daily_report (16:05); BEFORE trade_journal
+  # (16:10). monitored → writes a cron_heartbeat("daily_trade_review") on success.
+  daily_trade_review:
+    script: reports/daily_trade_review.py
+    schedule: 16:07 Mon-Fri
+    type: python
+    critical: false
+    market_day_only: true
+    cadence: market_day
+    monitored: true
+    enabled: true
+    personal_tooling: false
+    cron_expression: 7 16 * * 1-5
+    command: reports/daily_trade_review.py
+    env_wrapper: python
+    log_target: '>> logs/cron-daily-trade-review.log 2>&1'
+  trade_journal:
+    script: scripts/trade_journal.py
+    schedule: 16:10 Mon-Fri
+    type: python
+    critical: false
+    market_day_only: true
+    cadence: market_day
+    monitored: true
+    enabled: true
+    personal_tooling: false
+    cron_expression: 10 16 * * 1-5
+    command: scripts/trade_journal.py
+    env_wrapper: python
+    log_target: '>> logs/trade_journal.log 2>&1'
+  compute_strategy_metrics:
+    script: scripts/compute_strategy_metrics.py
+    schedule: 16:15 Mon-Fri
+    type: python
+    critical: false
+    market_day_only: true
+    cadence: market_day
+    monitored: true
+    enabled: true
+    personal_tooling: false
+    cron_expression: 15 16 * * 1-5
+    command: scripts/compute_strategy_metrics.py
+    env_wrapper: python
+    log_target: '>> logs/cron-strategy-metrics.log 2>&1'
+  metrics_summary:
+    script: scripts/capture_metrics_baseline.py --summarize
+    schedule: 16:16 Mon-Fri
+    type: python
+    critical: false
+    market_day_only: true
+    cadence: market_day
+    monitored: false
+    enabled: true
+    personal_tooling: false
+    cron_expression: 16 16 * * 1-5
+    command: scripts/capture_metrics_baseline.py --summarize
+    env_wrapper: python
+    log_target: '>> logs/cron-metrics.log 2>&1'
+    marker_name: metrics_summary
+  # Regime-ranking prerequisite (17-Jul-2026): the daily strategy-direction registry
+  # maintainer. Detects a newly-added strategy (loaded YAMLs ∪ distinct signals scanner/
+  # strategy), registers it PENDING with direction = StrategyConfig.direction, notifies
+  # Telegram+email, confirms PENDING->CONFIRMED on the first filled trade, and flags
+  # health=DIRECTION_CONFLICT where a realized trade side differs from the declared
+  # direction (never overwriting it). Runs 16:22 = after compute_strategy_metrics (16:15);
+  # writes config/strategy_direction_registry.yaml (a DB-derived cache — re-derives after
+  # a deploy checkout). DATA/REGISTRY only; no trading-decision change.
+  strategy_registry_officer:
+    script: scripts/strategy_registry_officer.py
+    schedule: 16:22 Mon-Fri
+    type: python
+    critical: false
+    market_day_only: true
+    cadence: market_day
+    monitored: true
+    enabled: true
+    personal_tooling: false
+    cron_expression: 22 16 * * 1-5
+    command: scripts/strategy_registry_officer.py
+    env_wrapper: python
+    log_target: '>> logs/cron-strategy-registry.log 2>&1'
+    marker_name: strategy_registry_officer
+  gemini_log_review:
+    script: scripts/gemini_log_review.py
+    schedule: 16:20 Mon-Fri
+    type: python
+    critical: false
+    market_day_only: true
+    cadence: market_day
+    monitored: true
+    enabled: true
+    personal_tooling: false
+    cron_expression: 20 16 * * 1-5
+    command: scripts/gemini_log_review.py
+    env_wrapper: python
+    log_target: '>> logs/cron-gemini-review.log 2>&1'
+  gemini_trade_coach:
+    script: scripts/gemini_trade_coach.py
+    schedule: 16:40 Mon-Fri
+    type: python
+    critical: false
+    market_day_only: true
+    cadence: market_day
+    monitored: true
+    enabled: true
+    personal_tooling: false
+    cron_expression: 40 16 * * 1-5
+    command: scripts/gemini_trade_coach.py
+    env_wrapper: python
+    log_target: '>> logs/cron-trade-coach.log 2>&1'
+  gemini_data_integrity_check:
+    script: scripts/gemini_data_integrity_check.py
+    schedule: 17:00 Mon-Fri
+    type: python
+    critical: false
+    market_day_only: true
+    cadence: market_day
+    monitored: true
+    enabled: true
+    personal_tooling: false
+    cron_expression: 0 17 * * 1-5
+    command: scripts/gemini_data_integrity_check.py
+    env_wrapper: python
+    log_target: '>> logs/cron-data-integrity.log 2>&1'
+  check_cron_drift:
+    script: scripts/check_cron_drift.py
+    schedule: 18:00 Mon-Fri
+    type: python
+    critical: false
+    market_day_only: true
+    cadence: market_day
+    monitored: false
+    detection_method: none
+    excluded_reason: "the cron drift-monitor itself \u2014 no self-signal by design"
+    enabled: true
+    personal_tooling: false
+    cron_expression: 0 18 * * 1-5
+    command: scripts/check_cron_drift.py
+    env_wrapper: python
+    log_target: '>> logs/cron-drift-check.log 2>&1'
+  cron_officer_eod:
+    script: scripts/cron_officer.py --eod-summary
+    schedule: 18:50 Mon-Fri
+    type: python
+    critical: false
+    market_day_only: true
+    cadence: market_day
+    monitored: true
+    enabled: true
+    personal_tooling: false
+    cron_expression: 50 18 * * 1-5
+    command: scripts/cron_officer.py --eod-summary
+    env_wrapper: python
+    log_target: '>> logs/cron-officer.log 2>&1'
+  system_manager_eod:
+    script: scripts/system_manager.py
+    schedule: 18:45 Mon-Fri
+    type: python
+    critical: true
+    market_day_only: true
+    cadence: market_day
+    monitored: true
+    enabled: true
+    personal_tooling: false
+    cron_expression: 45 18 * * 1-5
+    command: scripts/system_manager.py
+    env_wrapper: python
+    log_target: '>> logs/system-manager.log 2>&1'
+  gemini_weekly_patterns:
+    script: scripts/gemini_weekly_patterns.py
+    schedule: 18:00 Sunday
+    type: python
+    critical: false
+    market_day_only: false
+    cadence: weekly
+    monitored: true
+    weekday: 6
+    enabled: true
+    personal_tooling: false
+    cron_expression: 0 18 * * 0
+    command: scripts/gemini_weekly_patterns.py
+    env_wrapper: python
+    log_target: '>> logs/cron-weekly-patterns.log 2>&1'
+  backup_restore_drill:
+    script: scripts/backup_restore_drill.py --quiet
+    schedule: 03:00 1st-of-month
+    type: python
+    critical: false
+    market_day_only: false
+    cadence: monthly
+    monitored: true
+    day_of_month: 1
+    enabled: true
+    personal_tooling: false
+    cron_expression: 0 3 1 * *
+    command: scripts/backup_restore_drill.py --quiet
+    env_wrapper: python
+    log_target: '>> logs/cron-backup-drill.log 2>&1'
+officer:
+  day_window_start: 00:00
+  day_window_end: '23:59'
+  morning_briefing_time: 09:20
+  eod_floor_time: '18:45'
+  eod_gap_minutes: 5
+  # Race-debounce (24-Jun): a job due within N min of the briefing/EOD snapshot
+  # may have just fired and not yet committed its heartbeat -> PENDING not MISSED
+  # (stops the 09:20 cron-cluster false-CRITICAL). Real misses (> N min) still flag.
+  miss_grace_minutes: 2
+  telegram_ban_until: null    # F4 (15-Jul-2026): stale past ban ('2026-06-23') PURGED — it was inert (a past date) but confusing. null = no ban.

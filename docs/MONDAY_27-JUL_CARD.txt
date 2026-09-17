@@ -1,0 +1,238 @@
+==============================================================================
+MONDAY 27-JUL-2026 — THE CARD.   Detail: MASTER_PENDING_..._EVENING.txt
+Deployed d0fd7b8 · loads 08:15 · book flat.  Every command below was RE-RUN against
+production 26-Jul 16:1x, and every FACT re-verified again 26-Jul 18:4x direct from
+the VM: bare HEAD d0fd7b8 (= main, so the hold branch really is unpushed), service
+inactive/enabled since Fri 24-Jul 08:15:27, schema v44, trades 423 / open 0,
+signals 49,410, innings 322, pb01_watchlist 0, pb01_capture heartbeats 0,
+SOFT_KILL circuit_breaker_force_close_15:15 @ 24-Jul 15:15:01 (prior-day).
+Two originally-drafted checks did not exist — see footnote.
+    ssh trading-vm ; cd ~/systems/trading-system ; L=logs/system_$(date +%F).log
+    DB="file:data_store/trading_system.db?mode=ro&immutable=1"
+==============================================================================
+08:15  — THREE CHECKS, TWO MINUTES
+------------------------------------------------------------------------------
+[ ] 1 ⭐⭐ PB-01 IS WIRED — the highest-value 30 seconds of your week.
+      grep "PB-01 watchlist" $L
+      EXPECT ... PB-01 watchlist: ENABLED — capture + entry stage started
+      ⚠️ DISABLED or NOTHING => the 17:00 capture WILL FAIL, and you have ALL DAY
+         to react instead of discovering it Tuesday.
+
+[ ] 2 PRIOR-DAY KILL CLEARED.
+      journalctl -u trading-system --since today | grep auto-cleared
+      EXPECT  Kill switch auto-cleared: prior SOFT_KILL from 2026-07-24 ...
+      ⚠️ ABSENT + kill still set => entries blocked all day.
+
+[ ] 3 SHADOWTRACKER OFF — proved by silence; nothing logs the flag.
+      sqlite3 "$DB" "select count(*) from innings;"
+      EXPECT 322, and 322 forever. Growth => the disable did not take.
+
+⛔ Do NOT look for the 17:35 window this morning — no such boot line exists
+   (the guard runs before config loads). It shows up at ~17:35 - CHECK 7.
+
+~17:10 — THE MOST IMPORTANT CHECK OF THE DAY
+------------------------------------------------------------------------------
+[ ] 4 systemctl is-active trading-system            EXPECT active
+      ⭐ 16:00-17:35 is a MONITORING BLIND SPOT (liveness probe stops 15:55); this
+      is the compensating control. ⚠️ A silent death at 16:20 yields an empty
+      Tuesday watchlist that looks EXACTLY like "no breakouts" — after the fact
+      the two are indistinguishable.
+
+AFTER 17:00 — TWO CHECKS. DIFFERENT FACTS. BOTH NEEDED.
+------------------------------------------------------------------------------
+[ ] 5 DID THE ALERT ARRIVE?
+      sqlite3 "$DB" "select status,executed_at from cron_heartbeat
+                      where job_name='pb01_capture' order by id desc limit 3;"
+      ⭐ VERIFIED 26-Jul: this returns ZERO ROWS today — there has never been a
+         pb01_capture heartbeat. So Monday's would be the FIRST EVER, and an empty
+         result tonight is the honest "it did not run", NOT a stale query.
+[ ] 6 DID THE WORKER FINISH?
+      sqlite3 "$DB" "select count(*) from pb01_watchlist;"   (still 0, re-checked 26-Jul)
+      ⚠️ The heartbeat records QUEUED, not captured — the worker is async.
+         HEARTBEAT-BUT-NO-ROWS IS A REAL STATE (alert landed, worker failed).
+[ ] 7 ~17:40  grep eod_self_exit $L
+      EXPECT  past 17:35 IST and flat ... clean shutdown   (Friday said 16:00)
+
+IF YOU EVER NEED TO HALT — READ THIS BEFORE THE MOMENT, NOT DURING IT
+------------------------------------------------------------------------------
+⛔⛔ `halt.sh` DOES NOT EXIST. It was a hypothetical in an F2 report and was never
+   built. VERIFIED: not in the repo (nor in its history), not on the VM, not on
+   PATH. If you reach for it in an incident it will fail.
+   (`deploy/resume.sh` DOES exist, with no counterpart — that asymmetry is
+   exactly what makes the wrong assumption easy.)
+
+*** THE ONLY HALT THAT WORKS TODAY: ***
+      ssh trading-vm sudo systemctl stop trading-system
+
+⚠️ AND KNOW WHAT IT COSTS: it stops EVERYTHING — entries AND exit management.
+   There is NO way today to block new entries while still managing open
+   positions. If you stop the service holding an open position, that position is
+   left to its BROKER-SIDE SL/TGT with no system monitoring.
+   That is survivable — those are real resting orders at the broker, not
+   system-simulated ones — but it is a real reduction in cover, and you should
+   know it now rather than discover it then.
+   To resume: deploy/resume.sh (clears a kill), then start the service.
+
+EMAILS YOU WILL GET THAT MEAN NOTHING (so a real one still stands out)
+------------------------------------------------------------------------------
+✅ "UNEXPECTED SSH KEY present" — GONE. It fired 37 times since 17-Jul across two
+   key rotations; the last was Sat 21:46:45. You re-baselined at 00:24 Sunday and
+   the third (committed) baseline was fixed after that, so the check now produces
+   NO finding at all. ⭐ If a 38th ever arrives, that is NEW — do not assume it is
+   the old loop.
+✅ AND IT CANNOT COME BACK AS A FLOOD. The 6-hourly re-alert was the real defect
+   and it is fixed: a condition that is merely STILL PRESENT now backs off
+   6h -> 24h -> 7d and is never CRITICAL twice. A condition that CLEARED and CAME
+   BACK is now alerted immediately at full severity — it used to be swallowed.
+⭐ "System Manager EOD — clean" IS NOT A CRITICAL. Yesterday's card said it was;
+   that was wrong. Measured by re-rendering all 85 sentinels through the function
+   that builds the subject: it arrives as "[LFL836] INFO — …". So do the Pre-flight
+   READY and Cron Daily Report ones. They are correctly labelled already.
+· STILL ROUTINE, still worth ignoring: the 15:15 "SOFT KILL ACTIVATED —
+  circuit_breaker_force_close_15:15", same second every trading day, by design.
+🔴 "RMS/MANUAL CLOSE — <symbol>" — ⚠️ DO NOT TRUST THE WORDING, AND EXPECT IT AGAIN
+   MONDAY. All four sent so far (HUHTAMAKI, WAAREERTL, GODIGIT, BLSE) were the
+   system's OWN SL/TGT/EOD order filling, not an external close — the reconciler
+   polled between the broker fill and its own bookkeeping. The MONEY was right every
+   time. ⭐ WORSE THAN NOISE: because the reconciler wins that race, our own exit
+   path aborts at its double-close guard, so the INFO "TARGET HIT" is never sent —
+   the false CRITICAL REPLACES the good alert.
+   ⭐ THE FIX IS BUILT BUT DELIBERATELY NOT DEPLOYED FOR MONDAY. It sits on branch
+   hold-check1-w8-26jul (unpushed) and ships TUESDAY only if Monday is observed
+   clean — so Monday carries its four existing first-runs alone. Monday's behaviour
+   is therefore UNCHANGED: if this email arrives, it is the known false label, not a
+   new fault. See alert_stream_fixes_26jul2026 + check1_w8_design_26jul2026.
+⚠️ If an email arrives that is NOT on this list, it is worth stopping for.
+
+TUESDAY 08:15 — THREE NON-EVENTS
+------------------------------------------------------------------------------
+· CRITICAL sentinel  -> most likely the reconciler having run 95 min longer than
+  ever (~380 extra broker calls, a state that has never existed). EXPECTED shape,
+  self-clearing. Read it before reacting.
+· EMPTY watchlist    -> no breakouts OR silent capture failure. Checks 5+6 now
+  distinguish these; before this week they could not.
+· REGRESSION count moved -> the evening time-bomb was FIXED 25-Jul; the count no
+  longer depends on the hour. Residual wobble = the known machine-global
+  test_instance_lock flake (2/1/2 on an unchanged tree). Judge by the failure SET
+  against a same-shell baseline, NEVER by the count.
+  ⭐ MEASURED AGAIN 26-Jul AND IT PROVES THE POINT: the same unchanged tree gave
+  11F here where the recorded figure was 33F — a PATH difference, not a regression.
+  The SET is the only thing that means anything.
+  ⭐ A THIRD COUNT, same night: 31F. BASE 31F/5161P vs MERGE 30F/5164P, both run
+  ALONE. 33 / 11 / 31 on trees that differ by two test files — read the SET.
+  ⛔⛔ AND THE REASON FOR THE THIRD NUMBER IS ITSELF A RULE: NEVER RUN SUITES IN
+  PARALLEL. utils/instance_lock uses a MACHINE-GLOBAL %TEMP% lock, so concurrent
+  runs corrupt each other. Three parallel runs earlier tonight produced 30/50/53
+  and made the 18:15 bomb LOOK like it had regressed; run alone it passes. A
+  corrupted failure set is worse than a slow one — it reads as a finding.
+  ✅ THE WEEKEND ONE IS NOW FIXED (26-Jul, on the hold branch): test_daily_trade_
+  review::test_main_defaults_date_to_today_and_records_heartbeat used to fail every
+  Saturday and Sunday — the report correctly skips a non-trading day, so the xlsx
+  the test demanded was never written. Its clock is now pinned to a real NSE trading
+  day and the real holiday guard still runs against it.
+  ⭐ WHAT THIS MEANT IS THE PART WORTH KEEPING: the SUITE gave a different answer on
+  a Saturday than on a Tuesday, so a WEEKEND baseline was never comparable to a
+  WEEKDAY one — and BASE-vs-MERGE comparability is the whole gate. Two instances on
+  two different axes (hour-of-day 25-Jul, day-of-week 26-Jul) made it a class; the
+  suite was then swept for a third by re-running it under a simulated calendar.
+  ⚠️ Note for Monday specifically: Monday is a WEEKDAY, so the OLD test passes on
+  Monday anyway. Nothing about this is observable Monday morning — it matters only
+  when a baseline is taken on a weekend, which is exactly when they get taken.
+
+⭐⭐ THE MONDAY -> TUESDAY SEQUENCE — THE WHOLE PLAN, IN ONE PLACE
+------------------------------------------------------------------------------
+You should not have to reconstruct this from six documents. It is three steps.
+
+  1. MONDAY CHANGES NOTHING.  Branch `hold-check1-w8-26jul` @ 351c4c5 is UNPUSHED.
+     VERIFIED 26-Jul 18:4x: the VM bare repo HEAD is d0fd7b8 — identical to `main`.
+     Monday therefore runs exactly the code Friday ran, plus the two CONFIG changes
+     that were already deployed and first load at 08:15 (service window 17:35,
+     M-A2 deadline 8s).  Monday's job is to OBSERVE, not to change.
+
+  2. IF MONDAY IS OBSERVED CLEAN -> PUSH MONDAY EVENING.  "Clean" = checks 1-7 on
+     this card pass and no email arrives that is not on the list above. TWENTY-FOUR
+     commits now go together as one push — twenty-three below plus this card edit
+     itself as the twenty-fourth and the branch tip. Verify with:
+        git rev-list --count d0fd7b8..hold-check1-w8-26jul     ->  24
+     ⭐ TWENTY-FOUR, NOT FOURTEEN, AND THE REASON MATTERS. Late Sunday `main` gained 5
+     commits of its own (the December holiday-calendar reminder) while this branch
+     sat waiting, so the two DIVERGED — a branch push to origin/main would have been
+     REJECTED non-fast-forward, at exactly the moment you expect it to work. `main`
+     was MERGED INTO the branch on Sunday night (6184e79), not rebased: a rebase
+     would have rewritten all 14 SHAs below and silently invalidated every "gated at
+     <sha>" claim in the ledger and the audit docs. Zero conflicts — the two sides
+     touched disjoint files. The merged tree was then gated in full, on its own.
+        THE FIVE FROM MAIN, PLUS THE MERGE COMMIT:
+        cbcad2c  the 2027 reminder: it now EMAILS you from 15-Dec  (security_monitor)
+        dd51250  the overnight-carry report + register items        (DOCS)
+        cc86839  SYSTEM_MAP "9 checks" -> 10; one fraction corrected (DOCS)
+        359ccd8  alert body no longer says "copy the file that is missing"
+        8316e0a  security-watcher is Type=simple, not a oneshot     (COMMENT)
+        6184e79  the merge commit itself
+     AND FOUR MORE FROM SUNDAY NIGHT, AFTER THE MERGE:
+        e6ade32  a SECOND, final CRITICAL near the deadline  (security_monitor)
+        ea65581  ⚠️ the paper run announces its own carry blind spot (PRODUCTION,
+                 paper-only by a MODE check; proven silent in live on an identical row)
+        9ac5023  this card + SYSTEM_MAP + the two audit docs        (DOCS)
+        <tip>    this card edit
+     ⭐ NONE of these is loaded by the trading service's boot except ea65581, and
+        that one returns immediately unless mode == "PAPER" — proven silent in LIVE
+        against an identical carried row, and silent anyway today because delivery is
+        off so the reconcile has no rows at all. security_monitor is a SEPARATE
+        process (security-watcher.service, Type=simple + RestartSec=60), so its
+        changes go live ~60s after the push and cannot touch the 08:15 boot at all.
+        The reminder itself is December-gated: with nse_holidays_2026.yaml present
+        and today not in December it emits nothing.
+        SO v45 IS STILL TUESDAY'S SINGLE VARIABLE.
+     THE ORIGINAL FOURTEEN, unchanged and in this order:
+        77b8b04  §B  trades.closure_source + exit_mechanism  (SCHEMA v44 -> v45)
+        10c02ae  §A  the pure closure classifier (component only)
+        2f8fd87  §C  gather -> classify -> act; the alert the evidence supports
+        81f9372  §D  the mid-fill deferral      (ships OFF: bound default 0.0)
+        aaccbda      test hygiene: 3 fixed numbers become the property they meant
+        351c4c5      this card, re-verified against production
+        6f7d27e      the weekend-failing test: pin the clock  (TEST ONLY)
+        ffea817      the YEAR tripwire + the clock-class report  (TEST + DOCS)
+        5cccffb      §D report · paper-fidelity sweep · one standing rule  (DOCS)
+        6753854      card update: ten commits + a third failure count  (DOCS)
+        b53b5ac      the 2027 boot-blocker: warn in DECEMBER  (TEST ONLY)
+        687b958      ⚠️ a paper GTT can now FIRE  (PRODUCTION CODE, paper-only)
+        c43553d      the GTT report + gaps classified WEAKER vs WRONG  (DOCS)
+     ⛔ Do NOT push a subset. §C without §D leaves the deleted INFO deleted.
+     ⚠️ ONE of these touches production code: 687b958 changes broker/zerodha_adapter
+        .py. It is DOUBLY paper-only — the new pass returns immediately unless
+        self._paper, and both call sites already sit inside `if self._paper:`, with
+        a test pinning the live no-op. It touches no schema and no capital path.
+        ⭐ SO v45 IS STILL TUESDAY'S SINGLE VARIABLE. Everything else added Sunday
+        night is test files and documentation.
+     ⏰🔴 AND ONE DEADLINE THAT IS NOT MONDAY'S: the December reminder (cbcad2c +
+        e6ade32) is useless unless it reaches the VM before 15-DEC-2026. Monday's
+        push carries it, which is why the merge above mattered — but if this push
+        slips indefinitely, that item slips with it, silently, for five months. It
+        is logged in the standing UNPUSHED/PENDING-DEPLOY ledger, which is read
+        before every off-market window, so it cannot be lost by forgetting alone.
+
+  3. TUESDAY 08:15 TAKES v45 AS ITS SINGLE VARIABLE.  The migration REBUILDS the
+     live `trades` table, and a failed migration BLOCKS THE BOOT — there is no flag
+     that makes it a no-op. That is deliberate: it is why this ships on a day whose
+     only change is the migration, and why Monday must be clean first.
+     ⭐ §D ships OFF (0.0) and is a PROVEN structural no-op, so Tuesday's behaviour
+     change is §B + §C only. Raising the §D knob is a SEPARATE, LATER decision and
+     has its own precondition — see check1_deferral_26jul2026.md, which leads with
+     it: paper CANNOT exercise that path at all, so turning it on without either a
+     refusable paper cancel_order or a live canary ships an unrehearsed path
+     straight into live.
+
+⭐ WHAT MONDAY DOES *NOT* PROVE
+------------------------------------------------------------------------------
+A CAPTURE IS A PRECONDITION, NOT A WIN. PB-01 is enabled:false with NO live twin,
+so a captured row cannot yet be evaluated. It starts an out-of-sample clock that
+can only ever be STARTED, never backfilled — which is why a lost evening costs
+something permanent, and a captured one proves nothing yet.
+------------------------------------------------------------------------------
+FOOTNOTE (why two drafted checks are absent, verified 25-Jul): there is NO boot
+line naming the service window (guard main.py:1712 runs before load_all :1743)
+and NOTHING logs shadow_tracker's flag anywhere — replaced by checks 7 and 3.
+Also: the boot log is logs/system_<date>.log, NOT journald (~6 lines/boot); only
+check 2 lives in journald.
+==============================================================================

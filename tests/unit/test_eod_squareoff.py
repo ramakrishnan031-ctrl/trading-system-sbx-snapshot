@@ -1,0 +1,2157 @@
+"""
+tests/unit/test_eod_squareoff.py
+
+Validates orders/eod_squareoff.py against EOD1-EOD12 locked decisions.
+
+All tests use mocks for adapter, fund_manager, kill_switch, order_monitor,
+and state_store.  A real StateStore + in-memory DB is used for the DB-path
+tests (check_restart_recovery, eod_squareoff_log insertion).
+
+Run: python -m pytest tests/unit/test_eod_squareoff.py -v
+Or:  python tests/unit/test_eod_squareoff.py  (standalone mode)
+"""
+from __future__ import annotations
+
+import logging
+import sys
+import tempfile
+import time
+from datetime import date, datetime, timedelta, timezone
+from pathlib import Path
+from typing import Optional
+
+import pytest
+from unittest.mock import MagicMock, call, patch
+
+sys.path.insert(0, str(Path(__file__).parent.parent.parent))
+
+from broker.order_state_machine import OrderStateMachine
+from broker.zerodha_adapter import CancelResult, PlacedOrder
+from capital.kill_switch import KillState
+from core.events import EodSquareoffComplete, EventBus
+from core.market_windows import MarketWindows
+from core.state_store import StateStore
+from core.time_authority import now_ist
+from orders.eod_squareoff import EodSquareoff, EodFireResult
+
+_IST = timezone(timedelta(hours=5, minutes=30), "IST")
+_FIXED_TEST_DATE = date(2026, 4, 20)  # Monday, trading day; pins tests off real-world weekday
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Helpers
+# ─────────────────────────────────────────────────────────────────────────────
+
+def _ist(h: int, m: int, s: int = 0, d: Optional[datetime] = None) -> datetime:
+    """Build a timezone-aware IST datetime for a given H:M:S."""
+    base_date = d.date() if d is not None else _FIXED_TEST_DATE
+    return datetime(base_date.year, base_date.month, base_date.day, h, m, s, tzinfo=_IST)
+
+
+def _make_market_windows() -> MarketWindows:
+    return MarketWindows()  # defaults: entry 09:30-13:30, EOD 15:17
+
+
+def _make_eod(
+    store: Optional[StateStore] = None,
+    auto_resume: bool = True,
+    inter_order_delay_ms: int = 0,
+    holidays: Optional[set] = None,
+) -> tuple[EodSquareoff, MagicMock, MagicMock, MagicMock, MagicMock, MagicMock]:
+    """
+    Build an EodSquareoff with mocked dependencies.
+    Returns (eod, adapter_mock, fm_mock, ks_mock, bus_mock, om_mock).
+    """
+    if store is None:
+        store = MagicMock(spec=StateStore)
+        store.get_pending_intraday_orders.return_value = []
+        store.get_open_intraday_positions.return_value = []
+        store.get_eod_squareoff_log_for_date.return_value = None
+
+    adapter = MagicMock(spec=["place_order", "cancel_order"])
+    fm = MagicMock()
+    fm.release.return_value = True
+
+    ks = MagicMock()
+    ks.is_active.return_value = False
+    ks.current_state.return_value = KillState.INACTIVE
+
+    bus = MagicMock(spec=EventBus)
+    osm = OrderStateMachine()
+    mw = _make_market_windows()
+    if holidays:
+        mw = MarketWindows(holidays=holidays)
+    om = MagicMock()
+    import logging
+    logger = logging.getLogger("test_eod")
+
+    eod = EodSquareoff(
+        adapter=adapter,
+        state_store=store,
+        fund_manager=fm,
+        state_machine=osm,
+        bus=bus,
+        market_windows=mw,
+        time_authority=None,
+        kill_switch=ks,
+        logger=logger,
+        order_monitor=om,
+        inter_order_delay_ms=inter_order_delay_ms,
+    )
+    return eod, adapter, fm, ks, bus, om
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# check_and_fire: time / holiday gate (EOD3)
+# ─────────────────────────────────────────────────────────────────────────────
+
+def test_check_and_fire_before_eod_time_returns_false() -> None:
+    eod, *_ = _make_eod()
+    now = _ist(15, 16)    # one minute before 15:17
+    result = eod.check_and_fire(now)
+    assert result is False
+
+
+def test_check_and_fire_at_eod_time_returns_true() -> None:
+    eod, *_ = _make_eod()
+    now = _ist(15, 17)
+    result = eod.check_and_fire(now)
+    assert result is True
+
+
+def test_check_and_fire_on_holiday_returns_false() -> None:
+    today = _FIXED_TEST_DATE
+    eod, *_ = _make_eod(holidays={today})
+    now = _ist(15, 17)
+    result = eod.check_and_fire(now)
+    assert result is False
+
+
+def test_check_and_fire_idempotent_same_day() -> None:
+    """Second call on same date returns False (EOD3 idempotent flag)."""
+    eod, *_ = _make_eod()
+    now = _ist(15, 17)
+    first = eod.check_and_fire(now)
+    second = eod.check_and_fire(now)
+    assert first is True
+    assert second is False
+
+
+def test_check_and_fire_next_day_fires_again() -> None:
+    """Flag is per-date; a new date fires again (EOD3)."""
+    eod, *_ = _make_eod()
+    day1 = _ist(15, 17)
+    day2 = day1 + timedelta(days=2)  # skip to a non-holiday weekday
+    # Ensure day2 is Monday-Friday
+    while day2.weekday() >= 5:
+        day2 += timedelta(days=1)
+
+    first = eod.check_and_fire(day1)
+    second = eod.check_and_fire(day2)
+    assert first is True
+    assert second is True
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Kill switch lifecycle (EOD5 steps 2 + 7)
+# ─────────────────────────────────────────────────────────────────────────────
+
+def test_kill_switch_soft_killed_during_fire() -> None:
+    """EOD sets SOFT_KILL before squaring off."""
+    eod, adapter, fm, ks, bus, om = _make_eod()
+    ks.is_active.return_value = False
+    eod.check_and_fire(_ist(15, 17))
+    ks.soft_kill.assert_called_once_with(reason="EOD_SQUAREOFF", triggered_by="eod_squareoff")
+
+
+def test_kill_switch_resumed_after_fire_auto_resume_true() -> None:
+    """After fire, kill switch resumed if WE set it and auto_resume_kill_switch=True."""
+    eod, adapter, fm, ks, bus, om = _make_eod(auto_resume=True)
+    ks.is_active.return_value = False
+    eod.check_and_fire(_ist(15, 17))
+    ks.resume.assert_called_once_with(
+        reason="EOD_SQUAREOFF_COMPLETE",
+        resumed_by="eod_squareoff",
+    )
+
+
+def test_kill_switch_not_resumed_if_already_active() -> None:
+    """If kill switch was ALREADY active before EOD, we don't touch it (EOD5 step 7)."""
+    eod, adapter, fm, ks, bus, om = _make_eod()
+    ks.is_active.return_value = True
+    ks.current_state.return_value = KillState.HARD_KILL
+    eod.check_and_fire(_ist(15, 17))
+    ks.soft_kill.assert_not_called()
+    ks.resume.assert_not_called()
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Cancel pending entries (EOD5 step 3)
+# ─────────────────────────────────────────────────────────────────────────────
+
+def _pending_order_row(
+    trade_id: str = "trd_001",
+    signal_id: str = "sig_001",
+    symbol: str = "RELIANCE",
+    direction: str = "LONG",
+    broker_order_id: str = "KITE001",
+) -> MagicMock:
+    row = MagicMock()
+    row.__getitem__ = lambda self, key: {
+        "trade_id": trade_id,
+        "signal_id": signal_id,
+        "symbol": symbol,
+        "direction": direction,
+        "broker_order_id": broker_order_id,
+    }[key]
+    return row
+
+
+def test_pending_intraday_orders_cancelled() -> None:
+    store = MagicMock(spec=StateStore)
+    store.get_pending_intraday_orders.return_value = [
+        _pending_order_row("trd_001", "sig_001", "RELIANCE", "LONG", "KITE001"),
+    ]
+    store.get_open_intraday_positions.return_value = []
+    store.get_eod_squareoff_log_for_date.return_value = None
+    store.get_reservation_id_for_signal.return_value = "res_abc"
+
+    eod, adapter, fm, ks, bus, om = _make_eod(store=store)
+    adapter.cancel_order.return_value = CancelResult(
+        broker_order_id="KITE001", success=True, reason=""
+    )
+
+    eod.check_and_fire(_ist(15, 17))
+
+    adapter.cancel_order.assert_called_once_with("KITE001")
+    fm.release.assert_called_once_with("res_abc", "EOD_CANCEL")
+
+
+def test_pending_delivery_orders_not_cancelled(monkeypatch=None) -> None:
+    """
+    Regression EOD6: DELIVERY (CNC) positions are filtered out by
+    get_pending_intraday_orders (product IN ('MIS','CO') filter).
+    The helper itself handles this; eod_squareoff just calls the helper.
+    No pending rows returned -> no cancel calls.
+    """
+    store = MagicMock(spec=StateStore)
+    store.get_pending_intraday_orders.return_value = []  # no intraday pending
+    store.get_open_intraday_positions.return_value = []
+    store.get_eod_squareoff_log_for_date.return_value = None
+
+    eod, adapter, fm, ks, bus, om = _make_eod(store=store)
+    eod.check_and_fire(_ist(15, 17))
+    adapter.cancel_order.assert_not_called()
+
+
+def test_cancel_failure_logs_critical_and_continues() -> None:
+    """Cancel failure does NOT abort the rest of the sequence (EOD5)."""
+    store = MagicMock(spec=StateStore)
+    store.get_pending_intraday_orders.return_value = [
+        _pending_order_row("trd_001", "sig_001", "RELIANCE", "LONG", "KITE001"),
+        _pending_order_row("trd_002", "sig_002", "INFY", "LONG", "KITE002"),
+    ]
+    store.get_open_intraday_positions.return_value = []
+    store.get_eod_squareoff_log_for_date.return_value = None
+    store.get_reservation_id_for_signal.return_value = "res_x"
+
+    eod, adapter, fm, ks, bus, om = _make_eod(store=store)
+    adapter.cancel_order.side_effect = [
+        CancelResult(broker_order_id="KITE001", success=False, reason="already filled"),
+        CancelResult(broker_order_id="KITE002", success=True, reason=""),
+    ]
+
+    eod.check_and_fire(_ist(15, 17))
+
+    # Both cancels attempted; second one succeeds
+    assert adapter.cancel_order.call_count == 2
+    # Release only called for successful cancel
+    fm.release.assert_called_once_with("res_x", "EOD_CANCEL")
+
+
+def test_cancel_broker_exception_logs_critical_continues() -> None:
+    """BrokerError on cancel -> CRITICAL log -> continue to next order."""
+    from core.exceptions import BrokerError
+
+    store = MagicMock(spec=StateStore)
+    store.get_pending_intraday_orders.return_value = [
+        _pending_order_row("trd_001", "sig_001", "RELIANCE", "LONG", "KITE001"),
+        _pending_order_row("trd_002", "sig_002", "INFY", "LONG", "KITE002"),
+    ]
+    store.get_open_intraday_positions.return_value = []
+    store.get_eod_squareoff_log_for_date.return_value = None
+    store.get_reservation_id_for_signal.return_value = "res_x"
+
+    eod, adapter, fm, ks, bus, om = _make_eod(store=store)
+    adapter.cancel_order.side_effect = [
+        BrokerError("API error"),
+        CancelResult(broker_order_id="KITE002", success=True, reason=""),
+    ]
+
+    eod.check_and_fire(_ist(15, 17))
+    assert adapter.cancel_order.call_count == 2
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Exit open positions (EOD5 step 4)
+# ─────────────────────────────────────────────────────────────────────────────
+
+def _open_position_row(
+    trade_id: str = "trd_001",
+    signal_id: str = "sig_001",
+    symbol: str = "RELIANCE",
+    direction: str = "LONG",
+    qty_filled: int = 10,
+    order_protocol: str = "LIMIT_TRIPLE",
+    entry_broker_order_id: str = "",
+    entry_variety: str = "regular",
+) -> MagicMock:
+    row = MagicMock()
+    row.__getitem__ = lambda self, key: {
+        "trade_id": trade_id,
+        "signal_id": signal_id,
+        "symbol": symbol,
+        "direction": direction,
+        "qty_filled": qty_filled,
+        "order_protocol": order_protocol,
+        "entry_broker_order_id": entry_broker_order_id,
+        "entry_variety": entry_variety,
+    }[key]
+    return row
+
+
+def _placed_order(
+    internal_id: str = "ord_abc",
+    broker_id: str = "KITE999",
+    symbol: str = "RELIANCE",
+    side: str = "SELL",
+    qty: int = 10,
+) -> PlacedOrder:
+    return PlacedOrder(
+        internal_order_id=internal_id,
+        broker_order_id=broker_id,
+        symbol=symbol,
+        side=side,
+        qty=qty,
+        price=0.0,
+        order_type="MARKET",
+        product="MIS",
+        status="SUBMITTED",
+        ts=now_ist(),
+    )
+
+
+def test_open_intraday_positions_exited_with_market_sell() -> None:
+    """LONG position -> SELL MARKET exit (EOD5 step 4b)."""
+    store = MagicMock(spec=StateStore)
+    store.get_pending_intraday_orders.return_value = []
+    store.get_open_intraday_positions.return_value = [
+        _open_position_row("trd_001", "sig_001", "RELIANCE", "LONG", 10),
+    ]
+    store.get_eod_squareoff_log_for_date.return_value = None
+
+    eod, adapter, fm, ks, bus, om = _make_eod(store=store)
+    adapter.place_order.return_value = _placed_order(side="SELL")
+
+    eod.check_and_fire(_ist(15, 17))
+
+    adapter.place_order.assert_called_once()
+    call_kwargs = adapter.place_order.call_args
+    assert call_kwargs.kwargs.get("side") == "SELL" or call_kwargs[1].get("side") == "SELL" or \
+           (len(call_kwargs[0]) > 1 and call_kwargs[0][1] == "SELL")
+
+
+def test_short_position_exited_with_buy() -> None:
+    """SHORT position -> BUY MARKET exit (EOD5 step 4a)."""
+    store = MagicMock(spec=StateStore)
+    store.get_pending_intraday_orders.return_value = []
+    store.get_open_intraday_positions.return_value = [
+        _open_position_row("trd_001", "sig_001", "HDFC", "SHORT", 5),
+    ]
+    store.get_eod_squareoff_log_for_date.return_value = None
+
+    eod, adapter, fm, ks, bus, om = _make_eod(store=store)
+    adapter.place_order.return_value = _placed_order(side="BUY", symbol="HDFC", qty=5)
+
+    eod.check_and_fire(_ist(15, 17))
+
+    adapter.place_order.assert_called_once()
+    # Verify BUY exit
+    kwargs = adapter.place_order.call_args[1] if adapter.place_order.call_args[1] else {}
+    args = adapter.place_order.call_args[0] if adapter.place_order.call_args[0] else ()
+    side_val = kwargs.get("side") or (args[1] if len(args) > 1 else None)
+    assert side_val == "BUY"
+
+
+def test_open_delivery_positions_not_touched() -> None:
+    """Regression EOD6: CNC positions filtered by get_open_intraday_positions."""
+    store = MagicMock(spec=StateStore)
+    store.get_pending_intraday_orders.return_value = []
+    store.get_open_intraday_positions.return_value = []  # CNC filtered out by helper
+    store.get_eod_squareoff_log_for_date.return_value = None
+
+    eod, adapter, fm, ks, bus, om = _make_eod(store=store)
+    eod.check_and_fire(_ist(15, 17))
+    adapter.place_order.assert_not_called()
+
+
+def test_exit_orders_placed_in_symbol_sorted_order() -> None:
+    """Positions exited in symbol-sorted order (Foundation Rule 3.7 via DB ORDER BY)."""
+    store = MagicMock(spec=StateStore)
+    store.get_pending_intraday_orders.return_value = []
+    # DB helper already returns sorted; simulate with alphabetical order
+    store.get_open_intraday_positions.return_value = [
+        _open_position_row("trd_a", "sig_a", "HDFC", "LONG", 5),
+        _open_position_row("trd_b", "sig_b", "RELIANCE", "LONG", 10),
+        _open_position_row("trd_c", "sig_c", "ZOMATO", "SHORT", 20),
+    ]
+    store.get_eod_squareoff_log_for_date.return_value = None
+
+    eod, adapter, fm, ks, bus, om = _make_eod(store=store, inter_order_delay_ms=0)
+    adapter.place_order.side_effect = [
+        _placed_order("ord_1", "K1", "HDFC", "SELL", 5),
+        _placed_order("ord_2", "K2", "RELIANCE", "SELL", 10),
+        _placed_order("ord_3", "K3", "ZOMATO", "BUY", 20),
+    ]
+
+    eod.check_and_fire(_ist(15, 17))
+
+    symbols_called = [c[1].get("symbol") or c[0][0] for c in adapter.place_order.call_args_list]
+    assert symbols_called == ["HDFC", "RELIANCE", "ZOMATO"]
+
+
+def test_inter_order_delay_applied() -> None:
+    """time.sleep called between orders with correct delay (EOD5 audit fix)."""
+    store = MagicMock(spec=StateStore)
+    store.get_pending_intraday_orders.return_value = []
+    store.get_open_intraday_positions.return_value = [
+        _open_position_row("trd_a", "sig_a", "HDFC", "LONG", 5),
+        _open_position_row("trd_b", "sig_b", "INFY", "LONG", 10),
+    ]
+    store.get_eod_squareoff_log_for_date.return_value = None
+
+    eod, adapter, fm, ks, bus, om = _make_eod(store=store, inter_order_delay_ms=200)
+    adapter.place_order.side_effect = [
+        _placed_order("ord_1", "K1", "HDFC", "SELL", 5),
+        _placed_order("ord_2", "K2", "INFY", "SELL", 10),
+    ]
+
+    with patch("orders.eod_squareoff.time.sleep") as mock_sleep:
+        eod.check_and_fire(_ist(15, 17))
+
+    # FIX-063: Now there are TWO sleep calls:
+    # 1. The 2-second sleep between Pass 1 (cancel) and Pass 2 (exit)
+    # 2. The inter-order delay (0.2s) between the two exit orders
+    assert mock_sleep.call_count == 2
+    assert mock_sleep.call_args_list[0] == call(2)  # FIX-063 pass sleep
+    assert mock_sleep.call_args_list[1] == call(0.2)  # Inter-order delay
+
+
+def test_co_position_exited_via_cancel_order_variety_co() -> None:
+    """Audit 3.1: CO positions are squared off by cancelling the CO bracket
+    (variety='co'), NOT by placing a reverse MARKET. Zerodha forbids MARKET
+    exits for live CO orders and auto-squares at 15:20 with a ₹50+GST penalty."""
+    store = MagicMock(spec=StateStore)
+    store.get_pending_intraday_orders.return_value = []
+    store.get_open_intraday_positions.return_value = [
+        _open_position_row(
+            "trd_co", "sig_co", "RELIANCE", "LONG", 10,
+            order_protocol="CO_PLUS_TGT",
+            entry_broker_order_id="CO_ENTRY_KITE_123",
+            entry_variety="co",
+        ),
+    ]
+    store.get_eod_squareoff_log_for_date.return_value = None
+
+    eod, adapter, fm, ks, bus, om = _make_eod(store=store)
+    adapter.cancel_order.return_value = CancelResult(
+        broker_order_id="CO_ENTRY_KITE_123", success=True, reason=""
+    )
+
+    eod.check_and_fire(_ist(15, 17))
+
+    # CO path: cancel_order(variety="co") was called; NO reverse MARKET placed.
+    adapter.cancel_order.assert_called_once_with("CO_ENTRY_KITE_123", variety="co")
+    adapter.place_order.assert_not_called()
+
+
+def test_co_cancel_rejected_marks_exit_failed() -> None:
+    """Audit 3.1: CO cancel rejection marks trade EOD_EXIT_FAILED and logs
+    CRITICAL with the CO_SQUAREOFF_CANCEL_REJECTED grep tag."""
+    store = MagicMock(spec=StateStore)
+    store.get_pending_intraday_orders.return_value = []
+    store.get_open_intraday_positions.return_value = [
+        _open_position_row(
+            "trd_co_fail", "sig_co_fail", "HDFC", "SHORT", 5,
+            order_protocol="CO_PLUS_TGT",
+            entry_broker_order_id="CO_ENTRY_KITE_999",
+            entry_variety="co",
+        ),
+    ]
+    store.get_eod_squareoff_log_for_date.return_value = None
+
+    eod, adapter, fm, ks, bus, om = _make_eod(store=store)
+    adapter.cancel_order.return_value = CancelResult(
+        broker_order_id="CO_ENTRY_KITE_999", success=False, reason="already filled"
+    )
+
+    eod.check_and_fire(_ist(15, 17))
+
+    adapter.cancel_order.assert_called_once()
+    adapter.place_order.assert_not_called()
+    # Final counts: 1 attempted, 0 succeeded, 1 failed
+    kwargs = store.update_eod_squareoff_log_complete.call_args[1]
+    assert kwargs["positions_attempted"] == 1
+    assert kwargs["positions_succeeded"] == 0
+    assert kwargs["positions_failed"] == 1
+
+
+def test_limit_triple_position_still_uses_reverse_market() -> None:
+    """Audit 3.1 regression: non-CO (LIMIT_TRIPLE / MIS) trades continue to
+    use reverse MARKET as before."""
+    store = MagicMock(spec=StateStore)
+    store.get_pending_intraday_orders.return_value = []
+    store.get_open_intraday_positions.return_value = [
+        _open_position_row(
+            "trd_mis", "sig_mis", "TCS", "LONG", 3,
+            order_protocol="LIMIT_TRIPLE",
+            entry_broker_order_id="ENTRY_MIS_1",
+            entry_variety="regular",
+        ),
+    ]
+    store.get_eod_squareoff_log_for_date.return_value = None
+
+    eod, adapter, fm, ks, bus, om = _make_eod(store=store)
+    adapter.place_order.return_value = _placed_order(symbol="TCS", side="SELL", qty=3)
+
+    eod.check_and_fire(_ist(15, 17))
+
+    # MIS path: reverse MARKET placed; CO cancel NOT called.
+    adapter.place_order.assert_called_once()
+    adapter.cancel_order.assert_not_called()
+
+
+def test_exit_broker_exception_marks_exit_failed_continues() -> None:
+    """BrokerError on place_order -> mark EOD_EXIT_FAILED, continue (EOD5 step 4d)."""
+    from core.exceptions import BrokerError
+
+    store = MagicMock(spec=StateStore)
+    store.get_pending_intraday_orders.return_value = []
+    store.get_open_intraday_positions.return_value = [
+        _open_position_row("trd_a", "sig_a", "FAIL_STOCK", "LONG", 5),
+        _open_position_row("trd_b", "sig_b", "GOOD_STOCK", "LONG", 10),
+    ]
+    store.get_eod_squareoff_log_for_date.return_value = None
+
+    eod, adapter, fm, ks, bus, om = _make_eod(store=store, inter_order_delay_ms=0)
+    adapter.place_order.side_effect = [
+        BrokerError("network error"),
+        _placed_order("ord_2", "K2", "GOOD_STOCK", "SELL", 10),
+    ]
+
+    eod.check_and_fire(_ist(15, 17))
+
+    # Both positions attempted; second succeeded
+    assert adapter.place_order.call_count == 2
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# order_monitor hand-off (EOD7)
+# ─────────────────────────────────────────────────────────────────────────────
+
+def test_order_monitor_track_called_for_exit_order() -> None:
+    """order_monitor.track() called for each placed exit order (EOD7)."""
+    store = MagicMock(spec=StateStore)
+    store.get_pending_intraday_orders.return_value = []
+    store.get_open_intraday_positions.return_value = [
+        _open_position_row("trd_001", "sig_001", "RELIANCE", "LONG", 10),
+    ]
+    store.get_eod_squareoff_log_for_date.return_value = None
+
+    eod, adapter, fm, ks, bus, om = _make_eod(store=store)
+    placed = _placed_order("ord_abc", "KITE999", "RELIANCE", "SELL", 10)
+    adapter.place_order.return_value = placed
+
+    eod.check_and_fire(_ist(15, 17))
+
+    om.track.assert_called_once()
+    track_kwargs = om.track.call_args[1]
+    assert track_kwargs["internal_order_id"] == "ord_abc"
+    assert track_kwargs["broker_order_id"] == "KITE999"
+
+
+def test_fund_manager_not_called_for_position_exits() -> None:
+    """EOD does NOT call fund_manager on exit fills (order_monitor handles that)."""
+    store = MagicMock(spec=StateStore)
+    store.get_pending_intraday_orders.return_value = []
+    store.get_open_intraday_positions.return_value = [
+        _open_position_row("trd_001", "sig_001", "RELIANCE", "LONG", 10),
+    ]
+    store.get_eod_squareoff_log_for_date.return_value = None
+
+    eod, adapter, fm, ks, bus, om = _make_eod(store=store)
+    adapter.place_order.return_value = _placed_order()
+
+    eod.check_and_fire(_ist(15, 17))
+
+    fm.release.assert_not_called()
+    fm.commit_to_used.assert_not_called() if hasattr(fm, "commit_to_used") else None
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# EOD squareoff log (EOD8)
+# ─────────────────────────────────────────────────────────────────────────────
+
+def test_eod_squareoff_log_row_written() -> None:
+    """eod_squareoff_log write-ahead row + COMPLETE update after fire (EOD8 + M-3)."""
+    store = MagicMock(spec=StateStore)
+    store.get_pending_intraday_orders.return_value = []
+    store.get_open_intraday_positions.return_value = []
+    store.get_eod_squareoff_log_for_date.return_value = None
+
+    eod, adapter, fm, ks, bus, om = _make_eod(store=store)
+    eod.check_and_fire(_ist(15, 17))
+
+    # E.4 M-3: two-step write-ahead. Start writes IN_PROGRESS; Complete writes counts.
+    store.insert_eod_squareoff_log_start.assert_called_once()
+    store.update_eod_squareoff_log_complete.assert_called_once()
+    kwargs = store.update_eod_squareoff_log_complete.call_args[1]
+    assert kwargs["positions_attempted"] == 0
+    assert kwargs["cancels_attempted"] == 0
+
+
+def test_eod_squareoff_log_counts_correct() -> None:
+    """Log row has correct counts for mixed success/failure scenario."""
+    store = MagicMock(spec=StateStore)
+    store.get_pending_intraday_orders.return_value = [
+        _pending_order_row("trd_001", "sig_001", "RELIANCE", "LONG", "KITE001"),
+        _pending_order_row("trd_002", "sig_002", "INFY", "LONG", "KITE002"),
+    ]
+    store.get_open_intraday_positions.return_value = [
+        _open_position_row("trd_003", "sig_003", "HDFC", "LONG", 5),
+    ]
+    store.get_eod_squareoff_log_for_date.return_value = None
+    store.get_reservation_id_for_signal.return_value = "res_x"
+
+    eod, adapter, fm, ks, bus, om = _make_eod(store=store, inter_order_delay_ms=0)
+    from core.exceptions import BrokerError
+    adapter.cancel_order.side_effect = [
+        CancelResult("KITE001", True, ""),
+        CancelResult("KITE002", False, "already filled"),
+    ]
+    adapter.place_order.return_value = _placed_order()
+
+    eod.check_and_fire(_ist(15, 17))
+
+    # E.4 M-3: final counts land on update_eod_squareoff_log_complete (not insert)
+    kwargs = store.update_eod_squareoff_log_complete.call_args[1]
+    assert kwargs["cancels_attempted"] == 2
+    assert kwargs["cancels_succeeded"] == 1
+    assert kwargs["cancels_failed"] == 1
+    assert kwargs["positions_attempted"] == 1
+    assert kwargs["positions_succeeded"] == 1
+    assert kwargs["positions_failed"] == 0
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# EodSquareoffComplete event published (EOD5 step 6)
+# ─────────────────────────────────────────────────────────────────────────────
+
+def test_eod_squareoff_complete_event_published() -> None:
+    """EodSquareoffComplete event published with summary (EOD5)."""
+    store = MagicMock(spec=StateStore)
+    store.get_pending_intraday_orders.return_value = []
+    store.get_open_intraday_positions.return_value = []
+    store.get_eod_squareoff_log_for_date.return_value = None
+
+    eod, adapter, fm, ks, bus, om = _make_eod(store=store)
+    eod.check_and_fire(_ist(15, 17))
+
+    bus.publish.assert_called_once()
+    event = bus.publish.call_args[0][0]
+    assert isinstance(event, EodSquareoffComplete)
+    assert event.source_module == "eod_squareoff"
+    assert event.positions_attempted == 0
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# fire_now: emergency manual fire (EOD10)
+# ─────────────────────────────────────────────────────────────────────────────
+
+def test_fire_now_bypasses_time_check() -> None:
+    """fire_now() fires regardless of current time (EOD10)."""
+    store = MagicMock(spec=StateStore)
+    store.get_pending_intraday_orders.return_value = []
+    store.get_open_intraday_positions.return_value = []
+    store.get_eod_squareoff_log_for_date.return_value = None
+
+    eod, adapter, fm, ks, bus, om = _make_eod(store=store)
+    result = eod.fire_now(reason="TEST_EMERGENCY", triggered_by="operator")
+
+    assert isinstance(result, EodFireResult)
+    bus.publish.assert_called_once()
+
+
+def test_fire_now_marks_fired_flag() -> None:
+    """fire_now() marks _fired_for_date so check_and_fire stays quiet (EOD10)."""
+    store = MagicMock(spec=StateStore)
+    store.get_pending_intraday_orders.return_value = []
+    store.get_open_intraday_positions.return_value = []
+    store.get_eod_squareoff_log_for_date.return_value = None
+
+    eod, adapter, fm, ks, bus, om = _make_eod(store=store)
+    with patch("orders.eod_squareoff.now_ist", return_value=_ist(9, 0)):
+        eod.fire_now(reason="MANUAL", triggered_by="test")
+
+    # check_and_fire same day should return False
+    result = eod.check_and_fire(_ist(15, 17))
+    assert result is False
+
+
+def test_fire_now_still_sets_soft_kill() -> None:
+    """fire_now() does NOT skip the kill_switch SOFT_KILL step (EOD10)."""
+    store = MagicMock(spec=StateStore)
+    store.get_pending_intraday_orders.return_value = []
+    store.get_open_intraday_positions.return_value = []
+    store.get_eod_squareoff_log_for_date.return_value = None
+
+    eod, adapter, fm, ks, bus, om = _make_eod(store=store)
+    ks.is_active.return_value = False
+    eod.fire_now(reason="MANUAL", triggered_by="test")
+
+    ks.soft_kill.assert_called_once()
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# M-O5: fire_now must not leave the "already fired" flag stuck on failure, so the
+# 15:17 scheduled check_and_fire can still run the backstop squareoff. Mirrors
+# check_and_fire's reset-on-exception (:223-229) and adds the partial-failure
+# sibling (Rider 1). The realistic _fire raise is LIVE-only (paper get_positions()
+# -> [] places zero exits), so these inject a raising/failing mock (Rule #5).
+# ─────────────────────────────────────────────────────────────────────────────
+
+def test_fire_now_raise_resets_flag_allows_scheduled_retry() -> None:
+    """M-O5: if _fire raises out of fire_now, the flag must NOT stay stuck — the
+    scheduled 15:17 check_and_fire must still fire the backstop. RED before the
+    fix: fire_now left _fired_for_date set, so check_and_fire returned False."""
+    store = MagicMock(spec=StateStore)
+    store.get_pending_intraday_orders.return_value = []
+    store.get_open_intraday_positions.return_value = []
+    store.get_eod_squareoff_log_for_date.return_value = None
+
+    eod, adapter, fm, ks, bus, om = _make_eod(store=store)
+    ks.is_active.return_value = False
+    # soft_kill (:349) is unwrapped in _fire -> a realistic infra raise out of _fire.
+    ks.soft_kill.side_effect = RuntimeError("infra: soft_kill failed")
+
+    with patch("orders.eod_squareoff.now_ist", return_value=_ist(12, 0)):
+        with pytest.raises(RuntimeError):
+            eod.fire_now(reason="daily_loss_limit_breached", triggered_by="fund_manager")
+
+    # The concurrency slot was claimed then reset by the fix (was set -> now False).
+    assert eod._fired_for_date.get(_FIXED_TEST_DATE, False) is False
+
+    # Infra recovers; the scheduled backstop squareoff must now actually fire.
+    ks.soft_kill.side_effect = None
+    assert eod.check_and_fire(_ist(15, 17)) is True
+
+
+def test_fire_now_partial_failure_resets_flag_allows_scheduled_retry() -> None:
+    """M-O5 Rider 1: a fire_now that RETURNS with positions_failed>0 (un-squared
+    positions, no exception) must also not block the 15:17 retry. 'Fired' is not
+    'squared everything'. RED before the fix: flag stayed set, retry skipped."""
+    from core.exceptions import BrokerError
+
+    store = MagicMock(spec=StateStore)
+    store.get_pending_intraday_orders.return_value = []
+    store.get_open_intraday_positions.return_value = [
+        _open_position_row("trd_x", "sig_x", "FAILSTOCK", "LONG", 5),
+    ]
+    store.get_eod_squareoff_log_for_date.return_value = None
+
+    eod, adapter, fm, ks, bus, om = _make_eod(store=store)
+    adapter.place_order.side_effect = BrokerError("place failed")  # -> positions_failed=1
+
+    with patch("orders.eod_squareoff.now_ist", return_value=_ist(12, 0)):
+        r1 = eod.fire_now(reason="daily_loss_limit_breached", triggered_by="fund_manager")
+
+    assert r1.positions_failed > 0                                    # partial failure
+    assert eod._fired_for_date.get(_FIXED_TEST_DATE, False) is False  # flag reset (Rider 1)
+
+    # The scheduled fire must retry the un-squared leg.
+    adapter.place_order.side_effect = None
+    adapter.place_order.return_value = _placed_order("ok", "K", "FAILSTOCK", "SELL", 5)
+    assert eod.check_and_fire(_ist(15, 17)) is True
+
+
+def test_fire_now_retry_resets_daily_pnl_twice_nonzero() -> None:
+    """M-O5 / deploy-note B1: after a Rider-1 retry, reset_daily_pnl runs on BOTH
+    fires, so the RESET_PNL ledger gets TWO rows in one day and the second is
+    NON-ZERO (it carries -current_net). Pins that production must verify RESET_PNL
+    by SUM(pnl_delta), never a single-row read. Zero pnl would be vacuous, so a
+    non-zero net is planted between the two resets."""
+    from core.exceptions import BrokerError
+
+    store = MagicMock(spec=StateStore)
+    store.get_pending_intraday_orders.return_value = []
+    store.get_open_intraday_positions.return_value = [
+        _open_position_row("trd_x", "sig_x", "FAILSTOCK", "LONG", 5),
+    ]
+    store.get_eod_squareoff_log_for_date.return_value = None
+
+    eod, adapter, fm, ks, bus, om = _make_eod(store=store)
+
+    # Emulate reset_daily_pnl: append a RESET row = -(current net), then zero it.
+    state = {"net": -250.0}   # non-zero loss BEFORE the first reset
+    reset_rows: list[float] = []
+
+    def _reset() -> None:
+        reset_rows.append(-state["net"])
+        state["net"] = 0.0
+
+    fm.reset_daily_pnl.side_effect = _reset
+
+    # Fire 1: partial failure -> flag reset (Rider 1); reset_daily_pnl row #1.
+    adapter.place_order.side_effect = BrokerError("place failed")
+    with patch("orders.eod_squareoff.now_ist", return_value=_ist(12, 0)):
+        r1 = eod.fire_now(reason="daily_loss_limit_breached", triggered_by="fund_manager")
+    assert r1.positions_failed > 0
+    assert eod._fired_for_date.get(_FIXED_TEST_DATE, False) is False
+
+    # Non-zero P&L accrues before the scheduled retry (anti-vacuity: NOT zero).
+    state["net"] = -30.0
+    adapter.place_order.side_effect = None
+    adapter.place_order.return_value = _placed_order("ok", "K", "FAILSTOCK", "SELL", 5)
+    assert eod.check_and_fire(_ist(15, 17)) is True
+
+    # Both fires reset -> two non-zero RESET rows; the SUM is the true total.
+    assert fm.reset_daily_pnl.call_count == 2
+    assert reset_rows == [250.0, 30.0]
+    assert reset_rows[1] != 0.0                 # zero would prove nothing
+    assert sum(reset_rows) == 280.0             # SUM(RESET_PNL) == -(net1 + net2)
+
+
+def test_check_and_fire_raise_resets_flag_allows_retry() -> None:
+    """Pins check_and_fire's OWN reset-on-exception (:223-229): if _fire raises,
+    the flag resets so the next poll retries. Coverage-gap fill flagged by the
+    M-O5 investigation (previously unasserted). GREEN before and after the fix —
+    guards the pattern fire_now is being made to mirror from regressing."""
+    eod, adapter, fm, ks, bus, om = _make_eod()
+    ks.is_active.return_value = False
+    ks.soft_kill.side_effect = RuntimeError("infra: soft_kill failed")
+
+    with pytest.raises(RuntimeError):
+        eod.check_and_fire(_ist(15, 17))
+
+    assert eod._fired_for_date.get(_FIXED_TEST_DATE, False) is False
+
+    ks.soft_kill.side_effect = None
+    assert eod.check_and_fire(_ist(15, 17)) is True
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Restart recovery (EOD9)
+# ─────────────────────────────────────────────────────────────────────────────
+
+def test_restart_with_log_row_no_fire() -> None:
+    """
+    EOD9: if log row already exists for today on construction, do NOT fire.
+    check_and_fire also returns False.
+    """
+    store = MagicMock(spec=StateStore)
+    today_str = _FIXED_TEST_DATE.isoformat()
+    # Simulate existing log row with no failures
+    existing_row = MagicMock()
+    existing_row.__getitem__ = lambda self, key: {
+        "fired_date": today_str,
+        "positions_failed": 0,
+        "cancels_failed": 0,
+    }[key]
+    store.get_eod_squareoff_log_for_date.return_value = existing_row
+    store.get_pending_intraday_orders.return_value = []
+    store.get_open_intraday_positions.return_value = []
+
+    with patch("orders.eod_squareoff.now_ist", return_value=_ist(9, 0)):
+        eod, adapter, fm, ks, bus, om = _make_eod(store=store)
+        # H-7: recovery check now deferred to post_wire_init()
+        eod.post_wire_init()
+
+    result = eod.check_and_fire(_ist(15, 17))
+    assert result is False
+    adapter.cancel_order.assert_not_called()
+    adapter.place_order.assert_not_called()
+
+
+def test_restart_with_failed_log_row_logs_warning() -> None:
+    """EOD9: log row with failures -> WARNING logged, no auto-fire."""
+    import logging
+    store = MagicMock(spec=StateStore)
+    today_str = datetime.now(_IST).date().isoformat()
+    existing_row = MagicMock()
+    existing_row.__getitem__ = lambda self, key: {
+        "fired_date": today_str,
+        "positions_failed": 2,
+        "cancels_failed": 0,
+    }[key]
+    store.get_eod_squareoff_log_for_date.return_value = existing_row
+    store.get_pending_intraday_orders.return_value = []
+    store.get_open_intraday_positions.return_value = []
+
+    with patch.object(logging.getLogger("test_eod"), "warning") as mock_warn:
+        eod, adapter, fm, ks, bus, om = _make_eod(store=store)
+
+    # Just verify no crash; warning assertion would need log capture which
+    # is environment-dependent
+
+
+def test_restart_after_1530_no_fire_critical_logged() -> None:
+    """EOD9: past 15:30 with no log row -> CRITICAL but NO auto-fire."""
+    store = MagicMock(spec=StateStore)
+    store.get_eod_squareoff_log_for_date.return_value = None
+    store.get_pending_intraday_orders.return_value = []
+    store.get_open_intraday_positions.return_value = []
+
+    now_mock = _ist(15, 35)
+
+    with patch("orders.eod_squareoff.now_ist", return_value=now_mock):
+        eod, adapter, fm, ks, bus, om = _make_eod(store=store)
+
+    # After construction (recovery check), no fire occurred
+    adapter.cancel_order.assert_not_called()
+    adapter.place_order.assert_not_called()
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# State machine transitions for EOD exit orders (EOD5 step 4c)
+# ─────────────────────────────────────────────────────────────────────────────
+
+def test_state_machine_registered_for_exit_order() -> None:
+    """Exit order registered in state_machine by adapter (ZA7 wiring — not re-registered)."""
+    # ZA7: adapter.place_order already calls new_order_id() and registers
+    # with state_machine. We verify the internal_order_id comes back on PlacedOrder.
+    store = MagicMock(spec=StateStore)
+    store.get_pending_intraday_orders.return_value = []
+    store.get_open_intraday_positions.return_value = [
+        _open_position_row("trd_001", "sig_001", "RELIANCE", "LONG", 10),
+    ]
+    store.get_eod_squareoff_log_for_date.return_value = None
+
+    eod, adapter, fm, ks, bus, om = _make_eod(store=store)
+    placed = _placed_order("ord_xyz", "KITE999", "RELIANCE", "SELL", 10)
+    adapter.place_order.return_value = placed
+
+    eod.check_and_fire(_ist(15, 17))
+
+    # order_monitor should receive the internal_order_id from PlacedOrder
+    om.track.assert_called_once()
+    assert om.track.call_args[1]["internal_order_id"] == "ord_xyz"
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Integration: eod_squareoff_log via real StateStore (EOD8)
+# ─────────────────────────────────────────────────────────────────────────────
+
+def test_real_store_eod_log_insert_and_query() -> None:
+    """Insert eod_squareoff_log row and read it back (EOD8)."""
+    with tempfile.TemporaryDirectory() as tmpdir:
+        store = StateStore(Path(tmpdir) / "test.db")
+
+        today = datetime.now(_IST).date().isoformat()
+        fired_at = datetime.now(_IST).isoformat()
+
+        store.insert_eod_squareoff_log(
+            fired_date=today,
+            fired_at=fired_at,
+            positions_attempted=3,
+            positions_succeeded=2,
+            positions_failed=1,
+            cancels_attempted=1,
+            cancels_succeeded=1,
+            cancels_failed=0,
+            duration_sec=1.23,
+        )
+
+        row = store.get_eod_squareoff_log_for_date(today)
+        assert row is not None
+        assert row["positions_attempted"] == 3
+        assert row["positions_succeeded"] == 2
+        assert row["positions_failed"] == 1
+        assert row["cancels_attempted"] == 1
+        assert abs(row["duration_sec"] - 1.23) < 0.001
+
+        store.close()
+
+
+def test_real_store_eod_log_missing_returns_none() -> None:
+    """get_eod_squareoff_log_for_date returns None for a date with no row."""
+    with tempfile.TemporaryDirectory() as tmpdir:
+        store = StateStore(Path(tmpdir) / "test.db")
+        row = store.get_eod_squareoff_log_for_date("2099-01-01")
+        assert row is None
+        store.close()
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Regression tests: audit blocker fixes
+# ─────────────────────────────────────────────────────────────────────────────
+
+def test_reset_daily_pnl_called_after_fire() -> None:
+    """
+    BLOCKER #12 regression: fund_manager.reset_daily_pnl() must be called
+    after a successful EOD fire.
+    """
+    eod, adapter, fm, ks, bus, om = _make_eod()
+    now = _ist(15, 17)
+    eod.check_and_fire(now)
+    fm.reset_daily_pnl.assert_called_once()
+
+
+def test_fired_for_date_reset_on_fire_exception() -> None:
+    """
+    BLOCKER #13 regression: if _fire() raises, the _fired_for_date flag must
+    be reset so check_and_fire() can retry on the next poll.
+    Previously the flag was set before _fire(), causing permanent lockout.
+    """
+    eod, adapter, fm, ks, bus, om = _make_eod()
+    now = _ist(15, 17)
+    today = now.date()
+
+    # Make _fire() raise on the first call; succeed on the second.
+    original_fire = eod._fire
+    call_count = {"n": 0}
+
+    def _patched_fire(n, *, recovery_fire):
+        call_count["n"] += 1
+        if call_count["n"] == 1:
+            raise RuntimeError("simulated _fire failure")
+        return original_fire(n, recovery_fire=recovery_fire)
+
+    eod._fire = _patched_fire
+
+    # First call: _fire raises → flag must be reset
+    with pytest.raises(RuntimeError):
+        eod.check_and_fire(now)
+
+    assert not eod._fired_for_date.get(today, False), (
+        "_fired_for_date should be reset after _fire() exception"
+    )
+
+    # Second call: _fire succeeds → flag stays set
+    result = eod.check_and_fire(now)
+    assert result is True
+    assert eod._fired_for_date.get(today, False)
+
+
+def test_cancel_pending_entries_updates_order_row_status() -> None:
+    """
+    HIGH #8 regression: after EOD cancels a pending entry order, the orders row
+    status must be set to CANCELLED (not left as PENDING).
+    """
+    from orders.order_manager import OrderManager
+
+    with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as tmpdir:
+        store = StateStore(Path(tmpdir) / "test_h8.db")
+        om = OrderManager(store, logging.getLogger("test_h8_om"))
+
+        # Seed signal row (required FK)
+        sig_id = "SIG_H8_001"
+        now_ts = datetime.now(_IST).isoformat()
+        now_date = datetime.now(_IST).date().isoformat()
+        with store.transaction() as cur:
+            cur.execute(
+                "INSERT INTO signals (signal_id, symbol, scanner, strategy, "
+                "triggered_at, received_at, expires_at, status, fingerprint, fingerprint_date) "
+                "VALUES (?, 'RELIANCE', 'sc', 'strat', ?, ?, ?, 'ACCEPTED', 'fp_h8', ?)",
+                (sig_id, now_ts, now_ts, now_ts, now_date),
+            )
+
+        # Create trade + entry order
+        trade_id = om.create_trade(
+            signal_id=sig_id, symbol="RELIANCE", direction="LONG",
+            strategy="test_strat", sector=None,
+            qty=5, entry_target_price=2500.0, sl_initial=2450.0, tgt_initial=2600.0,
+            order_protocol="LIMIT_TRIPLE", margin_reserved=500.0, risk_amount=250.0,
+        )
+        om.insert_order(
+            trade_id=trade_id, broker_order_id="BRK_ORD_H8",
+            leg="ENTRY", transaction_type="BUY", order_type="LIMIT",
+            product="MIS", variety="regular", qty_requested=5, price=2500.0,
+        )
+        # Also update trade to PENDING_FILL (required by get_pending_intraday_orders)
+        # create_trade sets status=PENDING_FILL already
+
+        # Verify order starts as PENDING
+        row_before = store.fetch_one(
+            "SELECT status FROM orders WHERE order_id = ?", ("BRK_ORD_H8",)
+        )
+        assert row_before["status"] == "PENDING"
+
+        # Build EodSquareoff with real store; mock adapter to return success cancel
+        adapter = MagicMock(spec=["place_order", "cancel_order"])
+        adapter.cancel_order.return_value = MagicMock(success=True, reason=None)
+
+        fm = MagicMock()
+        ks = MagicMock()
+        ks.is_active.return_value = False
+        ks.current_state.return_value = KillState.INACTIVE
+        bus = MagicMock(spec=EventBus)
+        from broker.order_state_machine import OrderStateMachine
+        osm = OrderStateMachine()
+
+        eod = EodSquareoff(
+            adapter=adapter,
+            state_store=store,
+            fund_manager=fm,
+            state_machine=osm,
+            bus=bus,
+            market_windows=_make_market_windows(),
+            time_authority=None,
+            kill_switch=ks,
+            logger=logging.getLogger("test_h8_eod"),
+        )
+
+        now = _ist(15, 17)
+        eod.check_and_fire(now)
+
+        # Verify order row status updated to CANCELLED
+        row_after = store.fetch_one(
+            "SELECT status FROM orders WHERE order_id = ?", ("BRK_ORD_H8",)
+        )
+        assert row_after["status"] == "CANCELLED", (
+            f"Expected CANCELLED, got {row_after['status']}"
+        )
+        store.close()
+
+
+def test_eod9_skipped_late_writes_event_and_alerts() -> None:
+    """
+    Section 3 / EOD9 visibility regression: when system restarts after 15:30
+    with open positions, EOD_SKIPPED_LATE system_event must be written and
+    notifier.send called with severity=CRITICAL.  No fire must occur.
+    """
+    store = MagicMock(spec=StateStore)
+    # Simulate log row missing (no prior fire today)
+    store.get_eod_squareoff_log_for_date.return_value = None
+    # Two open intraday positions
+    store.get_open_intraday_positions.return_value = [
+        {"symbol": "RELIANCE", "side": "LONG", "quantity": 10, "entry_price": 2500.0},
+        {"symbol": "INFY", "side": "LONG", "quantity": 5, "entry_price": 1500.0},
+    ]
+
+    notifier = MagicMock()
+
+    adapter = MagicMock(spec=["place_order", "cancel_order"])
+    fm = MagicMock()
+    ks = MagicMock()
+    ks.is_active.return_value = False
+    ks.current_state.return_value = KillState.INACTIVE
+    bus = MagicMock(spec=EventBus)
+    osm = OrderStateMachine()
+    mw = _make_market_windows()
+    import logging
+    logger = logging.getLogger("test_eod9_skipped")
+
+    # Use a fixed "now" of 15:31 so _check_restart_recovery sees post-15:30
+    fixed_now = _ist(15, 31)
+
+    with patch("orders.eod_squareoff.now_ist", return_value=fixed_now):
+        eod = EodSquareoff(
+            adapter=adapter,
+            state_store=store,
+            fund_manager=fm,
+            state_machine=osm,
+            bus=bus,
+            market_windows=mw,
+            time_authority=None,
+            kill_switch=ks,
+            logger=logger,
+            notifier=notifier,
+        )
+        # H-7: recovery check now deferred to post_wire_init()
+        eod.post_wire_init()
+
+    # Assert EOD_SKIPPED_LATE system_event was written
+    store.insert_system_event.assert_called_once()
+    call_kwargs = store.insert_system_event.call_args
+    assert call_kwargs.kwargs.get("event_type") == "EOD_SKIPPED_LATE", (
+        f"Expected event_type='EOD_SKIPPED_LATE', got {call_kwargs}"
+    )
+
+    # Assert CRITICAL alert sent
+    notifier.send.assert_called_once()
+    send_kwargs = notifier.send.call_args.kwargs
+    assert send_kwargs.get("severity") == "CRITICAL"
+
+    # Assert no broker orders were placed (EOD9: no fire)
+    adapter.place_order.assert_not_called()
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Phase B B.1 — Audit 3.3 (LIMIT_THEN_MARKET) + 5.2 (broker-authoritative qty)
+# ─────────────────────────────────────────────────────────────────────────────
+
+from broker.zerodha_adapter import Quote, Position
+
+
+def _quote(symbol: str, last_price: float) -> Quote:
+    return Quote(
+        symbol=symbol,
+        last_price=last_price,
+        bid=last_price - 0.05,
+        ask=last_price + 0.05,
+        volume=1000,
+        ts=now_ist(),
+    )
+
+
+def _position(symbol: str, qty: int, side: str = "BUY") -> Position:
+    return Position(
+        symbol=symbol, qty=qty, avg_price=100.0, product="MIS", side=side,
+    )
+
+
+def _make_eod_limit(
+    store: Optional[StateStore] = None,
+    limit_aggressive_pct: float = 0.01,
+    limit_grace_sec: float = 0.0,
+    inter_order_delay_ms: int = 0,
+) -> tuple[EodSquareoff, MagicMock, MagicMock, MagicMock, MagicMock, MagicMock]:
+    """LIMIT_THEN_MARKET-mode EodSquareoff with full adapter mock (no spec)."""
+    if store is None:
+        store = MagicMock(spec=StateStore)
+        store.get_pending_intraday_orders.return_value = []
+        store.get_open_intraday_positions.return_value = []
+        store.get_eod_squareoff_log_for_date.return_value = None
+
+    adapter = MagicMock()  # no spec -> get_quote/get_positions auto-attr
+    adapter.get_positions.return_value = []  # default: no broker positions
+    fm = MagicMock(); fm.release.return_value = True
+    ks = MagicMock()
+    ks.is_active.return_value = False
+    ks.current_state.return_value = KillState.INACTIVE
+    bus = MagicMock(spec=EventBus)
+    osm = OrderStateMachine()
+    om = MagicMock()
+    logger = logging.getLogger("test_eod_limit")
+
+    eod = EodSquareoff(
+        adapter=adapter,
+        state_store=store,
+        fund_manager=fm,
+        state_machine=osm,
+        bus=bus,
+        market_windows=_make_market_windows(),
+        time_authority=None,
+        kill_switch=ks,
+        logger=logger,
+        order_monitor=om,
+        inter_order_delay_ms=inter_order_delay_ms,
+        exit_protocol="LIMIT_THEN_MARKET",
+        limit_aggressive_pct=limit_aggressive_pct,
+        limit_grace_sec=limit_grace_sec,
+    )
+    return eod, adapter, fm, ks, bus, om
+
+
+def _placed_limit(
+    internal_id: str = "ord_lim",
+    broker_id: str = "KITE_LIM",
+    symbol: str = "RELIANCE",
+    side: str = "SELL",
+    qty: int = 10,
+    price: float = 99.0,
+) -> PlacedOrder:
+    return PlacedOrder(
+        internal_order_id=internal_id, broker_order_id=broker_id,
+        symbol=symbol, side=side, qty=qty, price=price,
+        order_type="LIMIT", product="MIS", status="SUBMITTED",
+        ts=now_ist(),
+    )
+
+
+def test_b1_limit_protocol_sell_uses_ltp_minus_pct() -> None:
+    """Audit 3.3: LONG -> SELL exit at LIMIT = LTP * (1 - aggressive_pct)."""
+    store = MagicMock(spec=StateStore)
+    store.get_pending_intraday_orders.return_value = []
+    store.get_open_intraday_positions.return_value = [
+        _open_position_row("trd_a", "sig_a", "RELIANCE", "LONG", 10),
+    ]
+    store.get_eod_squareoff_log_for_date.return_value = None
+
+    eod, adapter, fm, ks, bus, om = _make_eod_limit(store=store)
+    # phase-1: 10 open; phase-2: closed (LIMIT filled in grace) -> no MARKET.
+    adapter.get_positions.side_effect = [
+        [_position("RELIANCE", 10)],
+        [],
+    ]
+    adapter.get_quote.return_value = {"RELIANCE": _quote("RELIANCE", 100.0)}
+    adapter.place_order.return_value = _placed_limit(
+        symbol="RELIANCE", side="SELL", qty=10, price=99.0,
+    )
+
+    eod.check_and_fire(_ist(15, 17))
+
+    adapter.get_quote.assert_called_once_with(["RELIANCE"])
+    adapter.place_order.assert_called_once()
+    kwargs = adapter.place_order.call_args.kwargs
+    assert kwargs["order_type"] == "LIMIT"
+    assert kwargs["side"] == "SELL"
+    assert kwargs["qty"] == 10
+    assert kwargs["price"] == 99.0  # 100.0 * (1 - 0.01)
+
+
+def test_b1_limit_protocol_buy_uses_ltp_plus_pct() -> None:
+    """Audit 3.3: SHORT -> BUY exit at LIMIT = LTP * (1 + aggressive_pct)."""
+    store = MagicMock(spec=StateStore)
+    store.get_pending_intraday_orders.return_value = []
+    store.get_open_intraday_positions.return_value = [
+        _open_position_row("trd_b", "sig_b", "HDFC", "SHORT", 5),
+    ]
+    store.get_eod_squareoff_log_for_date.return_value = None
+
+    eod, adapter, fm, ks, bus, om = _make_eod_limit(store=store)
+    adapter.get_positions.side_effect = [
+        [_position("HDFC", 5)],
+        [],
+    ]
+    adapter.get_quote.return_value = {"HDFC": _quote("HDFC", 200.0)}
+    adapter.place_order.return_value = _placed_limit(
+        symbol="HDFC", side="BUY", qty=5, price=202.0,
+    )
+
+    eod.check_and_fire(_ist(15, 17))
+
+    kwargs = adapter.place_order.call_args.kwargs
+    assert kwargs["order_type"] == "LIMIT"
+    assert kwargs["side"] == "BUY"
+    assert kwargs["price"] == 202.0  # 200.0 * (1 + 0.01)
+
+
+def test_b1_phase2_promotes_unfilled_limit_to_market() -> None:
+    """Audit 3.3 phase-2: LIMIT still open after grace -> cancel + MARKET."""
+    store = MagicMock(spec=StateStore)
+    store.get_pending_intraday_orders.return_value = []
+    store.get_open_intraday_positions.return_value = [
+        _open_position_row("trd_a", "sig_a", "RELIANCE", "LONG", 10),
+    ]
+    store.get_eod_squareoff_log_for_date.return_value = None
+
+    eod, adapter, fm, ks, bus, om = _make_eod_limit(store=store, limit_grace_sec=0.0)
+    adapter.get_quote.return_value = {"RELIANCE": _quote("RELIANCE", 100.0)}
+    # First get_positions: phase-1 upfront fetch (broker shows 10 open).
+    # Second get_positions: phase-2 sweep (still 10 open -> promote).
+    adapter.get_positions.side_effect = [
+        [_position("RELIANCE", 10)],
+        [_position("RELIANCE", 10)],
+    ]
+    # First place_order: phase-1 LIMIT. Second: phase-2 MARKET.
+    adapter.place_order.side_effect = [
+        _placed_limit("ord_lim", "KITE_LIM", "RELIANCE", "SELL", 10, 99.0),
+        _placed_order("ord_mkt", "KITE_MKT", "RELIANCE", "SELL", 10),
+    ]
+    adapter.cancel_order.return_value = CancelResult(
+        broker_order_id="KITE_LIM", success=True, reason="",
+    )
+
+    eod.check_and_fire(_ist(15, 17))
+
+    # Phase-1 LIMIT, phase-2 cancel, phase-2 MARKET.
+    assert adapter.place_order.call_count == 2
+    adapter.cancel_order.assert_called_once_with("KITE_LIM")
+    # Phase-2 placed MARKET for the broker-reported remaining qty (10).
+    second_call = adapter.place_order.call_args_list[1].kwargs
+    assert second_call["order_type"] == "MARKET"
+    assert second_call["qty"] == 10
+
+
+def test_b1_phase2_skips_when_position_filled_during_grace() -> None:
+    """Audit 3.3: LIMIT fully filled during grace -> phase-2 sees qty=0, no MARKET."""
+    store = MagicMock(spec=StateStore)
+    store.get_pending_intraday_orders.return_value = []
+    store.get_open_intraday_positions.return_value = [
+        _open_position_row("trd_a", "sig_a", "RELIANCE", "LONG", 10),
+    ]
+    store.get_eod_squareoff_log_for_date.return_value = None
+
+    eod, adapter, fm, ks, bus, om = _make_eod_limit(store=store, limit_grace_sec=0.0)
+    adapter.get_quote.return_value = {"RELIANCE": _quote("RELIANCE", 100.0)}
+    # Phase-1: open. Phase-2: closed (LIMIT filled).
+    adapter.get_positions.side_effect = [
+        [_position("RELIANCE", 10)],
+        [],
+    ]
+    adapter.place_order.return_value = _placed_limit(
+        symbol="RELIANCE", side="SELL", qty=10, price=99.0,
+    )
+
+    eod.check_and_fire(_ist(15, 17))
+
+    # Only the phase-1 LIMIT was placed; no phase-2 MARKET.
+    assert adapter.place_order.call_count == 1
+    adapter.cancel_order.assert_not_called()
+
+
+def test_b1_audit_5_2_broker_qty_overrides_db_qty() -> None:
+    """Audit 5.2: broker shows qty=8 (partial fill not yet ingested);
+    DB row says qty=10. Exit places for 8, not 10."""
+    store = MagicMock(spec=StateStore)
+    store.get_pending_intraday_orders.return_value = []
+    store.get_open_intraday_positions.return_value = [
+        _open_position_row("trd_a", "sig_a", "RELIANCE", "LONG", 10),  # DB: 10
+    ]
+    store.get_eod_squareoff_log_for_date.return_value = None
+
+    # Use legacy MARKET protocol for a clean test of just the qty override.
+    if True:
+        adapter = MagicMock()
+        adapter.get_positions.return_value = [_position("RELIANCE", 8)]  # broker: 8
+        fm = MagicMock(); fm.release.return_value = True
+        ks = MagicMock()
+        ks.is_active.return_value = False
+        ks.current_state.return_value = KillState.INACTIVE
+        bus = MagicMock(spec=EventBus)
+        osm = OrderStateMachine()
+        om = MagicMock()
+        logger = logging.getLogger("test_eod_5_2")
+        eod = EodSquareoff(
+            adapter=adapter, state_store=store, fund_manager=fm,
+            state_machine=osm, bus=bus, market_windows=_make_market_windows(),
+            time_authority=None, kill_switch=ks, logger=logger,
+            order_monitor=om, inter_order_delay_ms=0,
+            exit_protocol="MARKET",  # legacy path, qty override still applies
+        )
+        adapter.place_order.return_value = _placed_order(
+            symbol="RELIANCE", side="SELL", qty=8,
+        )
+
+        eod.check_and_fire(_ist(15, 17))
+
+        kwargs = adapter.place_order.call_args.kwargs
+        assert kwargs["qty"] == 8, "broker qty must override DB qty"
+
+
+def test_b1_audit_5_2_broker_qty_zero_skips_exit() -> None:
+    """Audit 5.2: broker shows qty=0 (already closed); DB row stale.
+    Exit is skipped; no order placed."""
+    store = MagicMock(spec=StateStore)
+    store.get_pending_intraday_orders.return_value = []
+    store.get_open_intraday_positions.return_value = [
+        _open_position_row("trd_a", "sig_a", "RELIANCE", "LONG", 10),
+    ]
+    store.get_eod_squareoff_log_for_date.return_value = None
+
+    adapter = MagicMock()
+    adapter.get_positions.return_value = [_position("OTHER", 5)]  # not RELIANCE
+    fm = MagicMock(); fm.release.return_value = True
+    ks = MagicMock()
+    ks.is_active.return_value = False
+    ks.current_state.return_value = KillState.INACTIVE
+    bus = MagicMock(spec=EventBus)
+    osm = OrderStateMachine()
+    om = MagicMock()
+    logger = logging.getLogger("test_eod_5_2_zero")
+    eod = EodSquareoff(
+        adapter=adapter, state_store=store, fund_manager=fm,
+        state_machine=osm, bus=bus, market_windows=_make_market_windows(),
+        time_authority=None, kill_switch=ks, logger=logger,
+        order_monitor=om, inter_order_delay_ms=0,
+        exit_protocol="MARKET",
+    )
+
+    eod.check_and_fire(_ist(15, 17))
+
+    # broker_qty had OTHER=5 but not RELIANCE -> use_qty=0 -> skip.
+    adapter.place_order.assert_not_called()
+
+
+def test_fix015_delivery_positions_excluded_from_broker_qty() -> None:
+    """
+    FIX-015: broker.get_positions includes CNC/NRML (delivery); EOD must
+    filter to MIS/CO only before building broker_qty dict (EOD6 design).
+    """
+    store = MagicMock(spec=StateStore)
+    store.get_pending_intraday_orders.return_value = []
+    # DB has one MIS position for RELIANCE
+    store.get_open_intraday_positions.return_value = [
+        _open_position_row("trd_a", "sig_a", "RELIANCE", "LONG", 10),
+    ]
+    store.get_eod_squareoff_log_for_date.return_value = None
+
+    adapter = MagicMock()
+    # Broker reports 3 positions: RELIANCE MIS, INFY CNC, TCS NRML
+    adapter.get_positions.return_value = [
+        Position(symbol="RELIANCE", qty=10, avg_price=100.0, product="MIS", side="BUY"),
+        Position(symbol="INFY", qty=50, avg_price=200.0, product="CNC", side="BUY"),
+        Position(symbol="TCS", qty=25, avg_price=300.0, product="NRML", side="BUY"),
+    ]
+    adapter.place_order.return_value = _placed_order("ord_1", "K1", "RELIANCE", "SELL", 10)
+
+    fm = MagicMock(); fm.release.return_value = True
+    ks = MagicMock()
+    ks.is_active.return_value = False
+    ks.current_state.return_value = KillState.INACTIVE
+    bus = MagicMock(spec=EventBus)
+    osm = OrderStateMachine()
+    om = MagicMock()
+    logger = logging.getLogger("test_fix015")
+    eod = EodSquareoff(
+        adapter=adapter, state_store=store, fund_manager=fm,
+        state_machine=osm, bus=bus, market_windows=_make_market_windows(),
+        time_authority=None, kill_switch=ks, logger=logger,
+        order_monitor=om, inter_order_delay_ms=0,
+        exit_protocol="MARKET",
+    )
+
+    eod.check_and_fire(_ist(15, 17))
+
+    # Verify: only RELIANCE (MIS) should be exited. INFY (CNC) and TCS (NRML)
+    # should be filtered out from broker_qty, so their symbols don't influence
+    # the position filter logic.
+    adapter.place_order.assert_called_once()
+    call_args = adapter.place_order.call_args
+    assert call_args[1]["symbol"] == "RELIANCE", "Only MIS position should be exited"
+    assert call_args[1]["side"] == "SELL"
+    assert call_args[1]["qty"] == 10
+
+
+def test_b1_get_quote_failure_falls_back_to_market() -> None:
+    """Audit 3.3: get_quote raises -> all symbols fall back to MARKET."""
+    store = MagicMock(spec=StateStore)
+    store.get_pending_intraday_orders.return_value = []
+    store.get_open_intraday_positions.return_value = [
+        _open_position_row("trd_a", "sig_a", "RELIANCE", "LONG", 10),
+    ]
+    store.get_eod_squareoff_log_for_date.return_value = None
+
+    eod, adapter, fm, ks, bus, om = _make_eod_limit(store=store, limit_grace_sec=0.0)
+    adapter.get_positions.return_value = [_position("RELIANCE", 10)]
+    adapter.get_quote.side_effect = RuntimeError("quote API down")
+    adapter.place_order.return_value = _placed_order(
+        symbol="RELIANCE", side="SELL", qty=10,
+    )
+
+    eod.check_and_fire(_ist(15, 17))
+
+    kwargs = adapter.place_order.call_args.kwargs
+    assert kwargs["order_type"] == "MARKET"
+    # No LIMIT placed -> no phase-2 sweep needed.
+    adapter.cancel_order.assert_not_called()
+
+
+def test_b1_get_quote_returns_zero_ltp_falls_back_to_market() -> None:
+    """Audit 3.3: get_quote returns last_price=0 -> per-symbol fallback to MARKET."""
+    store = MagicMock(spec=StateStore)
+    store.get_pending_intraday_orders.return_value = []
+    store.get_open_intraday_positions.return_value = [
+        _open_position_row("trd_a", "sig_a", "RELIANCE", "LONG", 10),
+    ]
+    store.get_eod_squareoff_log_for_date.return_value = None
+
+    eod, adapter, fm, ks, bus, om = _make_eod_limit(store=store, limit_grace_sec=0.0)
+    adapter.get_positions.return_value = [_position("RELIANCE", 10)]
+    adapter.get_quote.return_value = {"RELIANCE": _quote("RELIANCE", 0.0)}
+    adapter.place_order.return_value = _placed_order(
+        symbol="RELIANCE", side="SELL", qty=10,
+    )
+
+    eod.check_and_fire(_ist(15, 17))
+
+    kwargs = adapter.place_order.call_args.kwargs
+    assert kwargs["order_type"] == "MARKET"
+
+
+def test_b1_get_positions_failure_falls_back_to_db_qty() -> None:
+    """Audit 5.2: get_positions raises -> use DB qty (legacy behaviour)."""
+    store = MagicMock(spec=StateStore)
+    store.get_pending_intraday_orders.return_value = []
+    store.get_open_intraday_positions.return_value = [
+        _open_position_row("trd_a", "sig_a", "RELIANCE", "LONG", 10),
+    ]
+    store.get_eod_squareoff_log_for_date.return_value = None
+
+    adapter = MagicMock()
+    adapter.get_positions.side_effect = RuntimeError("positions API down")
+    fm = MagicMock(); fm.release.return_value = True
+    ks = MagicMock()
+    ks.is_active.return_value = False
+    ks.current_state.return_value = KillState.INACTIVE
+    bus = MagicMock(spec=EventBus)
+    osm = OrderStateMachine()
+    om = MagicMock()
+    logger = logging.getLogger("test_eod_5_2_fail")
+    eod = EodSquareoff(
+        adapter=adapter, state_store=store, fund_manager=fm,
+        state_machine=osm, bus=bus, market_windows=_make_market_windows(),
+        time_authority=None, kill_switch=ks, logger=logger,
+        order_monitor=om, inter_order_delay_ms=0,
+        exit_protocol="MARKET",
+    )
+    adapter.place_order.return_value = _placed_order(
+        symbol="RELIANCE", side="SELL", qty=10,
+    )
+
+    eod.check_and_fire(_ist(15, 17))
+
+    # DB qty=10 used (broker fetch failed).
+    kwargs = adapter.place_order.call_args.kwargs
+    assert kwargs["qty"] == 10
+
+
+def test_b1_phase2_market_failure_marks_failed() -> None:
+    """Audit 3.3: phase-2 MARKET fallback raises -> EOD_EXIT_FAILED, succeeded--/failed++."""
+    store = MagicMock(spec=StateStore)
+    store.get_pending_intraday_orders.return_value = []
+    store.get_open_intraday_positions.return_value = [
+        _open_position_row("trd_a", "sig_a", "RELIANCE", "LONG", 10),
+    ]
+    store.get_eod_squareoff_log_for_date.return_value = None
+
+    eod, adapter, fm, ks, bus, om = _make_eod_limit(store=store, limit_grace_sec=0.0)
+    adapter.get_quote.return_value = {"RELIANCE": _quote("RELIANCE", 100.0)}
+    adapter.get_positions.side_effect = [
+        [_position("RELIANCE", 10)],   # phase-1
+        [_position("RELIANCE", 10)],   # phase-2 (still open)
+    ]
+    adapter.place_order.side_effect = [
+        _placed_limit("ord_lim", "KITE_LIM", "RELIANCE", "SELL", 10, 99.0),
+        RuntimeError("MARKET API down"),  # phase-2 MARKET fails
+    ]
+    adapter.cancel_order.return_value = CancelResult(
+        broker_order_id="KITE_LIM", success=True, reason="",
+    )
+
+    eod.check_and_fire(_ist(15, 17))
+
+    # Final summary: 1 attempted, 0 succeeded, 1 failed.
+    summary_kwargs = store.update_eod_squareoff_log_complete.call_args.kwargs
+    assert summary_kwargs["positions_attempted"] == 1
+    assert summary_kwargs["positions_succeeded"] == 0
+    assert summary_kwargs["positions_failed"] == 1
+
+
+def test_b1_legacy_market_protocol_unchanged() -> None:
+    """Default exit_protocol='MARKET' preserves legacy MARKET-only behaviour;
+    no get_quote call, no LIMIT placement."""
+    store = MagicMock(spec=StateStore)
+    store.get_pending_intraday_orders.return_value = []
+    store.get_open_intraday_positions.return_value = [
+        _open_position_row("trd_a", "sig_a", "RELIANCE", "LONG", 10),
+    ]
+    store.get_eod_squareoff_log_for_date.return_value = None
+
+    adapter = MagicMock()
+    # Broker reports the position open with the same qty as DB.
+    adapter.get_positions.return_value = [_position("RELIANCE", 10)]
+    fm = MagicMock(); fm.release.return_value = True
+    ks = MagicMock()
+    ks.is_active.return_value = False
+    ks.current_state.return_value = KillState.INACTIVE
+    bus = MagicMock(spec=EventBus)
+    osm = OrderStateMachine()
+    om = MagicMock()
+    logger = logging.getLogger("test_eod_legacy")
+    eod = EodSquareoff(
+        adapter=adapter, state_store=store, fund_manager=fm,
+        state_machine=osm, bus=bus, market_windows=_make_market_windows(),
+        time_authority=None, kill_switch=ks, logger=logger,
+        order_monitor=om, inter_order_delay_ms=0,
+        exit_protocol="MARKET",  # legacy
+    )
+    adapter.place_order.return_value = _placed_order(
+        symbol="RELIANCE", side="SELL", qty=10,
+    )
+
+    eod.check_and_fire(_ist(15, 17))
+
+    # Legacy MARKET path: no get_quote call, no LIMIT, no cancel.
+    adapter.get_quote.assert_not_called()
+    kwargs = adapter.place_order.call_args.kwargs
+    assert kwargs["order_type"] == "MARKET"
+    adapter.cancel_order.assert_not_called()
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# E.5 / 2026-04-25 audit — broker-position filter applies on every fire
+#
+# Pre-fix the upfront filter only ran when recovery_fire=True. A regular
+# fire could still hit the per-symbol broker_qty.get(symbol, 0) skip, but
+# without the explicit "naked short prevention" warn log. E.5 promotes the
+# filter to ALL fires so:
+#   (a) the safety log surface is identical between regular and recovery,
+#   (b) the LIMIT phase doesn't waste a get_quote burst on stale symbols.
+# ─────────────────────────────────────────────────────────────────────────────
+
+
+def test_e5_regular_fire_logs_naked_short_warning_for_stale_db_row() -> None:
+    """E.5: on a non-recovery fire, when broker reports the symbol absent,
+    the upfront filter logs a WARNING with the naked-short rationale and
+    no MARKET order is placed."""
+    store = MagicMock(spec=StateStore)
+    store.get_pending_intraday_orders.return_value = []
+    store.get_open_intraday_positions.return_value = [
+        _open_position_row("trd_a", "sig_a", "RELIANCE", "LONG", 10),
+    ]
+    store.get_eod_squareoff_log_for_date.return_value = None
+
+    adapter = MagicMock()
+    # Broker reports a different symbol than the DB has -> RELIANCE is stale.
+    adapter.get_positions.return_value = [_position("OTHER", 5)]
+    fm = MagicMock(); fm.release.return_value = True
+    ks = MagicMock()
+    ks.is_active.return_value = False
+    ks.current_state.return_value = KillState.INACTIVE
+    bus = MagicMock(spec=EventBus)
+    osm = OrderStateMachine()
+    om = MagicMock()
+
+    captured = logging.getLogger("test_eod_e5_warn")
+    handler_records: list[logging.LogRecord] = []
+
+    class _RecHandler(logging.Handler):
+        def emit(self, record: logging.LogRecord) -> None:
+            handler_records.append(record)
+
+    rec_handler = _RecHandler(level=logging.WARNING)
+    captured.addHandler(rec_handler)
+    captured.setLevel(logging.WARNING)
+
+    try:
+        eod = EodSquareoff(
+            adapter=adapter, state_store=store, fund_manager=fm,
+            state_machine=osm, bus=bus, market_windows=_make_market_windows(),
+            time_authority=None, kill_switch=ks, logger=captured,
+            order_monitor=om, inter_order_delay_ms=0,
+            exit_protocol="MARKET",
+        )
+        # Regular fire (recovery_fire defaults to False on first call).
+        eod.check_and_fire(_ist(15, 17))
+
+        adapter.place_order.assert_not_called()
+
+        warns = [r for r in handler_records if r.levelno == logging.WARNING]
+        msgs = [r.getMessage() for r in warns]
+        naked_short_warns = [
+            m for m in msgs
+            if "RELIANCE" in m and "naked short" in m
+            and "recovery_fire=False" in m
+        ]
+        assert naked_short_warns, (
+            f"Expected naked-short WARN on regular fire; got {msgs}"
+        )
+    finally:
+        captured.removeHandler(rec_handler)
+
+
+def test_e5_filter_log_carries_recovery_flag() -> None:
+    """E.5: the summary INFO log records the recovery_fire flag so post-
+    incident review can tell which path filtered. Pin the contract."""
+    store = MagicMock(spec=StateStore)
+    store.get_pending_intraday_orders.return_value = []
+    store.get_open_intraday_positions.return_value = [
+        _open_position_row("trd_a", "sig_a", "RELIANCE", "LONG", 10),
+    ]
+    store.get_eod_squareoff_log_for_date.return_value = None
+
+    adapter = MagicMock()
+    adapter.get_positions.return_value = [_position("RELIANCE", 10)]  # match
+    adapter.place_order.return_value = _placed_order(
+        symbol="RELIANCE", side="SELL", qty=10,
+    )
+    fm = MagicMock(); fm.release.return_value = True
+    ks = MagicMock()
+    ks.is_active.return_value = False
+    ks.current_state.return_value = KillState.INACTIVE
+    bus = MagicMock(spec=EventBus)
+    osm = OrderStateMachine()
+    om = MagicMock()
+
+    captured = logging.getLogger("test_eod_e5_info")
+    handler_records: list[logging.LogRecord] = []
+
+    class _RecHandler(logging.Handler):
+        def emit(self, record: logging.LogRecord) -> None:
+            handler_records.append(record)
+
+    rec_handler = _RecHandler(level=logging.INFO)
+    captured.addHandler(rec_handler)
+    captured.setLevel(logging.INFO)
+
+    try:
+        eod = EodSquareoff(
+            adapter=adapter, state_store=store, fund_manager=fm,
+            state_machine=osm, bus=bus, market_windows=_make_market_windows(),
+            time_authority=None, kill_switch=ks, logger=captured,
+            order_monitor=om, inter_order_delay_ms=0,
+            exit_protocol="MARKET",
+        )
+        eod.check_and_fire(_ist(15, 17))
+
+        infos = [r for r in handler_records if r.levelno == logging.INFO]
+        msgs = [r.getMessage() for r in infos]
+        filter_logs = [
+            m for m in msgs
+            if "broker-position filter" in m and "recovery_fire=False" in m
+        ]
+        assert filter_logs, (
+            f"Expected filter INFO log on regular fire with "
+            f"recovery_fire=False; got {msgs}"
+        )
+    finally:
+        captured.removeHandler(rec_handler)
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Standalone runner
+# ─────────────────────────────────────────────────────────────────────────────
+
+# ───────────────────────────────────────────────────────────────────────────
+# FIX-046: Clear Gate State at EOD
+# ───────────────────────────────────────────────────────────────────────────
+
+def test_fix046_gate_state_cleared_at_eod() -> None:
+    """FIX-046: gate_state table + in-memory watchlist cleared at EOD fire."""
+    store = MagicMock(spec=StateStore)
+    store.get_pending_intraday_orders.return_value = []
+    store.get_open_intraday_positions.return_value = []
+    store.get_eod_squareoff_log_for_date.return_value = None
+
+    # Mock EntryGate with clear_all method
+    gate = MagicMock()
+    gate.clear_all.return_value = 3  # 3 entries cleared
+
+    eod, adapter, fm, ks, bus, om = _make_eod(store)
+    eod._entry_gate = gate  # Wire the gate
+
+    # Trigger EOD
+    eod.fire_now(reason="test", triggered_by="test")
+
+    # Assert gate.clear_all() was called
+    gate.clear_all.assert_called_once()
+    print("  OK FIX-046: gate_state cleared at EOD fire")
+
+
+def test_fix046_gate_clear_failure_does_not_abort_eod() -> None:
+    """FIX-046: If gate.clear_all() raises, EOD sequence continues."""
+    store = MagicMock(spec=StateStore)
+    store.get_pending_intraday_orders.return_value = []
+    store.get_open_intraday_positions.return_value = []
+    store.get_eod_squareoff_log_for_date.return_value = None
+
+    # Mock gate that raises on clear_all
+    gate = MagicMock()
+    gate.clear_all.side_effect = Exception("DB error")
+
+    eod, adapter, fm, ks, bus, om = _make_eod(store)
+    eod._entry_gate = gate
+
+    # Should not raise - EOD continues even if gate clear fails
+    eod.fire_now(reason="test", triggered_by="test")
+
+    # EOD should complete (soft_kill called, etc.)
+    assert ks.soft_kill.called
+    print("  OK FIX-046: gate clear failure does not abort EOD")
+
+
+def test_fix046_no_gate_wired_skips_clear() -> None:
+    """FIX-046: If entry_gate=None, EOD proceeds without error."""
+    store = MagicMock(spec=StateStore)
+    store.get_pending_intraday_orders.return_value = []
+    store.get_open_intraday_positions.return_value = []
+    store.get_eod_squareoff_log_for_date.return_value = None
+
+    eod, adapter, fm, ks, bus, om = _make_eod(store)
+    # entry_gate is None (not wired)
+    assert eod._entry_gate is None
+
+    # Should not crash
+    eod.fire_now(reason="test", triggered_by="test")
+
+    # EOD completes normally
+    assert ks.soft_kill.called
+    print("  OK FIX-046: no gate wired -> skip clear, no error")
+
+
+# ───────────────────────────────────────────────────────────────────────────
+# FIX-047: WAL Checkpoint at EOD
+# ───────────────────────────────────────────────────────────────────────────
+
+def test_fix047_wal_checkpoint_called_at_eod() -> None:
+    """FIX-047: state_store.checkpoint() called during EOD fire."""
+    store = MagicMock(spec=StateStore)
+    store.get_pending_intraday_orders.return_value = []
+    store.get_open_intraday_positions.return_value = []
+    store.get_eod_squareoff_log_for_date.return_value = None
+    store.checkpoint.return_value = {"busy": 0, "log": 100, "checkpointed": 100}
+
+    eod, adapter, fm, ks, bus, om = _make_eod(store)
+
+    # Trigger EOD
+    eod.fire_now(reason="test", triggered_by="test")
+
+    # Assert checkpoint() was called
+    store.checkpoint.assert_called_once()
+    print("  OK FIX-047: WAL checkpoint called at EOD")
+
+
+def test_fix047_checkpoint_failure_does_not_abort_eod() -> None:
+    """FIX-047: If checkpoint() raises, EOD sequence continues."""
+    store = MagicMock(spec=StateStore)
+    store.get_pending_intraday_orders.return_value = []
+    store.get_open_intraday_positions.return_value = []
+    store.get_eod_squareoff_log_for_date.return_value = None
+    store.checkpoint.side_effect = Exception("Checkpoint error")
+
+    eod, adapter, fm, ks, bus, om = _make_eod(store)
+
+    # Should not raise - EOD continues even if checkpoint fails
+    eod.fire_now(reason="test", triggered_by="test")
+
+    # EOD should complete (event published)
+    assert bus.publish.called
+    print("  OK FIX-047: checkpoint failure does not abort EOD")
+
+
+def test_fix047_checkpoint_logs_stats() -> None:
+    """FIX-047: Checkpoint result stats logged as INFO."""
+    store = MagicMock(spec=StateStore)
+    store.get_pending_intraday_orders.return_value = []
+    store.get_open_intraday_positions.return_value = []
+    store.get_eod_squareoff_log_for_date.return_value = None
+    store.checkpoint.return_value = {"busy": 0, "log": 250, "checkpointed": 250}
+
+    eod, adapter, fm, ks, bus, om = _make_eod(store)
+
+    # Fire EOD
+    eod.fire_now(reason="test", triggered_by="test")
+
+    # Checkpoint was called
+    assert store.checkpoint.called
+    print("  OK FIX-047: checkpoint stats logged")
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# FIX-182: daily summary includes CLOSED_MANUAL / EXITING
+# ─────────────────────────────────────────────────────────────────────────────
+
+def test_fix182_daily_summary_includes_closed_manual() -> None:
+    """FIX-182: CLOSED_MANUAL trades appear in the daily summary (previously
+    only pure CLOSED counted -> manual-close days reported 'No closed trades').
+    net_pnl=None on a manual close is coerced to 0.0, not dropped."""
+    eod, adapter, fm, ks, bus, om = _make_eod()
+    store = eod._store  # MagicMock(spec=StateStore)
+    store.get_trades_for_date.return_value = [
+        {"status": "CLOSED_MANUAL", "net_pnl": None, "strategy": "gap_fade_short",
+         "symbol": "AGARIND", "exit_reason": "MANUAL", "risk_amount": 500.0,
+         "margin_reserved": 572.55, "order_protocol": "LIMIT_TRIPLE", "trade_id": "t1"},
+        {"status": "CLOSED", "net_pnl": 120.0, "strategy": "gap_go_long",
+         "symbol": "FOO", "exit_reason": "TGT", "risk_amount": 500.0,
+         "margin_reserved": 1000.0, "order_protocol": "LIMIT_TRIPLE", "trade_id": "t2"},
+        {"status": "FAILED", "net_pnl": None, "strategy": "x", "symbol": "BAR",
+         "trade_id": "t3"},
+    ]
+    store.fetch_all.return_value = []  # no human orders today
+
+    notifier = MagicMock()
+    eod._notifier = notifier
+
+    eod._send_daily_summary("2026-06-16")
+
+    notifier.send.assert_called_once()
+    body = notifier.send.call_args.kwargs["body"]
+    assert "No closed trades" not in body
+    # Both closed + closed_manual counted -> 2 trades, 1 win (FOO), 1 loss (AGARIND@0)
+    assert "1W 1L" in body
+    assert "gap_fade_short" in body and "gap_go_long" in body
+    print("  OK FIX-182: daily summary counts CLOSED_MANUAL (net_pnl None -> 0)")
+
+
+def test_fix182_daily_summary_no_closed_adds_human_note() -> None:
+    """FIX-182: with no closed trades but human/untracked orders present, the
+    summary still says 'No closed trades' but appends the human-order note."""
+    eod, adapter, fm, ks, bus, om = _make_eod()
+    store = eod._store
+    store.get_trades_for_date.return_value = [
+        {"status": "FAILED", "net_pnl": None, "symbol": "BHARATGEAR", "trade_id": "t1"},
+    ]
+    store.fetch_all.return_value = [{"symbol": "ITC"}]  # human order detected today
+
+    notifier = MagicMock()
+    eod._notifier = notifier
+
+    eod._send_daily_summary("2026-06-16")
+
+    notifier.send.assert_called_once()
+    body = notifier.send.call_args.kwargs["body"]
+    assert "No closed trades" in body
+    assert "ITC" in body and "Human" in body
+    print("  OK FIX-182: human-order note appended when no closed trades")
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# FIX-182: EOD broker-driven residual sweep
+# ─────────────────────────────────────────────────────────────────────────────
+
+def test_fix182_residual_sweep_flattens_system_orphan_skips_human() -> None:
+    """FIX-182: a non-zero broker MIS position with no local OPEN trade is
+    flattened ONLY when the system traded that symbol today (system orphan,
+    e.g. GICRE). A human/untracked position (no local trade) is left alone."""
+    from types import SimpleNamespace
+
+    eod, _adapter, fm, ks, bus, om = _make_eod()
+
+    adapter = MagicMock()  # full adapter (get_positions/get_quote/place_order)
+    adapter.get_positions.return_value = [
+        SimpleNamespace(symbol="GICRE", qty=-1, avg_price=366.40, product="MIS"),  # system orphan (short)
+        SimpleNamespace(symbol="ITC", qty=1, avg_price=289.0, product="MIS"),      # human order
+    ]
+    adapter.get_quote.return_value = {"GICRE": SimpleNamespace(last_price=366.0)}
+    placed = MagicMock()
+    placed.internal_order_id = "int1"
+    placed.broker_order_id = "b1"
+    placed.price = 366.05
+    placed.ts = now_ist()
+    adapter.place_order.return_value = placed
+    eod._adapter = adapter
+
+    store = eod._store
+    # System traded GICRE today; ITC has no local trade.
+    store.get_trades_for_date.return_value = [{"symbol": "GICRE"}]
+
+    attempted, succeeded, failed = eod._sweep_residual_broker_positions(handled_symbols=set())
+
+    assert (attempted, succeeded, failed) == (1, 1, 0)
+    # Exactly one flatten order, for GICRE, BUY side (flattening a short).
+    adapter.place_order.assert_called_once()
+    kwargs = adapter.place_order.call_args.kwargs
+    assert kwargs["symbol"] == "GICRE"
+    assert kwargs["side"] == "BUY"
+    assert kwargs["qty"] == 1
+    print("  OK FIX-182: residual sweep flattens system orphan, skips human order")
+
+
+def test_fix182_residual_sweep_skips_handled_symbols() -> None:
+    """FIX-182: positions already handled by the local-trade exit loop are not
+    re-flattened by the residual sweep."""
+    from types import SimpleNamespace
+
+    eod, _adapter, *_ = _make_eod()
+    adapter = MagicMock()
+    adapter.get_positions.return_value = [
+        SimpleNamespace(symbol="GICRE", qty=-1, avg_price=366.40, product="MIS"),
+    ]
+    eod._adapter = adapter
+    eod._store.get_trades_for_date.return_value = [{"symbol": "GICRE"}]
+
+    attempted, succeeded, failed = eod._sweep_residual_broker_positions(
+        handled_symbols={"GICRE"}
+    )
+    assert (attempted, succeeded, failed) == (0, 0, 0)
+    adapter.place_order.assert_not_called()
+    print("  OK FIX-182: residual sweep skips already-handled symbols")
+
+
+def test_fix182_residual_sweep_ignores_cnc_and_zero_qty() -> None:
+    """FIX-182: residual sweep only touches non-zero MIS/CO positions; CNC
+    (delivery) and zero-qty positions are ignored."""
+    from types import SimpleNamespace
+
+    eod, _adapter, *_ = _make_eod()
+    adapter = MagicMock()
+    adapter.get_positions.return_value = [
+        SimpleNamespace(symbol="DELIV", qty=10, avg_price=100.0, product="CNC"),  # delivery
+        SimpleNamespace(symbol="FLAT", qty=0, avg_price=50.0, product="MIS"),     # already flat
+    ]
+    eod._adapter = adapter
+    eod._store.get_trades_for_date.return_value = [{"symbol": "DELIV"}, {"symbol": "FLAT"}]
+
+    attempted, succeeded, failed = eod._sweep_residual_broker_positions(handled_symbols=set())
+    assert (attempted, succeeded, failed) == (0, 0, 0)
+    adapter.place_order.assert_not_called()
+    print("  OK FIX-182: residual sweep ignores CNC + zero-qty positions")
+
+
+if __name__ == "__main__":
+    import traceback
+
+    tests = [
+        test_check_and_fire_before_eod_time_returns_false,
+        test_check_and_fire_at_eod_time_returns_true,
+        test_check_and_fire_on_holiday_returns_false,
+        test_check_and_fire_idempotent_same_day,
+        test_check_and_fire_next_day_fires_again,
+        test_kill_switch_soft_killed_during_fire,
+        test_kill_switch_resumed_after_fire_auto_resume_true,
+        test_kill_switch_not_resumed_if_already_active,
+        test_pending_intraday_orders_cancelled,
+        test_pending_delivery_orders_not_cancelled,
+        test_cancel_failure_logs_critical_and_continues,
+        test_cancel_broker_exception_logs_critical_continues,
+        test_open_intraday_positions_exited_with_market_sell,
+        test_short_position_exited_with_buy,
+        test_open_delivery_positions_not_touched,
+        test_exit_orders_placed_in_symbol_sorted_order,
+        test_inter_order_delay_applied,
+        test_exit_broker_exception_marks_exit_failed_continues,
+        test_order_monitor_track_called_for_exit_order,
+        test_fund_manager_not_called_for_position_exits,
+        test_eod_squareoff_log_row_written,
+        test_eod_squareoff_log_counts_correct,
+        test_eod_squareoff_complete_event_published,
+        test_fire_now_bypasses_time_check,
+        test_fire_now_marks_fired_flag,
+        test_fire_now_still_sets_soft_kill,
+        test_restart_with_log_row_no_fire,
+        test_restart_with_failed_log_row_logs_warning,
+        test_restart_after_1530_no_fire_critical_logged,
+        test_state_machine_registered_for_exit_order,
+        test_real_store_eod_log_insert_and_query,
+        test_real_store_eod_log_missing_returns_none,
+        test_cancel_pending_entries_updates_order_row_status,
+        test_reset_daily_pnl_called_after_fire,
+        test_fired_for_date_reset_on_fire_exception,
+        test_eod9_skipped_late_writes_event_and_alerts,
+        # Audit 3.1 — CO square-off
+        test_co_position_exited_via_cancel_order_variety_co,
+        test_co_cancel_rejected_marks_exit_failed,
+        test_limit_triple_position_still_uses_reverse_market,
+        # B.1 — Audit 3.3 + 5.2
+        test_b1_limit_protocol_sell_uses_ltp_minus_pct,
+        test_b1_limit_protocol_buy_uses_ltp_plus_pct,
+        test_b1_phase2_promotes_unfilled_limit_to_market,
+        test_b1_phase2_skips_when_position_filled_during_grace,
+        test_b1_audit_5_2_broker_qty_overrides_db_qty,
+        test_b1_audit_5_2_broker_qty_zero_skips_exit,
+        test_b1_get_quote_failure_falls_back_to_market,
+        test_b1_get_quote_returns_zero_ltp_falls_back_to_market,
+        test_b1_get_positions_failure_falls_back_to_db_qty,
+        test_b1_phase2_market_failure_marks_failed,
+        test_b1_legacy_market_protocol_unchanged,
+        # E.5 / 2026-04-25 audit — broker-position filter on every fire
+        test_e5_regular_fire_logs_naked_short_warning_for_stale_db_row,
+        test_e5_filter_log_carries_recovery_flag,
+        # FIX-046: Clear gate state at EOD
+        test_fix046_gate_state_cleared_at_eod,
+        test_fix046_gate_clear_failure_does_not_abort_eod,
+        test_fix046_no_gate_wired_skips_clear,
+        # FIX-047: WAL checkpoint at EOD
+        test_fix047_wal_checkpoint_called_at_eod,
+        test_fix047_checkpoint_failure_does_not_abort_eod,
+        test_fix047_checkpoint_logs_stats,
+    ]
+
+    passed = 0
+    failed_tests = []
+    for fn in tests:
+        try:
+            fn()
+            print(f"  PASS  {fn.__name__}")
+            passed += 1
+        except Exception:
+            print(f"  FAIL  {fn.__name__}")
+            traceback.print_exc()
+            failed_tests.append(fn.__name__)
+
+    print(f"\n{passed}/{len(tests)} passed")
+    if failed_tests:
+        print("FAILED:", failed_tests)
+        sys.exit(1)

@@ -1,0 +1,129 @@
+"""
+tests/unit/test_fix133_dynamic_sizing.py
+
+FIX-133 Item 21: Dynamic position sizing by strategy win rate.
+  - High perf_weight -> larger qty (up to 2x cap)
+  - Low (but positive) perf_weight -> smaller qty, floored at 1 lot
+  - perf_weight=0 -> SKIP the trade  (M-C6, 16-Jul-2026 — was "floor at 1", which
+    put capital on a signal the sizing model had sized to nothing; the floor is for
+    small-but-POSITIVE multipliers, not for an explicit zero)
+  - perf_weight=3.0 -> capped at 2x raw_qty
+"""
+from __future__ import annotations
+
+import sys
+from pathlib import Path
+from unittest.mock import MagicMock
+
+sys.path.insert(0, str(Path(__file__).parent.parent.parent))
+
+from capital.fund_manager import CapitalSnapshot
+from capital.position_sizer import PositionSizer, SizingResult
+
+
+def _make_sizer(total=200000.0, risk_pct=0.01, max_conc=0.20):
+    fm = MagicMock()
+    # BUILD 1 (#2): provide a real snapshot — the capital-relative position-value
+    # cap reads snap.total, so a bare MagicMock total no longer works.
+    fm.get_snapshot.return_value = CapitalSnapshot(
+        total=total, intraday_avail=total, intraday_reserved=0.0, intraday_used=0.0,
+        positional_avail=total, positional_reserved=0.0, positional_used=0.0,
+        daily_realized_pnl=0.0, ts="2026-06-24T09:20:00",
+    )
+    sizer = PositionSizer(
+        max_position_value_pct=0.40,  # NI-5: was a silent default
+        fund_manager=fm,
+        leverage_map={"INTRADAY": 5.0, "POSITIONAL": 1.0},
+        risk_per_trade_pct=risk_pct,
+        max_concentration_pct=max_conc,
+    )
+    return sizer
+
+
+class TestDynamicSizingCap:
+
+    def test_high_perf_weight_larger_qty(self) -> None:
+        """High perf_weight (1.5) should produce larger qty than 1.0."""
+        sizer = _make_sizer()
+        base = sizer.calculate("TEST", "BUY", 1000.0, 985.0, "INTRADAY", perf_weight=1.0)
+        boosted = sizer.calculate("TEST", "BUY", 1000.0, 985.0, "INTRADAY", perf_weight=1.5)
+
+        assert boosted.qty >= base.qty, (
+            f"perf_weight=1.5 qty ({boosted.qty}) should be >= base ({base.qty})"
+        )
+        print(f"  OK: perf_weight=1.5 -> qty={boosted.qty} >= base={base.qty}")
+
+    def test_low_perf_weight_smaller_qty(self) -> None:
+        """Low perf_weight (0.5) should produce smaller qty than 1.0."""
+        sizer = _make_sizer()
+        base = sizer.calculate("TEST", "BUY", 1000.0, 985.0, "INTRADAY", perf_weight=1.0)
+        reduced = sizer.calculate("TEST", "BUY", 1000.0, 985.0, "INTRADAY", perf_weight=0.5)
+
+        assert reduced.qty <= base.qty, (
+            f"perf_weight=0.5 qty ({reduced.qty}) should be <= base ({base.qty})"
+        )
+        print(f"  OK: perf_weight=0.5 -> qty={reduced.qty} <= base={base.qty}")
+
+    def test_perf_weight_zero_skips_the_trade(self) -> None:
+        """perf_weight=0 -> SKIP, NOT one lot.
+
+        SUPERSEDED BY M-C6 (16-Jul-2026). This test previously asserted
+        `tiered_qty >= 1` for perf_weight=0 and was named ..._floor_at_one — it
+        locked in the defect: a ZERO multiplier means the sizing model said to trade
+        NOTHING, and flooring it to 1 lot put real capital and real risk on exactly
+        the signal it had just declined. The floor's real job (kept below, and in
+        test_low_perf_weight_smaller_qty) is to stop a small-but-POSITIVE multiplier
+        rounding to zero and silently killing a wanted trade.
+
+        Behaviour-neutral in production: performance_allocator clamps min_weight=0.5
+        (PA3/PA8) and signal_processor defaults an unknown strategy to 1.0, so
+        perf_weight is never 0 today. This is the hard PREREQUISITE for ever lowering
+        min_weight.
+        """
+        sizer = _make_sizer()
+        result = sizer.calculate("TEST", "BUY", 1000.0, 985.0, "INTRADAY", perf_weight=0.0)
+
+        assert result.success is False
+        assert result.qty == 0, "a zero multiplier must not manufacture a position"
+        assert result.constraint == "ZERO_MULTIPLIER"
+        assert result.breakdown.get("tiered_qty") == 0
+        print(f"  OK: perf_weight=0.0 -> SKIP (constraint={result.constraint})")
+
+    def test_perf_weight_large_capped_at_2x(self) -> None:
+        """perf_weight=3.0 should cap tiered_qty at 2x raw_qty."""
+        sizer = _make_sizer()
+        base = sizer.calculate("TEST", "BUY", 1000.0, 985.0, "INTRADAY", perf_weight=1.0)
+        extreme = sizer.calculate("TEST", "BUY", 1000.0, 985.0, "INTRADAY", perf_weight=3.0)
+
+        raw_qty = base.breakdown.get("raw_qty", 0)
+        tiered_qty = extreme.breakdown.get("tiered_qty", 0)
+        assert tiered_qty <= raw_qty * 2, (
+            f"tiered_qty ({tiered_qty}) must be <= 2 * raw_qty ({raw_qty * 2})"
+        )
+        print(f"  OK: perf_weight=3.0 -> tiered_qty={tiered_qty} <= 2*raw={raw_qty * 2}")
+
+    def test_perf_weight_breakdown_recorded(self) -> None:
+        """Breakdown dict should contain perf_weight value."""
+        sizer = _make_sizer()
+        result = sizer.calculate("TEST", "BUY", 1000.0, 985.0, "INTRADAY", perf_weight=1.3)
+        assert "perf_weight" in result.breakdown
+        assert result.breakdown["perf_weight"] == 1.3
+        print(f"  OK: breakdown records perf_weight={result.breakdown['perf_weight']}")
+
+
+if __name__ == "__main__":
+    tests = [
+        TestDynamicSizingCap().test_high_perf_weight_larger_qty,
+        TestDynamicSizingCap().test_low_perf_weight_smaller_qty,
+        TestDynamicSizingCap().test_perf_weight_zero_floor_at_one,
+        TestDynamicSizingCap().test_perf_weight_large_capped_at_2x,
+        TestDynamicSizingCap().test_perf_weight_breakdown_recorded,
+    ]
+    passed = 0
+    for t in tests:
+        try:
+            t()
+            passed += 1
+        except Exception as exc:
+            print(f"  FAIL {t.__name__}: {exc}")
+    print(f"\n{passed}/{len(tests)} passed")

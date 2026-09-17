@@ -1,0 +1,54 @@
+# config/strategies/vwap_bounce_long.yaml
+# Locked decisions: S1-S15
+
+name: "vwap_bounce_long"
+display_name: "VWAP Bounce Long"
+description: "Long entry on price bounce off VWAP with volume confirmation"
+
+direction: "LONG"
+intent: "INTRADAY"
+enabled: true
+order_protocol: "CO_PLUS_TGT"
+
+# Taxonomy (metadata + display only; V3 side-task A). SWING = multi-day hold.
+pipeline: "INTRADAY"
+horizon: "SAME_DAY"
+
+entry_method: "LIMIT"
+entry_offset_pct: 0.001
+
+sl_method: "FIXED_PCT"
+sl_pct: 0.008
+sl_atr_multiplier: 1.5
+sl_min_pct: 0.003
+sl_max_pct: 0.05
+
+tgt_method: "RISK_REWARD"
+tgt_pct: 0.0
+tgt_risk_reward: 1.5
+tgt_atr_multiplier: 2.5
+
+smart_tgt_enabled: true
+smart_tgt_trail_trigger_pct: 0.005
+smart_tgt_trail_step_pct: 0.003
+
+pullback_wait_enabled: true
+pullback_wait_tolerance_pct: 0.005
+pullback_wait_timeout_sec: 180
+
+min_score: 0
+min_volume_surge: 1.5
+min_adr_pct: 0.005
+max_spread_pct: 0.005
+
+lot_size: 1
+max_concurrent_positions: 2  # FIX-135 Item 42
+
+entry_start_time: "09:25"
+entry_end_time: "15:00"   # FIX-133 Item 22: default production window
+active_days:
+  - MON
+  - TUE
+  - WED
+  - THU
+  - FRI

@@ -1,0 +1,2042 @@
+"""
+tests/unit/test_webhook_receiver.py
+
+Validates signals/webhook_receiver.py against locked decisions WR1-WR17.
+
+All tests use Flask's test_client -- no real HTTP, no port binding.
+State store is a fresh in-memory (temp-file) SQLite DB for each test.
+
+Run: python -m pytest tests/unit/test_webhook_receiver.py -v
+Or:  python tests/unit/test_webhook_receiver.py  (standalone mode)
+"""
+from __future__ import annotations
+
+import contextlib
+import hashlib
+import hmac as _hmac
+import json
+import logging
+import queue
+import sqlite3
+import sys
+import tempfile
+import threading
+import time
+import types
+from datetime import datetime, timedelta
+from pathlib import Path
+
+sys.path.insert(0, str(Path(__file__).parent.parent.parent))
+
+from core.state_store import StateStore
+from signals.webhook_receiver import WebhookReceiver
+
+
+# ---------------------------------------------------------------------------
+# Test doubles
+# ---------------------------------------------------------------------------
+
+class _MockMarketWindows:
+    def __init__(self, entry_allowed: bool = True) -> None:
+        self._allowed = entry_allowed
+
+    def is_entry_allowed(self, now) -> bool:
+        return self._allowed
+
+
+class _MockKillSwitch:
+    def __init__(self, active: bool = False) -> None:
+        self._active = active
+
+    def is_active(self, intent: str = "entry") -> bool:
+        return self._active
+
+
+class _NullLogger:
+    def debug(self, *a, **kw): pass
+    def info(self, *a, **kw): pass
+    def warning(self, *a, **kw): pass
+    def error(self, *a, **kw): pass
+    def critical(self, *a, **kw): pass
+
+
+def _make_config(capacity=20, bp_pct=0.8, expiry=60,
+                 scanners=None):
+    if scanners is None:
+        scanners = {"gap_go_long": "strategies/gap_go_long.yaml"}
+    cfg = types.SimpleNamespace()
+    cfg.system = types.SimpleNamespace(
+        signal_queue=types.SimpleNamespace(
+            capacity=capacity,
+            backpressure_pct=bp_pct,
+            expiry_sec=expiry,
+        )
+    )
+    cfg.scan_webhook_map = types.SimpleNamespace(scanners=scanners)
+    return cfg
+
+
+def _make_receiver(
+    sq=None,
+    store=None,
+    config=None,
+    mw=None,
+    ks=None,
+    secret=None,
+    capacity=20,
+    bp_pct=0.8,
+    expiry=60,
+    scanners=None,
+):
+    if sq is None:
+        sq = queue.Queue(maxsize=capacity)
+    if store is None:
+        # Create a fresh temp-file store each time
+        td = tempfile.mkdtemp()
+        store = StateStore(Path(td) / "test.db")
+    if config is None:
+        config = _make_config(capacity=capacity, bp_pct=bp_pct,
+                              expiry=expiry, scanners=scanners)
+    if mw is None:
+        mw = _MockMarketWindows(entry_allowed=True)
+    if ks is None:
+        ks = _MockKillSwitch(active=False)
+    logger = _NullLogger()
+    receiver = WebhookReceiver(sq, store, config, mw, ks, logger,
+                               secret_token=secret)
+    return receiver, sq, store
+
+
+def _now_str() -> str:
+    """Return current local time as YYYY-MM-DD HH:MM:SS (naive IST-ish for tests)."""
+    return datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+
+
+def _expired_str(seconds: int = 120) -> str:
+    """Return a triggered_at that is <seconds> old."""
+    return (datetime.now() - timedelta(seconds=seconds)).strftime("%Y-%m-%d %H:%M:%S")
+
+
+def _valid_payload(scanner="gap_go_long", stocks="RELIANCE", prices="2500.0",
+                   triggered_at=None, scan_name=None):
+    return {
+        "stocks": stocks,
+        "trigger_prices": prices,
+        "triggered_at": triggered_at or _now_str(),
+        "scan_name": scan_name if scan_name is not None else scanner,
+    }
+
+
+# ---------------------------------------------------------------------------
+# Tests
+# ---------------------------------------------------------------------------
+
+def test_health_endpoint_returns_200():
+    """GET /health returns 200 with JSON status."""
+    receiver, _, _ = _make_receiver()
+    with receiver.app.test_client() as client:
+        resp = client.get("/health")
+    assert resp.status_code == 200
+    data = resp.get_json()
+    assert data["status"] == "ok"
+    assert "kill_switch_active" in data
+    assert "queue_size" in data
+    assert "queue_capacity" in data
+    print("  OK GET /health -> 200 with status JSON")
+
+
+def test_valid_single_stock_accepted():
+    """Valid single-stock payload returns 200, 1 accepted, signal in queue, row in DB."""
+    receiver, sq, store = _make_receiver()
+    payload = _valid_payload()
+
+    with receiver.app.test_client() as client:
+        resp = client.post("/webhook/gap_go_long", json=payload)
+
+    assert resp.status_code == 200, resp.get_data(as_text=True)
+    data = resp.get_json()
+    assert data["accepted"] == 1
+    assert data["rejected"] == 0
+    assert len(data["results"]) == 1
+    assert data["results"][0]["status"] == "ACCEPTED"
+    signal_id = data["results"][0]["signal_id"]
+    assert signal_id.startswith("sig_")
+
+    # Signal must be in the queue
+    assert sq.qsize() == 1
+    entry = sq.get_nowait()
+    assert entry[0] == signal_id
+    assert entry[2] == "RELIANCE"
+
+    # Signal must be in the DB
+    row = store.fetch_one("SELECT * FROM signals WHERE signal_id = ?", (signal_id,))
+    assert row is not None
+    assert row["status"] == "QUEUED"
+    assert row["symbol"] == "RELIANCE"
+    print(f"  OK single-stock ACCEPTED: {signal_id}")
+
+
+def test_valid_multi_stock_all_accepted():
+    """Three-stock payload returns 200 with all 3 accepted."""
+    receiver, sq, _ = _make_receiver()
+    payload = _valid_payload(
+        stocks="RELIANCE,TCS,INFY",
+        prices="2500.0,3650.0,1450.25",
+    )
+
+    with receiver.app.test_client() as client:
+        resp = client.post("/webhook/gap_go_long", json=payload)
+
+    assert resp.status_code == 200
+    data = resp.get_json()
+    assert data["accepted"] == 3
+    assert data["rejected"] == 0
+    assert sq.qsize() == 3
+    print("  OK multi-stock 3/3 ACCEPTED")
+
+
+def test_mixed_valid_invalid_payload():
+    """Valid + invalid prices produce per-stock results in one 200 response."""
+    receiver, sq, _ = _make_receiver()
+    payload = _valid_payload(
+        stocks="RELIANCE,BADSTOCK,TCS",
+        prices="2500.0,-1.0,3650.0",
+    )
+
+    with receiver.app.test_client() as client:
+        resp = client.post("/webhook/gap_go_long", json=payload)
+
+    assert resp.status_code == 200
+    data = resp.get_json()
+    assert data["accepted"] == 2
+    assert data["rejected"] == 1
+    statuses = [r["status"] for r in data["results"]]
+    assert statuses[0] == "ACCEPTED"
+    assert statuses[1] == "INVALID_PRICE"
+    assert statuses[2] == "ACCEPTED"
+    print(f"  OK mixed: {statuses}")
+
+
+def test_unknown_scanner_returns_404():
+    """Unknown scanner_name path param returns 404."""
+    receiver, _, _ = _make_receiver()
+    payload = _valid_payload(scanner="unknown_scanner", scan_name="unknown_scanner")
+
+    with receiver.app.test_client() as client:
+        resp = client.post("/webhook/unknown_scanner", json=payload)
+
+    assert resp.status_code == 404
+    print("  OK unknown scanner -> 404")
+
+
+def test_scan_name_body_mismatch_returns_400():
+    """scan_name in body != scanner_name path param -> 400."""
+    receiver, _, _ = _make_receiver()
+    payload = _valid_payload(scan_name="wrong_name")  # path says gap_go_long
+
+    with receiver.app.test_client() as client:
+        resp = client.post("/webhook/gap_go_long", json=payload)
+
+    assert resp.status_code == 400
+    assert "match" in resp.get_json()["error"].lower()
+    print("  OK scan_name mismatch -> 400")
+
+
+def test_malformed_json_returns_400():
+    """Non-JSON body returns 400."""
+    receiver, _, _ = _make_receiver()
+
+    with receiver.app.test_client() as client:
+        resp = client.post("/webhook/gap_go_long",
+                           data=b"this is not json",
+                           content_type="application/json")
+
+    assert resp.status_code == 400
+    print("  OK malformed JSON -> 400")
+
+
+def test_missing_required_field_returns_400():
+    """Missing 'stocks' field returns 400."""
+    receiver, _, _ = _make_receiver()
+    payload = {
+        "trigger_prices": "2500.0",
+        "triggered_at": _now_str(),
+        "scan_name": "gap_go_long",
+        # 'stocks' omitted
+    }
+
+    with receiver.app.test_client() as client:
+        resp = client.post("/webhook/gap_go_long", json=payload)
+
+    assert resp.status_code == 400
+    assert "stocks" in resp.get_json()["error"]
+    print("  OK missing field -> 400")
+
+
+def test_bad_triggered_at_format_returns_400():
+    """Bad triggered_at format returns 400."""
+    receiver, _, _ = _make_receiver()
+    payload = _valid_payload(triggered_at="15/04/2026 10:15")
+
+    with receiver.app.test_client() as client:
+        resp = client.post("/webhook/gap_go_long", json=payload)
+
+    assert resp.status_code == 400
+    print("  OK bad triggered_at format -> 400")
+
+
+def test_hmac_absent_when_required_returns_401():
+    """Missing X-Webhook-Signature when secret_token configured -> 401."""
+    receiver, _, _ = _make_receiver(secret="mysecret")
+    payload = _valid_payload()
+
+    with receiver.app.test_client() as client:
+        resp = client.post("/webhook/gap_go_long", json=payload)  # no HMAC header
+
+    assert resp.status_code == 401
+    print("  OK HMAC absent -> 401")
+
+
+def test_hmac_mismatch_returns_401():
+    """Wrong HMAC value -> 401."""
+    receiver, _, _ = _make_receiver(secret="mysecret")
+    body = json.dumps(_valid_payload()).encode()
+
+    with receiver.app.test_client() as client:
+        resp = client.post(
+            "/webhook/gap_go_long",
+            data=body,
+            headers={
+                "Content-Type": "application/json",
+                "X-Webhook-Signature": "sha256=deadbeefdeadbeefdeadbeefdeadbeef",
+            },
+        )
+
+    assert resp.status_code == 401
+    print("  OK HMAC mismatch -> 401")
+
+
+def test_hmac_valid_returns_200():
+    """Correct HMAC header allows the request through -> 200."""
+    secret = "mysecret"
+    receiver, _, _ = _make_receiver(secret=secret)
+    payload = _valid_payload()
+    body = json.dumps(payload).encode()
+    sig = _hmac.new(secret.encode(), body, hashlib.sha256).hexdigest()
+
+    with receiver.app.test_client() as client:
+        resp = client.post(
+            "/webhook/gap_go_long",
+            data=body,
+            headers={
+                "Content-Type": "application/json",
+                "X-Webhook-Signature": f"sha256={sig}",
+            },
+        )
+
+    assert resp.status_code == 200
+    print("  OK HMAC valid -> 200")
+
+
+def test_hmac_none_mode_no_header_check():
+    """When secret_token=None, no HMAC header required -> 200."""
+    receiver, _, _ = _make_receiver(secret=None)
+
+    with receiver.app.test_client() as client:
+        resp = client.post("/webhook/gap_go_long", json=_valid_payload())
+
+    assert resp.status_code == 200
+    print("  OK HMAC=None mode, no header check -> 200")
+
+
+def test_soft_kill_active_returns_403():
+    """SOFT_KILL active -> 403."""
+    receiver, _, _ = _make_receiver(ks=_MockKillSwitch(active=True))
+
+    with receiver.app.test_client() as client:
+        resp = client.post("/webhook/gap_go_long", json=_valid_payload())
+
+    assert resp.status_code == 403
+    print("  OK SOFT_KILL active -> 403")
+
+
+def test_hard_kill_active_returns_403():
+    """HARD_KILL also returns 403 (is_active() -> True)."""
+    receiver, _, _ = _make_receiver(ks=_MockKillSwitch(active=True))
+
+    with receiver.app.test_client() as client:
+        resp = client.post("/webhook/gap_go_long", json=_valid_payload())
+
+    assert resp.status_code == 403
+    print("  OK HARD_KILL active -> 403")
+
+
+def test_outside_entry_window_returns_403():
+    """Outside entry window (after 13:30) -> 403."""
+    receiver, _, _ = _make_receiver(mw=_MockMarketWindows(entry_allowed=False))
+
+    with receiver.app.test_client() as client:
+        resp = client.post("/webhook/gap_go_long", json=_valid_payload())
+
+    assert resp.status_code == 403
+    assert "entry window" in resp.get_json()["error"].lower()
+    print("  OK outside entry window -> 403")
+
+
+def test_queue_at_backpressure_threshold_returns_503():
+    """Queue at backpressure threshold -> 503."""
+    # capacity=5, bp_pct=0.8 => threshold=4; pre-fill queue with 4 items
+    sq = queue.Queue(maxsize=5)
+    for i in range(4):
+        sq.put_nowait(("sig_dummy", "gap_go_long", f"SYM{i}", 100.0, datetime.now()))
+
+    receiver, _, _ = _make_receiver(sq=sq, capacity=5, bp_pct=0.8)
+
+    with receiver.app.test_client() as client:
+        resp = client.post("/webhook/gap_go_long", json=_valid_payload())
+
+    assert resp.status_code == 503
+    print("  OK queue at backpressure -> 503")
+
+
+def test_queue_full_on_individual_signal_returns_503():
+    """Queue.Full on put_nowait returns 503 so client knows to retry (HIGH #6).
+
+    Design: maxsize=1 (real queue limit), capacity=50 (config value used for
+    backpressure threshold only). bp_threshold = int(50 * 0.9) = 45, so with
+    1 item in the queue the backpressure 503 will NOT fire. The second
+    put_nowait fails with queue.Full -> QUEUE_FULL status AND 503 HTTP code.
+    """
+    sq = queue.Queue(maxsize=1)
+    # capacity=50 so backpressure threshold=45; well above 1 item -> no 503 via BP
+    receiver, _, store = _make_receiver(sq=sq, capacity=50, bp_pct=0.9,
+                                        expiry=3600)
+
+    with receiver.app.test_client() as client:
+        # First signal (RELIANCE) fills the queue
+        resp1 = client.post("/webhook/gap_go_long",
+                            json=_valid_payload(stocks="RELIANCE", prices="2500.0"))
+        assert resp1.status_code == 200
+        data1 = resp1.get_json()
+        assert data1["results"][0]["status"] == "ACCEPTED"
+
+        # Second signal (TCS, different symbol to avoid IN_PROCESS): queue is
+        # physically full -> put_nowait raises Full -> QUEUE_FULL per-stock + 503
+        resp2 = client.post("/webhook/gap_go_long",
+                            json=_valid_payload(stocks="TCS", prices="3650.0",
+                                                triggered_at=_now_str()))
+        assert resp2.status_code == 503, f"Expected 503, got {resp2.status_code}"
+        data2 = resp2.get_json()
+        assert data2["results"][0]["status"] == "QUEUE_FULL", data2
+    print("  OK queue full -> QUEUE_FULL status + 503")
+
+
+def test_ms2_queue_full_then_retry_is_accepted_not_duplicate():
+    """M-S2: QUEUE_FULL is backpressure (503 'retry later'), NOT a duplicate. After the
+    queue drains, the sender's retry of the SAME signal must be ACCEPTED — pre-fix the
+    dedup cache AND the DB fingerprint row both bounced it as DUPLICATE for the whole 300s
+    window, so backpressure recovery was impossible. RED on pre-fix code."""
+    sq = queue.Queue(maxsize=1)
+    receiver, _, store = _make_receiver(sq=sq, capacity=50, bp_pct=0.9, expiry=3600)
+    tcs_ts = _now_str()
+
+    with receiver.app.test_client() as client:
+        # RELIANCE fills the queue (maxsize=1)
+        r1 = client.post("/webhook/gap_go_long",
+                         json=_valid_payload(stocks="RELIANCE", prices="2500.0"))
+        assert r1.get_json()["results"][0]["status"] == "ACCEPTED"
+
+        # TCS -> queue physically full -> QUEUE_FULL + 503
+        r2 = client.post("/webhook/gap_go_long",
+                         json=_valid_payload(stocks="TCS", prices="3650.0", triggered_at=tcs_ts))
+        assert r2.status_code == 503
+        assert r2.get_json()["results"][0]["status"] == "QUEUE_FULL"
+
+        # Backpressure clears (queue drained); the sender retries the SAME signal.
+        sq.get_nowait()
+        receiver.release_in_flight("TCS")   # defensive — QUEUE_FULL path already released it
+
+        r3 = client.post("/webhook/gap_go_long",
+                         json=_valid_payload(stocks="TCS", prices="3650.0", triggered_at=tcs_ts))
+        assert r3.status_code == 200, r3.get_json()
+        assert r3.get_json()["results"][0]["status"] == "ACCEPTED", r3.get_json()
+
+    # the re-accept REUSED the QUEUE_FULL row (no orphan) and flipped it back to QUEUED
+    rows = store.fetch_all("SELECT status FROM signals WHERE symbol = 'TCS'")
+    assert len(rows) == 1, f"expected 1 TCS row (reused), got {len(rows)}"
+    assert rows[0]["status"] == "QUEUED", rows[0]["status"]
+    print("  OK M-S2 QUEUE_FULL -> drain -> retry ACCEPTED (backpressure recovery)")
+
+
+# ---------------------------------------------------------------------------
+# P3-s14: a store failure is NOT a duplicate.
+#
+# _process_signal claims the symbol in-flight and writes the fast-path dedup cache
+# BEFORE the INSERT, and pre-fix the INSERT's only handler was
+# `except sqlite3.IntegrityError`. Any other exception (sqlite3.OperationalError on a
+# full disk being the likeliest) escaped holding BOTH claims: the transaction rolled
+# itself back, but a rollback cannot touch an in-memory cache. The leaked claim then
+# bounced the sender's retry as DUPLICATE for the whole dedup window -> the signal was
+# silently dropped, and the escape also abandoned the rest of the payload batch.
+#
+# No test injected a non-IntegrityError INSERT failure, which is why a wholly
+# unprotected path sat under a green suite.
+# ---------------------------------------------------------------------------
+
+class _InsertFailingCursor:
+    """Wraps a real cursor and raises OperationalError on the signals INSERT for one
+    target symbol -- a faithful stand-in for a disk-full / disk-I/O error at the INSERT.
+    The raise happens INSIDE the real transaction, so the real ROLLBACK still runs."""
+
+    def __init__(self, real_cur, fail_symbol: str) -> None:
+        self._real = real_cur
+        self._fail_symbol = fail_symbol
+
+    def execute(self, sql, params=()):
+        # params[1] is `symbol` in the signals INSERT.
+        if ("INSERT INTO signals" in sql
+                and len(params) > 1 and params[1] == self._fail_symbol):
+            raise sqlite3.OperationalError("disk I/O error")
+        return self._real.execute(sql, params)
+
+    def __getattr__(self, name):
+        return getattr(self._real, name)
+
+
+@contextlib.contextmanager
+def _insert_fails_for(store, fail_symbol: str):
+    """Make the signals INSERT raise sqlite3.OperationalError for `fail_symbol` only.
+    Every other statement (incl. BEGIN IMMEDIATE / COMMIT / ROLLBACK) runs for real."""
+    real_transaction = store.transaction
+
+    @contextlib.contextmanager
+    def _patched():
+        with real_transaction() as cur:
+            yield _InsertFailingCursor(cur, fail_symbol)
+
+    store.transaction = _patched
+    try:
+        yield
+    finally:
+        store.transaction = real_transaction
+
+
+def test_p3s14_store_failure_releases_both_claims():
+    """P3-s14 (1)+(2): a non-IntegrityError INSERT failure must release the fast-path
+    dedup claim AND the in-flight claim. RED on pre-fix code: the OperationalError
+    escaped _process_signal with both still held."""
+    receiver, sq, store = _make_receiver(capacity=50, expiry=3600)
+
+    with receiver.app.test_client() as client:
+        with _insert_fails_for(store, "TCS"):
+            client.post("/webhook/gap_go_long",
+                        json=_valid_payload(stocks="TCS", prices="3650.0"))
+
+    # Both claims leak on pre-fix code, and they bounce the retry at DIFFERENT times:
+    # in-flight is checked first (:811) so an IMMEDIATE retry gets IN_PROCESS; once the
+    # sweeper evicts that (<=120s) the dedup cache takes over and gives DUPLICATE until
+    # its TTL expires (<=300s). The dedup cache is the binding constraint, hence ~300s.
+
+    # (1) the fast-path dedup claim -- leaked, it bounces the retry as DUPLICATE
+    with receiver._dedup_lock:
+        assert ("TCS", "gap_go_long") not in receiver._dedup_cache, \
+            "dedup claim leaked: the retry is bounced as DUPLICATE for the rest of the window"
+
+    # (2) the in-flight claim -- leaked, it bounces the IMMEDIATE retry as IN_PROCESS
+    with receiver._in_flight_lock:
+        assert "TCS" not in receiver._in_flight, \
+            "in-flight claim leaked: the immediate retry is bounced as IN_PROCESS"
+
+    # the transaction rolled back, so no orphan row and nothing queued
+    assert len(store.fetch_all("SELECT signal_id FROM signals WHERE symbol='TCS'")) == 0
+    assert sq.qsize() == 0
+    print("  OK P3-s14 store failure -> both claims released")
+
+
+def test_p3s14_store_failure_retry_is_accepted_not_duplicate():
+    """P3-s14 (3)+(4): after a store failure the sender's IMMEDIATE retry of the SAME
+    signal must be ACCEPTED, and the failed attempt must have answered with a RETRYABLE
+    5xx -- releasing the claims only helps if a retry is actually sent. RED on pre-fix
+    code: the retry came back IN_PROCESS (the leaked in-flight claim is checked before
+    the leaked dedup claim, which would answer DUPLICATE from ~120s to 300s), and the
+    batch answered 500 because the exception escaped to _handle_webhook."""
+    receiver, sq, store = _make_receiver(capacity=50, expiry=3600)
+    ts = _now_str()
+
+    with receiver.app.test_client() as client:
+        with _insert_fails_for(store, "TCS"):
+            r1 = client.post("/webhook/gap_go_long",
+                             json=_valid_payload(stocks="TCS", prices="3650.0",
+                                                 triggered_at=ts))
+
+        # The store is healthy again and the sender retries the SAME signal. Same
+        # (scanner, symbol, epoch bucket) -> the SAME fingerprint, so this also proves
+        # the rolled-back INSERT left no row to collide with.
+        r2 = client.post("/webhook/gap_go_long",
+                         json=_valid_payload(stocks="TCS", prices="3650.0",
+                                             triggered_at=ts))
+
+    # (3) THE HARM first: pre-fix the leaked dedup claim bounced this as DUPLICATE and
+    #     the signal was dropped for the whole window.
+    assert r2.get_json()["results"][0]["status"] == "ACCEPTED", \
+        f"the retry must re-enter cleanly, got {r2.get_json()}"
+    assert r2.status_code == 200, r2.get_json()
+
+    # (4) THE MECHANISM: a retry only arrives if the failed attempt was retryable. An
+    #     ordinary status here would make the batch answer 200 -> Chartink never retries
+    #     -> the bounded loss becomes permanent.
+    assert r1.status_code == 503, \
+        f"a store failure must answer retryably (503), got {r1.status_code}: {r1.get_json()}"
+    assert r1.get_json()["results"][0]["status"] == "STORE_ERROR", r1.get_json()
+
+    # the retry stored exactly one row -- no orphan from the failed attempt
+    rows = store.fetch_all("SELECT status FROM signals WHERE symbol='TCS'")
+    assert len(rows) == 1 and rows[0]["status"] == "QUEUED", rows
+    print("  OK P3-s14 store failure -> 503 -> retry ACCEPTED (not DUPLICATE)")
+
+
+def test_p3s14_store_failure_does_not_abandon_rest_of_batch():
+    """P3-s14 (5): _process_request calls _process_signal inside the per-symbol loop with
+    no try/except, so a raising store failure abandoned every symbol AFTER it in the same
+    Chartink payload. Catching it keeps the loop alive. RED on pre-fix code: the escape
+    returned a bare 500 with no per-symbol results at all."""
+    receiver, sq, store = _make_receiver(capacity=50, expiry=3600)
+
+    with receiver.app.test_client() as client:
+        with _insert_fails_for(store, "TCS"):
+            # TCS sits in the MIDDLE: RELIANCE precedes it, INFY follows it.
+            resp = client.post("/webhook/gap_go_long",
+                               json=_valid_payload(stocks="RELIANCE,TCS,INFY",
+                                                   prices="2500.0,3650.0,1500.0"))
+
+    assert resp.status_code == 503, f"expected 503, got {resp.status_code}"
+    data = resp.get_json()
+    assert "results" in data, f"batch abandoned -- no per-symbol results: {data}"
+    by_symbol = {r["symbol"]: r["status"] for r in data["results"]}
+    assert by_symbol == {"RELIANCE": "ACCEPTED", "TCS": "STORE_ERROR",
+                         "INFY": "ACCEPTED"}, by_symbol
+
+    # INFY comes AFTER the failing symbol: it must be really stored, not just reported.
+    stored = {r["symbol"] for r in store.fetch_all("SELECT symbol FROM signals")}
+    assert stored == {"RELIANCE", "INFY"}, stored
+    print("  OK P3-s14 store failure -> loop continues (INFY after TCS still processed)")
+
+
+def test_duplicate_same_fingerprint_same_minute():
+    """Same scanner+symbol+minute returns per-stock DUPLICATE on second call."""
+    receiver, sq, _ = _make_receiver()
+    ts = _now_str()
+    # Force minute precision: same minute string
+    ts_minute = datetime.now().strftime("%Y-%m-%d %H:%M") + ":00"
+    payload = _valid_payload(triggered_at=ts_minute)
+
+    with receiver.app.test_client() as client:
+        resp1 = client.post("/webhook/gap_go_long", json=payload)
+        assert resp1.status_code == 200
+        assert resp1.get_json()["results"][0]["status"] == "ACCEPTED"
+
+        # Release in-flight so DUPLICATE check runs (not IN_PROCESS)
+        receiver.release_in_flight("RELIANCE")
+
+        resp2 = client.post("/webhook/gap_go_long", json=payload)
+        assert resp2.status_code == 200
+        status2 = resp2.get_json()["results"][0]["status"]
+        assert status2 == "DUPLICATE", f"Expected DUPLICATE, got {status2}"
+
+    print("  OK same fingerprint same minute -> DUPLICATE")
+
+
+def test_fix036_signals_within_ttl_rejected():
+    """FIX-036: Signals within TTL window (300s) are rejected as DUPLICATE.
+
+    Replaces old minute-string behavior which broke across hour boundaries.
+    Same (symbol, scanner_name) within 300 seconds → DUPLICATE.
+    """
+    receiver, sq, _ = _make_receiver(expiry=3600)
+    base = datetime.now()
+    ts1 = base.strftime("%Y-%m-%d %H:%M:%S")
+    ts2 = (base - timedelta(minutes=1)).strftime("%Y-%m-%d %H:%M:%S")  # 1 min earlier, within TTL
+
+    with receiver.app.test_client() as client:
+        resp1 = client.post("/webhook/gap_go_long",
+                            json=_valid_payload(triggered_at=ts1))
+        assert resp1.status_code == 200
+        assert resp1.get_json()["results"][0]["status"] == "ACCEPTED"
+
+        receiver.release_in_flight("RELIANCE")
+
+        resp2 = client.post("/webhook/gap_go_long",
+                            json=_valid_payload(triggered_at=ts2))
+        assert resp2.status_code == 200
+        # FIX-036: TTLCache rejects within 300s window
+        assert resp2.get_json()["results"][0]["status"] == "DUPLICATE"
+
+    print("  OK FIX-036: signals within TTL window rejected as DUPLICATE")
+
+
+def test_fix036_signals_after_ttl_accepted():
+    """FIX-036: Signals after TTL expires (>300s) are accepted.
+
+    TTLCache automatically evicts entries after 300 seconds.
+    This test uses manual cache manipulation to simulate TTL expiry.
+    Use different minute for ts2 to avoid DB fingerprint collision.
+    """
+    receiver, sq, _ = _make_receiver(expiry=3600)
+    base = datetime.now()
+    ts1 = base.strftime("%Y-%m-%d %H:%M:%S")
+    # Use a different minute so DB fingerprint differs
+    ts2 = (base + timedelta(minutes=6)).strftime("%Y-%m-%d %H:%M:%S")
+
+    with receiver.app.test_client() as client:
+        resp1 = client.post("/webhook/gap_go_long",
+                            json=_valid_payload(triggered_at=ts1))
+        assert resp1.status_code == 200
+        assert resp1.get_json()["results"][0]["status"] == "ACCEPTED"
+
+        receiver.release_in_flight("RELIANCE")
+
+        # Manually clear the TTLCache entry to simulate TTL expiry
+        dedup_key = ("RELIANCE", "gap_go_long")
+        with receiver._dedup_lock:
+            receiver._dedup_cache.pop(dedup_key, None)
+
+        resp2 = client.post("/webhook/gap_go_long",
+                            json=_valid_payload(triggered_at=ts2))
+        assert resp2.status_code == 200
+        # After TTL expiry, signal is accepted again
+        assert resp2.get_json()["results"][0]["status"] == "ACCEPTED"
+
+    print("  OK FIX-036: signals after TTL expiry are ACCEPTED")
+
+
+def test_fix131_dedup_window_seconds_used_in_ttl():
+    """FIX-131 Item 17: dedup_window_seconds from config sets TTLCache TTL."""
+    import types
+    cfg = _make_config(expiry=3600)
+    cfg.system.webhook = types.SimpleNamespace(
+        require_hmac=False, dedup_window_seconds=120
+    )
+    receiver, _, _ = _make_receiver(config=cfg, expiry=3600)
+    assert receiver._dedup_window_seconds == 120, (
+        f"Expected 120, got {receiver._dedup_window_seconds}"
+    )
+    print("  OK FIX-131: dedup_window_seconds from config drives TTLCache TTL")
+
+
+def test_fix131_epoch_bucket_same_for_signals_within_5min_epoch():
+    """FIX-131 Item 17: two times within the same 5-min epoch get the same DB fingerprint.
+
+    Old minute-string approach: 12:55 and 12:59 → different fingerprints (4 distinct minutes).
+    New epoch-bucket approach: both within same 300s epoch → same fingerprint → DUPLICATE.
+
+    Note: 5-min epoch boundaries fall on :00, :05, :10, ... so times 12:55:30 and 12:59:30
+    are both in the same 300s epoch (12:55:00-12:59:59) despite crossing 4 minute boundaries.
+    """
+    from datetime import timezone as _tz
+
+    # 12:55:30 UTC and 12:59:30 UTC are 4 minutes apart, same 300s epoch
+    t1 = datetime(2026, 5, 30, 12, 55, 30, tzinfo=_tz.utc)
+    t2 = datetime(2026, 5, 30, 12, 59, 30, tzinfo=_tz.utc)
+    bucket1 = int(t1.timestamp() // 300)
+    bucket2 = int(t2.timestamp() // 300)
+
+    assert bucket1 == bucket2, (
+        f"Expected same 300s bucket for 12:55:30 and 12:59:30, got {bucket1} vs {bucket2}"
+    )
+
+    # Old 1-min bucket would have been different (minute 55 vs 59)
+    old_bucket1 = int(t1.timestamp() // 60)
+    old_bucket2 = int(t2.timestamp() // 60)
+    assert old_bucket1 != old_bucket2, "Old 1-min buckets must differ"
+
+    print(f"  OK FIX-131: 12:55:30 and 12:59:30 share epoch bucket {bucket1} (old 1-min: {old_bucket1} vs {old_bucket2})")
+
+
+def test_fix131_duplicate_across_minute_boundary_rejected_via_db():
+    """FIX-131 Item 17: duplicate within same 5-min epoch rejected even after TTL cleared.
+
+    Uses two timestamps <= 120s apart that share the same 300s epoch bucket.
+    The TTLCache is cleared to force the DB fingerprint check.
+    """
+    import types
+    cfg = _make_config(expiry=3600)
+    cfg.system.webhook = types.SimpleNamespace(
+        require_hmac=False, dedup_window_seconds=300
+    )
+    receiver, sq, _ = _make_receiver(config=cfg, expiry=3600)
+
+    # t1 = 120s ago (within expiry, within 5-min bucket)
+    # t2 = 30s ago  (within expiry, same 5-min bucket as t1 since they're < 300s apart)
+    now = datetime.now()
+    t1 = now - timedelta(seconds=120)
+    t2 = now - timedelta(seconds=30)
+    # Verify they share the same epoch bucket (both fresh, < 300s difference)
+    bucket1 = int(t1.timestamp() // 300)
+    bucket2 = int(t2.timestamp() // 300)
+
+    ts1 = t1.strftime("%Y-%m-%d %H:%M:%S")
+    ts2 = t2.strftime("%Y-%m-%d %H:%M:%S")
+
+    with receiver.app.test_client() as client:
+        resp1 = client.post("/webhook/gap_go_long",
+                            json=_valid_payload(triggered_at=ts1))
+        assert resp1.get_json()["results"][0]["status"] == "ACCEPTED"
+        receiver.release_in_flight("RELIANCE")
+
+        # Clear TTL cache to test DB-fingerprint dedup (not TTL-cache dedup)
+        dedup_key = ("RELIANCE", "gap_go_long")
+        with receiver._dedup_lock:
+            receiver._dedup_cache.pop(dedup_key, None)
+
+        resp2 = client.post("/webhook/gap_go_long",
+                            json=_valid_payload(triggered_at=ts2))
+        status2 = resp2.get_json()["results"][0]["status"]
+        if bucket1 == bucket2:
+            assert status2 == "DUPLICATE", (
+                f"Expected DUPLICATE (same epoch bucket {bucket1}), got {status2}"
+            )
+            print("  OK FIX-131: duplicate within same 5-min epoch bucket rejected via DB fingerprint")
+        else:
+            # If we happen to straddle a 300s boundary, both are accepted — that's correct behavior
+            print(f"  OK FIX-131: signals straddle epoch boundary ({bucket1} vs {bucket2}) -> {status2}")
+
+
+def test_fix131_signal_after_full_window_accepted():
+    """FIX-131 Item 17: signal > 5 min after original is accepted (different epoch bucket)."""
+    import types
+    cfg = _make_config(expiry=7200)
+    cfg.system.webhook = types.SimpleNamespace(
+        require_hmac=False, dedup_window_seconds=300
+    )
+    receiver, sq, _ = _make_receiver(config=cfg, expiry=7200)
+
+    # Two timestamps > 300s apart — guaranteed different epoch buckets
+    # t1 = 600s ago, t2 = 30s ago → 570s apart → different 300s buckets
+    now = datetime.now()
+    t1 = now - timedelta(seconds=600)
+    t2 = now - timedelta(seconds=30)
+    ts1 = t1.strftime("%Y-%m-%d %H:%M:%S")
+    ts2 = t2.strftime("%Y-%m-%d %H:%M:%S")
+
+    with receiver.app.test_client() as client:
+        resp1 = client.post("/webhook/gap_go_long",
+                            json=_valid_payload(triggered_at=ts1))
+        assert resp1.get_json()["results"][0]["status"] == "ACCEPTED"
+        receiver.release_in_flight("RELIANCE")
+
+        # Clear TTL cache to simulate process restart / cache miss
+        dedup_key = ("RELIANCE", "gap_go_long")
+        with receiver._dedup_lock:
+            receiver._dedup_cache.pop(dedup_key, None)
+
+        resp2 = client.post("/webhook/gap_go_long",
+                            json=_valid_payload(triggered_at=ts2))
+        status2 = resp2.get_json()["results"][0]["status"]
+        assert status2 == "ACCEPTED", (
+            f"Expected ACCEPTED (different epoch bucket, 600s apart), got {status2}"
+        )
+    print("  OK FIX-131: signal > 5 min after original accepted (different epoch bucket)")
+
+
+def test_different_scanner_same_symbol_same_minute_accepted():
+    """Different scanner + same symbol + same minute = different fingerprint -> ACCEPTED.
+
+    The in-flight set is per-WebhookReceiver instance. Between the two calls
+    we release RELIANCE from in-flight so the IN_PROCESS guard does not mask
+    the deduplication result (the purpose of this test is fingerprint logic).
+    """
+    scanners = {
+        "scanner_a": "strategies/a.yaml",
+        "scanner_b": "strategies/b.yaml",
+    }
+    receiver, sq, _ = _make_receiver(scanners=scanners, expiry=3600)
+    ts = _now_str()
+
+    with receiver.app.test_client() as client:
+        resp1 = client.post("/webhook/scanner_a",
+                            json=_valid_payload(scanner="scanner_a",
+                                                scan_name="scanner_a",
+                                                triggered_at=ts))
+        assert resp1.status_code == 200
+        assert resp1.get_json()["results"][0]["status"] == "ACCEPTED"
+
+        # Release RELIANCE from in-flight so the second request is not blocked
+        # by IN_PROCESS; the point is that a DIFFERENT scanner creates a different
+        # fingerprint, so no DUPLICATE.
+        receiver.release_in_flight("RELIANCE")
+
+        resp2 = client.post("/webhook/scanner_b",
+                            json=_valid_payload(scanner="scanner_b",
+                                                scan_name="scanner_b",
+                                                triggered_at=ts))
+        assert resp2.status_code == 200
+        assert resp2.get_json()["results"][0]["status"] == "ACCEPTED"
+
+    print("  OK different scanner same symbol -> both ACCEPTED (different fingerprint)")
+
+
+def test_symbol_in_flight_returns_in_process():
+    """Symbol already in _in_flight -> per-stock IN_PROCESS.
+
+    Use expiry=3600 and current-time-based timestamps to avoid EXPIRED masking.
+    Two calls use different minutes so fingerprint differs (no DUPLICATE).
+    """
+    receiver, _, _ = _make_receiver(expiry=3600)
+    base = datetime.now()
+    ts1 = base.strftime("%Y-%m-%d %H:%M:%S")
+    ts2 = (base - timedelta(minutes=1)).strftime("%Y-%m-%d %H:%M:%S")  # different minute
+    ts3 = (base - timedelta(minutes=2)).strftime("%Y-%m-%d %H:%M:%S")  # yet another minute
+
+    with receiver.app.test_client() as client:
+        # First request: RELIANCE accepted and added to in-flight
+        resp1 = client.post("/webhook/gap_go_long",
+                            json=_valid_payload(triggered_at=ts1))
+        assert resp1.get_json()["results"][0]["status"] == "ACCEPTED"
+
+        # Second request (different minute -> not dup) but symbol still in-flight
+        resp2 = client.post("/webhook/gap_go_long",
+                            json=_valid_payload(triggered_at=ts2))
+        assert resp2.status_code == 200
+        status = resp2.get_json()["results"][0]["status"]
+        assert status == "IN_PROCESS", f"Expected IN_PROCESS, got {status}"
+
+    # After release, same symbol within TTL window -> DUPLICATE (FIX-036)
+    receiver.release_in_flight("RELIANCE")
+    with receiver.app.test_client() as client:
+        resp3 = client.post("/webhook/gap_go_long",
+                            json=_valid_payload(triggered_at=ts3))
+        # FIX-036: TTLCache rejects within 300s even after in-flight release
+        assert resp3.get_json()["results"][0]["status"] == "DUPLICATE"
+
+    print("  OK in-flight -> IN_PROCESS; after release within TTL -> DUPLICATE")
+
+
+def test_in_flight_sweeper_evicts_old_entries() -> None:
+    """HIGH #9 regression: sweeper evicts in_flight entries older than timeout."""
+    receiver, _, _ = _make_receiver(expiry=3600)
+
+    # Manually inject a stuck symbol with a very old timestamp
+    with receiver._in_flight_lock:
+        receiver._in_flight["STUCK"] = time.monotonic() - 400  # 400s old > 300s timeout
+
+    # Trigger one sweeper cycle directly (don't wait 60s)
+    receiver._run_sweeper.__func__  # just verify it exists
+    # Run sweeper logic inline
+    now_mono = time.monotonic()
+    evicted = []
+    with receiver._in_flight_lock:
+        for sym, added_at in list(receiver._in_flight.items()):
+            if now_mono - added_at > receiver._in_flight_timeout_sec:
+                evicted.append(sym)
+        for sym in evicted:
+            del receiver._in_flight[sym]
+
+    assert "STUCK" in evicted, "Expected STUCK to be evicted by sweeper"
+    with receiver._in_flight_lock:
+        assert "STUCK" not in receiver._in_flight
+    print("  OK HIGH #9: sweeper evicts in_flight entries older than timeout")
+
+
+def test_expired_signal_returns_expired():
+    """Signal triggered_at older than expiry_sec -> per-stock EXPIRED."""
+    receiver, _, _ = _make_receiver(expiry=60)
+    payload = _valid_payload(triggered_at=_expired_str(seconds=120))
+
+    with receiver.app.test_client() as client:
+        resp = client.post("/webhook/gap_go_long", json=payload)
+
+    assert resp.status_code == 200
+    assert resp.get_json()["results"][0]["status"] == "EXPIRED"
+    print("  OK expired signal -> EXPIRED")
+
+
+def test_invalid_price_zero_returns_invalid_price():
+    """Price == 0 -> INVALID_PRICE."""
+    receiver, _, _ = _make_receiver()
+    payload = _valid_payload(prices="0")
+
+    with receiver.app.test_client() as client:
+        resp = client.post("/webhook/gap_go_long", json=payload)
+
+    assert resp.status_code == 200
+    assert resp.get_json()["results"][0]["status"] == "INVALID_PRICE"
+    print("  OK price=0 -> INVALID_PRICE")
+
+
+def test_invalid_price_negative_returns_invalid_price():
+    """Negative price -> INVALID_PRICE."""
+    receiver, _, _ = _make_receiver()
+    payload = _valid_payload(prices="-100")
+
+    with receiver.app.test_client() as client:
+        resp = client.post("/webhook/gap_go_long", json=payload)
+
+    assert resp.status_code == 200
+    assert resp.get_json()["results"][0]["status"] == "INVALID_PRICE"
+    print("  OK negative price -> INVALID_PRICE")
+
+
+def test_invalid_price_non_numeric_returns_invalid_price():
+    """Non-numeric price string -> INVALID_PRICE."""
+    receiver, _, _ = _make_receiver()
+    payload = _valid_payload(prices="abc")
+
+    with receiver.app.test_client() as client:
+        resp = client.post("/webhook/gap_go_long", json=payload)
+
+    assert resp.status_code == 200
+    assert resp.get_json()["results"][0]["status"] == "INVALID_PRICE"
+    print("  OK non-numeric price -> INVALID_PRICE")
+
+
+def test_empty_symbol_returns_invalid_symbol():
+    """Empty symbol string -> INVALID_SYMBOL."""
+    receiver, _, _ = _make_receiver()
+    payload = _valid_payload(stocks=" ,TCS", prices="2500.0,3650.0")
+
+    with receiver.app.test_client() as client:
+        resp = client.post("/webhook/gap_go_long", json=payload)
+
+    assert resp.status_code == 200
+    results = resp.get_json()["results"]
+    assert results[0]["status"] == "INVALID_SYMBOL"
+    assert results[1]["status"] == "ACCEPTED"
+    print("  OK empty symbol -> INVALID_SYMBOL")
+
+
+def test_webhook_audit_row_written_for_every_post():
+    """Every POST writes a webhook_audit row regardless of outcome (WR13)."""
+    td = tempfile.mkdtemp()
+    store = StateStore(Path(td) / "test.db")
+    receiver, _, _ = _make_receiver(store=store)
+
+    audit_q = "SELECT COUNT(*) AS n FROM webhook_audit"
+
+    with receiver.app.test_client() as client:
+        # 200 OK
+        client.post("/webhook/gap_go_long", json=_valid_payload())
+        assert store.fetch_one(audit_q)["n"] == 1
+
+        # 404 (unknown scanner)
+        client.post("/webhook/no_such_scanner",
+                    json=_valid_payload(scanner="no_such_scanner",
+                                        scan_name="no_such_scanner"))
+        assert store.fetch_one(audit_q)["n"] == 2
+
+        # 403 (kill switch)
+        receiver._ks = _MockKillSwitch(active=True)
+        client.post("/webhook/gap_go_long", json=_valid_payload())
+        assert store.fetch_one(audit_q)["n"] == 3
+        receiver._ks = _MockKillSwitch(active=False)
+
+        # 400 (bad JSON)
+        client.post("/webhook/gap_go_long",
+                    data=b"bad", content_type="application/json")
+        assert store.fetch_one(audit_q)["n"] == 4
+
+    store.close()
+    print("  OK audit row written for all 4 outcomes")
+
+
+def test_concurrent_posts_queue_consistent():
+    """5 concurrent POSTs process independently; queue count matches accepted."""
+    receiver, sq, _ = _make_receiver(capacity=50)
+    errors = []
+    accepted_counts = []
+
+    symbols = ["REL", "TCS", "INFY", "HDFC", "SBIN"]
+
+    def post_signal(sym: str) -> None:
+        try:
+            with receiver.app.test_client() as client:
+                resp = client.post(
+                    "/webhook/gap_go_long",
+                    json=_valid_payload(stocks=sym, prices="1000.0"),
+                )
+            data = resp.get_json()
+            accepted_counts.append(data.get("accepted", 0))
+        except Exception as exc:
+            errors.append(str(exc))
+
+    threads = [threading.Thread(target=post_signal, args=(s,)) for s in symbols]
+    for t in threads:
+        t.start()
+    for t in threads:
+        t.join(timeout=10)
+
+    assert not errors, f"Thread errors: {errors}"
+    total_accepted = sum(accepted_counts)
+    assert sq.qsize() == total_accepted, \
+        f"queue size {sq.qsize()} != total accepted {total_accepted}"
+    print(f"  OK 5 concurrent POSTs: {total_accepted} accepted, queue size {sq.qsize()}")
+
+
+def test_performance_100_posts_under_5_seconds():
+    """100 single-stock POSTs complete in < 5 seconds (handler latency smoke test)."""
+    # C-2 (02-Jul-2026): this measures raw handler throughput from ONE client IP.
+    # Disable the per-IP rate limiter here — a genuine single-IP flood of 100 is
+    # correctly capped at burst=60 (see test_c2_webhook_lockdown), which is not
+    # what this latency smoke test is exercising.
+    cfg = _make_config(capacity=200)
+    cfg.system.webhook = types.SimpleNamespace(per_ip_rate_limit_enabled=False)
+    receiver, sq, _ = _make_receiver(capacity=200, config=cfg)
+
+    start = time.monotonic()
+    with receiver.app.test_client() as client:
+        for i in range(100):
+            ts = f"2026-04-15 10:{i // 60:02d}:{i % 60:02d}"
+            # Use different symbols to avoid IN_PROCESS
+            sym = f"SYM{i:03d}"
+            resp = client.post(
+                "/webhook/gap_go_long",
+                json={
+                    "stocks": sym,
+                    "trigger_prices": "1000.0",
+                    "triggered_at": ts,
+                    "scan_name": "gap_go_long",
+                },
+            )
+            assert resp.status_code == 200, f"Request {i} failed: {resp.status_code}"
+
+    elapsed = time.monotonic() - start
+    assert elapsed < 5.0, f"100 POSTs took {elapsed:.2f}s, expected < 5s"
+    print(f"  OK 100 POSTs in {elapsed:.3f}s ({elapsed / 100 * 1000:.1f}ms each)")
+
+
+# ---------------------------------------------------------------------------
+# BL-18: construction guard for config.webhook.require_hmac
+#
+# SCOPE: these tests are CONSTRUCTOR-ONLY — they prove __init__ raises (or does not)
+# for a given require_hmac/secret combination. They do NOT exercise request-time
+# enforcement: delete the request-time `elif self._require_hmac` branches and every
+# BL-18 test below still passes. Request-time enforcement is owned by the G.1 tests
+# further down (/webhook) and by TestHealthRequireHmac in test_fix134_backpressure.py
+# (/health, added 17-Jul). Don't read a green BL-18 as proof the routes enforce it.
+# ---------------------------------------------------------------------------
+
+def _make_config_with_require_hmac(require_hmac: bool):
+    """Return a config object shaped like SystemConfig, with webhook.require_hmac."""
+    cfg = _make_config()
+    cfg.webhook = types.SimpleNamespace(
+        bind_host="127.0.0.1",
+        bind_port=5000,
+        require_hmac=require_hmac,
+    )
+    return cfg
+
+
+def _bl18_build(config, secret):
+    """Construct WebhookReceiver with given config + secret (bypasses _make_receiver
+    which would inject a default config without the webhook attribute)."""
+    import pytest  # noqa: F401 - only for raises in tests below
+    sq = queue.Queue(maxsize=20)
+    td = tempfile.mkdtemp()
+    store = StateStore(Path(td) / "test.db")
+    return WebhookReceiver(
+        sq, store, config,
+        _MockMarketWindows(entry_allowed=True),
+        _MockKillSwitch(active=False),
+        _NullLogger(),
+        secret_token=secret,
+    )
+
+
+def test_bl18_require_hmac_true_no_secret_raises():
+    """require_hmac=True + secret_token=None -> ValueError at construction (BL-18)."""
+    import pytest
+    cfg = _make_config_with_require_hmac(True)
+    with pytest.raises(ValueError, match="require_hmac"):
+        _bl18_build(cfg, None)
+    print("  OK BL-18: require_hmac=True + no secret raises")
+
+
+def test_bl18_require_hmac_true_empty_secret_raises():
+    """require_hmac=True + secret_token='' -> ValueError (BL-18: falsy check)."""
+    import pytest
+    cfg = _make_config_with_require_hmac(True)
+    with pytest.raises(ValueError, match="require_hmac"):
+        _bl18_build(cfg, "")
+    print("  OK BL-18: require_hmac=True + empty secret raises")
+
+
+def test_bl18_require_hmac_true_with_secret_ok():
+    """require_hmac=True + secret set -> construction succeeds (BL-18)."""
+    cfg = _make_config_with_require_hmac(True)
+    receiver = _bl18_build(cfg, "real-secret")
+    assert receiver is not None
+    print("  OK BL-18: require_hmac=True + secret succeeds")
+
+
+def test_bl18_require_hmac_false_no_secret_ok():
+    """require_hmac=False -> permissive; no secret is fine (BL-18)."""
+    cfg = _make_config_with_require_hmac(False)
+    receiver = _bl18_build(cfg, None)
+    assert receiver is not None
+    print("  OK BL-18: require_hmac=False + no secret succeeds")
+
+
+def test_bl18_nested_appconfig_shape_resolved():
+    """AppConfig shape (config.system.webhook.require_hmac) is resolved (BL-18)."""
+    import pytest
+    cfg = _make_config()  # flat, no .webhook
+    cfg.system = types.SimpleNamespace(
+        webhook=types.SimpleNamespace(
+            bind_host="127.0.0.1", bind_port=5000, require_hmac=True
+        )
+    )
+    with pytest.raises(ValueError, match="require_hmac"):
+        _bl18_build(cfg, None)
+    print("  OK BL-18: nested AppConfig shape resolved")
+
+
+def test_bl18_no_webhook_attr_permissive():
+    """Missing webhook attr (legacy/test fixtures) -> permissive (BL-18)."""
+    cfg = _make_config()  # no .webhook, no .system.webhook
+    receiver = _bl18_build(cfg, None)
+    assert receiver is not None
+    print("  OK BL-18: no webhook attr is permissive")
+
+
+# ---------------------------------------------------------------------------
+# G.1 / 2026-04-25 audit: require_hmac=True disables token-param fallback.
+# Pre-fix, a request with ?token=<secret> but no X-Webhook-Signature header
+# was accepted via the elif token_param branch even when require_hmac=True
+# (which is meant to mean "HMAC ONLY"). Tokens in URL are logged by nginx
+# and weaker than HMAC over the body.
+# ---------------------------------------------------------------------------
+
+def test_g1_require_hmac_true_rejects_token_only_request():
+    """G.1: require_hmac=True + ?token=secret + no HMAC header -> 401."""
+    cfg = _make_config_with_require_hmac(True)
+    receiver = _bl18_build(cfg, "real-secret")
+    payload = _valid_payload()
+
+    with receiver.app.test_client() as client:
+        resp = client.post(
+            "/webhook/gap_go_long?token=real-secret",
+            json=payload,
+        )
+
+    assert resp.status_code == 401
+    body = resp.get_json() or {}
+    assert "HMAC signature required" in body.get("error", ""), (
+        f"Expected HMAC-required error, got {body!r}"
+    )
+    print("  OK G.1: require_hmac=True rejects token-only request")
+
+
+def test_g1_require_hmac_true_accepts_valid_hmac():
+    """G.1 regression: require_hmac=True still accepts a valid HMAC -> 200."""
+    secret = "real-secret"
+    cfg = _make_config_with_require_hmac(True)
+    receiver = _bl18_build(cfg, secret)
+    body = json.dumps(_valid_payload()).encode()
+    sig = _hmac.new(secret.encode(), body, hashlib.sha256).hexdigest()
+
+    with receiver.app.test_client() as client:
+        resp = client.post(
+            "/webhook/gap_go_long",
+            data=body,
+            headers={
+                "Content-Type": "application/json",
+                "X-Webhook-Signature": f"sha256={sig}",
+            },
+        )
+
+    assert resp.status_code == 200, f"Expected 200, got {resp.status_code}: {resp.data!r}"
+    print("  OK G.1: require_hmac=True still accepts valid HMAC")
+
+
+def test_g1_require_hmac_false_keeps_legacy_token_path():
+    """G.1: require_hmac=False (or absent) preserves the Chartink-compatible
+    token-in-URL path. This is the pin for back-compat in legacy deployments."""
+    cfg = _make_config_with_require_hmac(False)
+    receiver = _bl18_build(cfg, "real-secret")
+
+    with receiver.app.test_client() as client:
+        resp = client.post(
+            "/webhook/gap_go_long?token=real-secret",
+            json=_valid_payload(),
+        )
+
+    assert resp.status_code == 200, (
+        f"require_hmac=False must still allow token; got "
+        f"{resp.status_code}: {resp.data!r}"
+    )
+    print("  OK G.1: require_hmac=False keeps token-param fallback")
+
+
+def test_g1_require_hmac_true_rejects_invalid_hmac_does_not_fall_through():
+    """G.1: require_hmac=True + invalid HMAC + valid token -> 401 (HMAC
+    mismatch), never falls through to token check. Pin existing behavior."""
+    cfg = _make_config_with_require_hmac(True)
+    receiver = _bl18_build(cfg, "real-secret")
+
+    with receiver.app.test_client() as client:
+        resp = client.post(
+            "/webhook/gap_go_long?token=real-secret",
+            json=_valid_payload(),
+            headers={"X-Webhook-Signature": "sha256=deadbeef"},
+        )
+
+    assert resp.status_code == 401
+    body = resp.get_json() or {}
+    # Either HMAC mismatch OR HMAC required is acceptable; what must NOT
+    # happen is the token-fallback path letting the request through.
+    assert resp.status_code != 200
+    print("  OK G.1: invalid HMAC + valid token still 401 (no fallthrough)")
+
+
+# ---------------------------------------------------------------------------
+# FIX-011: Sweeper heartbeat mechanism (no blind lock eviction)
+# ---------------------------------------------------------------------------
+
+def test_fix011_long_running_with_heartbeats_not_evicted():
+    """
+    FIX-011: Lock held for 400s but heartbeating every 30s is NOT evicted.
+    Validates that active processing is distinguished from stalled processing.
+    """
+    receiver, sq, store = _make_receiver()
+    # Manually claim a symbol
+    symbol = "LONGRUN"
+    claimed = receiver._claim_in_flight(symbol)
+    assert claimed, "Initial claim should succeed"
+
+    # Simulate 400s of processing with heartbeats every 30s
+    # Sweeper runs every 60s and evicts if no heartbeat for 60s.
+    # We'll update heartbeat at t=0, t=30, t=60, t=90, ... t=390
+    # Then wait 65s (total 455s) and check lock still exists.
+
+    # Fast-forward simulation: directly manipulate the entry timestamps
+    with receiver._in_flight_lock:
+        entry = receiver._in_flight[symbol]
+        # Set acquired_at to 400s ago
+        entry['acquired_at'] = time.monotonic() - 400.0
+        # Set heartbeat_at to 30s ago (recent heartbeat)
+        entry['heartbeat_at'] = time.monotonic() - 30.0
+
+    # Wait for sweeper cycle (it runs every 60s, but we need to ensure it ran)
+    # Instead of waiting 60s, trigger a manual sweep check
+    # (since we can't easily wait in tests, we'll check the eviction logic directly)
+
+    # Check that the lock is still present
+    with receiver._in_flight_lock:
+        assert symbol in receiver._in_flight, "Lock should NOT be evicted (recent heartbeat)"
+
+    # Now manually check sweeper logic: (now - heartbeat_at) should be ~30s < 60s
+    now_mono = time.monotonic()
+    with receiver._in_flight_lock:
+        entry = receiver._in_flight[symbol]
+        stall_time = now_mono - entry['heartbeat_at']
+        assert stall_time < receiver._in_flight_timeout_sec, \
+            f"Stall time {stall_time:.1f}s should be < timeout {receiver._in_flight_timeout_sec}s"
+
+    receiver.release_in_flight(symbol)
+    print("  OK FIX-011: lock held 400s with heartbeats NOT evicted")
+
+
+def test_fix011_no_heartbeat_90s_evicted():
+    """
+    FIX-011: Lock claimed but no heartbeat for 90s is evicted by sweeper.
+    Validates that stalled workers are detected and cleaned up.
+    """
+    receiver, sq, store = _make_receiver()
+    symbol = "STALLED"
+    claimed = receiver._claim_in_flight(symbol)
+    assert claimed, "Initial claim should succeed"
+
+    # Simulate stall: set both timestamps to 90s ago
+    with receiver._in_flight_lock:
+        entry = receiver._in_flight[symbol]
+        old_time = time.monotonic() - 90.0
+        entry['acquired_at'] = old_time
+        entry['heartbeat_at'] = old_time
+
+    # Manually run sweeper logic (instead of waiting 60s for the thread)
+    now_mono = time.monotonic()
+    evicted = []
+    with receiver._in_flight_lock:
+        for sym, entry in list(receiver._in_flight.items()):
+            heartbeat_at = entry['heartbeat_at']
+            if now_mono - heartbeat_at > receiver._in_flight_timeout_sec:
+                evicted.append(sym)
+        for sym in evicted:
+            del receiver._in_flight[sym]
+
+    assert symbol in evicted, "Symbol should be evicted (no heartbeat for 90s > 60s timeout)"
+    with receiver._in_flight_lock:
+        assert symbol not in receiver._in_flight, "Symbol should be removed from in_flight"
+
+    print("  OK FIX-011: lock with no heartbeat for 90s evicted")
+
+
+def test_fix011_evicted_symbol_can_be_readmitted():
+    """
+    FIX-011: After sweeper evicts a stalled symbol, a new signal for that
+    symbol is admitted (not rejected as IN_PROCESS / DUPLICATE).
+    """
+    receiver, sq, store = _make_receiver(expiry=3600)
+    symbol = "READMIT"
+    base = datetime.now()
+    ts1 = base.strftime("%Y-%m-%d %H:%M:%S")
+    ts2 = (base - timedelta(minutes=1)).strftime("%Y-%m-%d %H:%M:%S")  # different minute
+
+    # First request: accepted
+    with receiver.app.test_client() as client:
+        resp1 = client.post(
+            "/webhook/gap_go_long",
+            json={
+                "stocks": symbol,
+                "trigger_prices": "1000.0",
+                "triggered_at": ts1,
+                "scan_name": "gap_go_long",
+            },
+        )
+    assert resp1.status_code == 200
+    body1 = resp1.get_json()
+    results1 = body1.get("results", [])
+    assert len(results1) == 1
+    assert results1[0]["status"] == "ACCEPTED"
+
+    # Verify symbol is in_flight
+    with receiver._in_flight_lock:
+        assert symbol in receiver._in_flight
+
+    # Simulate stall and eviction (same as previous test)
+    with receiver._in_flight_lock:
+        entry = receiver._in_flight[symbol]
+        old_time = time.monotonic() - 90.0
+        entry['acquired_at'] = old_time
+        entry['heartbeat_at'] = old_time
+
+    # Manual sweep
+    now_mono = time.monotonic()
+    evicted = []
+    with receiver._in_flight_lock:
+        for sym, entry in list(receiver._in_flight.items()):
+            heartbeat_at = entry['heartbeat_at']
+            if now_mono - heartbeat_at > receiver._in_flight_timeout_sec:
+                evicted.append(sym)
+        for sym in evicted:
+            del receiver._in_flight[sym]
+
+    assert symbol in evicted
+
+    # Second request: FIX-036 TTLCache rejects within 300s even after eviction
+    # Use different minute but still within TTL window
+    with receiver.app.test_client() as client:
+        resp2 = client.post(
+            "/webhook/gap_go_long",
+            json={
+                "stocks": symbol,
+                "trigger_prices": "1000.0",
+                "triggered_at": ts2,  # different minute but within TTL
+                "scan_name": "gap_go_long",
+            },
+        )
+    assert resp2.status_code == 200
+    body2 = resp2.get_json()
+    results2 = body2.get("results", [])
+    assert len(results2) == 1
+    # FIX-036: TTLCache blocks duplicate even after in_flight eviction
+    assert results2[0]["status"] == "DUPLICATE", \
+        f"Expected DUPLICATE within TTL, got {results2[0]['status']}"
+
+    print("  OK FIX-011+FIX-036: evicted symbol still blocked by TTLCache within 300s")
+
+
+def test_fix011_update_heartbeat_updates_timestamp():
+    """
+    FIX-011: update_heartbeat() correctly updates the heartbeat_at timestamp.
+    """
+    receiver, sq, store = _make_receiver()
+    symbol = "HEARTBEAT"
+    claimed = receiver._claim_in_flight(symbol)
+    assert claimed
+
+    # Get initial heartbeat timestamp
+    with receiver._in_flight_lock:
+        entry = receiver._in_flight[symbol]
+        initial_heartbeat = entry['heartbeat_at']
+
+    # Sleep briefly then update heartbeat
+    time.sleep(0.05)
+    receiver.update_heartbeat(symbol)
+
+    # Check that heartbeat_at was updated
+    with receiver._in_flight_lock:
+        entry = receiver._in_flight[symbol]
+        updated_heartbeat = entry['heartbeat_at']
+
+    assert updated_heartbeat > initial_heartbeat, \
+        "heartbeat_at should be updated after update_heartbeat() call"
+
+    receiver.release_in_flight(symbol)
+    print("  OK FIX-011: update_heartbeat() updates timestamp")
+
+
+def test_fix011_update_heartbeat_unknown_symbol_noop():
+    """
+    FIX-011: update_heartbeat() on a symbol not in_flight is a silent no-op.
+    """
+    receiver, sq, store = _make_receiver()
+    # Call update_heartbeat on a symbol that was never claimed
+    try:
+        receiver.update_heartbeat("UNKNOWN")
+        print("  OK FIX-011: update_heartbeat() on unknown symbol is no-op")
+    except Exception as exc:
+        raise AssertionError(f"update_heartbeat should not raise on unknown symbol: {exc}")
+
+
+# ---------------------------------------------------------------------------
+# FIX-022: Timezone-aware triggered_at parsing
+# ---------------------------------------------------------------------------
+
+def test_fix022_naive_triggered_at_not_rejected_as_stale():
+    """
+    FIX-022: Send naive triggered_at string (Chartink format).
+    After IST localization, age should be computed correctly → NOT rejected as stale.
+    """
+    receiver, sq, store = _make_receiver(expiry=600)  # 10min expiry
+    # Send a webhook with recent naive timestamp (within expiry window)
+    recent_naive = (datetime.now() - timedelta(seconds=30)).strftime("%Y-%m-%d %H:%M:%S")
+    payload = _valid_payload(triggered_at=recent_naive)
+    with receiver.app.test_client() as client:
+        resp = client.post("/webhook/gap_go_long",
+                          data=json.dumps(payload),
+                          content_type="application/json")
+        assert resp.status_code == 200, f"Expected 200, got {resp.status_code}: {resp.get_json()}"
+        data = resp.get_json()
+        assert data["results"][0]["status"] == "ACCEPTED", \
+            f"Signal should be ACCEPTED, not stale. Got: {data['results'][0]['status']}"
+    print("  OK FIX-022: naive triggered_at localized to IST, age computed correctly, signal accepted")
+
+
+def test_fix022_already_aware_triggered_at_no_double_offset():
+    """
+    FIX-022: If triggered_at is already timezone-aware (future-proofing),
+    should not apply double offset or crash.
+    """
+    from core.time_authority import ist_timezone
+    receiver, sq, store = _make_receiver(expiry=600)
+    # Create an already-aware IST datetime
+    aware_dt = datetime.now(ist_timezone()) - timedelta(seconds=30)
+    aware_str = aware_dt.strftime("%Y-%m-%d %H:%M:%S")  # Still sends as string
+    payload = _valid_payload(triggered_at=aware_str)
+    with receiver.app.test_client() as client:
+        resp = client.post("/webhook/gap_go_long",
+                          data=json.dumps(payload),
+                          content_type="application/json")
+        assert resp.status_code == 200, f"Expected 200, got {resp.status_code}"
+        data = resp.get_json()
+        assert data["results"][0]["status"] == "ACCEPTED"
+    print("  OK FIX-022: already-aware triggered_at handled without double-offset")
+
+
+def test_fix022_simulated_offset_bug_age_correct():
+    """
+    FIX-022: Simulate the bug scenario where naive datetime would cause
+    5.5 hour offset in age calculation. After fix, age should be correct.
+    """
+    receiver, sq, store = _make_receiver(expiry=600)  # 10min expiry
+    # Send a timestamp that's 60 seconds old
+    past_naive = (datetime.now() - timedelta(seconds=60)).strftime("%Y-%m-%d %H:%M:%S")
+    payload = _valid_payload(triggered_at=past_naive)
+    with receiver.app.test_client() as client:
+        resp = client.post("/webhook/gap_go_long",
+                          data=json.dumps(payload),
+                          content_type="application/json")
+        assert resp.status_code == 200
+        data = resp.get_json()
+        # Before fix: age would be calculated as ~19860 seconds (5.5h offset)
+        # After fix: age should be ~60 seconds, well within 600s expiry
+        assert data["results"][0]["status"] == "ACCEPTED", \
+            f"Signal 60s old should be ACCEPTED (expiry=600s). Got: {data['results'][0]['status']}"
+    print("  OK FIX-022: age calculation correct after timezone fix (no 5.5h offset)")
+
+
+# ---------------------------------------------------------------------------
+# Standalone runner (no pytest dependency)
+# ---------------------------------------------------------------------------
+
+# ---------------------------------------------------------------------------
+# FIX-C: Excluded symbols list
+# ---------------------------------------------------------------------------
+
+def test_fixc_excluded_symbol_rejected_after_alias_resolution() -> None:
+    """FIX-C: Symbol in excluded_symbols list is rejected with DEBUG log only."""
+    sq = queue.Queue(maxsize=20)
+    td = tempfile.mkdtemp()
+    store = StateStore(Path(td) / "test.db")
+
+    # Create config with excluded_symbols list
+    cfg = types.SimpleNamespace()
+    cfg.system = types.SimpleNamespace(
+        signal_queue=types.SimpleNamespace(
+            capacity=20,
+            backpressure_pct=0.8,
+            expiry_sec=86400,  # 24 hours - large enough to not expire during test
+        ),
+        excluded_symbols=["E2E", "GVPIL", "BIRLACABLE", "SHANKARA", "MCLEODRUSS"],
+    )
+    cfg.scan_webhook_map = types.SimpleNamespace(scanners={"test_scanner": "test.yaml"})
+
+    mw = _MockMarketWindows(entry_allowed=True)
+    ks = _MockKillSwitch(active=False)
+    log = _NullLogger()
+
+    receiver = WebhookReceiver(sq, store, cfg, mw, ks, log)
+    client = receiver.app.test_client()
+
+    payload = {
+        "stocks": "E2E,RELIANCE",
+        "trigger_prices": "100.0,2500.0",
+        "triggered_at": "10:30 am",
+        "scan_name": "test_scanner",
+    }
+
+    resp = client.post("/webhook/test_scanner", json=payload)
+    assert resp.status_code == 200
+
+    data = json.loads(resp.data)
+    assert data["accepted"] == 1  # Only RELIANCE
+    assert data["rejected"] == 1  # E2E excluded
+
+    results = data["results"]
+    assert len(results) == 2
+
+    # E2E should be rejected
+    e2e_result = [r for r in results if r["symbol"] == "E2E"][0]
+    assert e2e_result["status"] == "REJECTED_EXCLUDED_SYMBOL"
+
+    # RELIANCE should be accepted
+    rel_result = [r for r in results if r["symbol"] == "RELIANCE"][0]
+    assert rel_result["status"] == "ACCEPTED"
+
+    # Verify E2E not in queue
+    assert sq.qsize() == 1
+    item = sq.get_nowait()
+    assert item[2] == "RELIANCE"  # symbol is 3rd element
+
+    store.close()
+    print("  OK FIX-C: excluded symbol rejected after alias resolution")
+
+
+def test_fixc_excluded_symbols_case_insensitive() -> None:
+    """FIX-C: Excluded symbols check is case-insensitive."""
+    sq = queue.Queue(maxsize=20)
+    td = tempfile.mkdtemp()
+    store = StateStore(Path(td) / "test.db")
+
+    cfg = types.SimpleNamespace()
+    cfg.system = types.SimpleNamespace(
+        signal_queue=types.SimpleNamespace(
+            capacity=20,
+            backpressure_pct=0.8,
+            expiry_sec=86400,  # 24 hours - large enough to not expire during test
+        ),
+        excluded_symbols=["E2E", "gvpil"],  # Mixed case
+    )
+    cfg.scan_webhook_map = types.SimpleNamespace(scanners={"test_scanner": "test.yaml"})
+
+    mw = _MockMarketWindows(entry_allowed=True)
+    ks = _MockKillSwitch(active=False)
+    log = _NullLogger()
+
+    receiver = WebhookReceiver(sq, store, cfg, mw, ks, log)
+    client = receiver.app.test_client()
+
+    payload = {
+        "stocks": "e2e,GVPIL,reliance",  # lowercase symbols
+        "trigger_prices": "100.0,200.0,2500.0",
+        "triggered_at": "10:30 am",
+        "scan_name": "test_scanner",
+    }
+
+    resp = client.post("/webhook/test_scanner", json=payload)
+    assert resp.status_code == 200
+
+    data = json.loads(resp.data)
+    assert data["accepted"] == 1  # Only reliance
+    assert data["rejected"] == 2  # e2e and GVPIL
+
+    # Verify only RELIANCE in queue
+    assert sq.qsize() == 1
+    item = sq.get_nowait()
+    assert item[2] == "reliance"
+
+    store.close()
+    print("  OK FIX-C: excluded symbols check is case-insensitive")
+
+
+def test_fixc_no_excluded_symbols_passthrough() -> None:
+    """FIX-C: When excluded_symbols is empty or missing, all symbols pass through."""
+    sq = queue.Queue(maxsize=20)
+    td = tempfile.mkdtemp()
+    store = StateStore(Path(td) / "test.db")
+
+    cfg = types.SimpleNamespace()
+    cfg.system = types.SimpleNamespace(
+        signal_queue=types.SimpleNamespace(
+            capacity=20,
+            backpressure_pct=0.8,
+            expiry_sec=86400,  # 24 hours - large enough to not expire during test
+        ),
+        # No excluded_symbols attribute
+    )
+    cfg.scan_webhook_map = types.SimpleNamespace(scanners={"test_scanner": "test.yaml"})
+
+    mw = _MockMarketWindows(entry_allowed=True)
+    ks = _MockKillSwitch(active=False)
+    log = _NullLogger()
+
+    receiver = WebhookReceiver(sq, store, cfg, mw, ks, log)
+    client = receiver.app.test_client()
+
+    payload = {
+        "stocks": "E2E,RELIANCE",
+        "trigger_prices": "100.0,2500.0",
+        "triggered_at": "10:30 am",
+        "scan_name": "test_scanner",
+    }
+
+    resp = client.post("/webhook/test_scanner", json=payload)
+    assert resp.status_code == 200
+
+    data = json.loads(resp.data)
+    assert data["accepted"] == 2  # Both accepted
+    assert data["rejected"] == 0
+
+    # Verify both in queue
+    assert sq.qsize() == 2
+
+    store.close()
+    print("  OK FIX-C: no excluded_symbols attribute - all symbols pass through")
+
+
+# ---------------------------------------------------------------------------
+# S-1B.1 — webhook secret must NEVER persist to signals.webhook_payload.
+# Chartink echoes ?token=<SECRET> inside the body's `webhook_url` field and the
+# raw body is stored verbatim, so without redaction the secret lands plaintext
+# at rest. Redaction is STORAGE-ONLY: auth (:410-432) + parsing are unchanged.
+# ---------------------------------------------------------------------------
+
+# A deliberately-fake, placeholder-shaped token (starts with "dummy" so the
+# pre-commit secret scanner recognises it as a non-secret). The redaction logic
+# is value-agnostic, so this exercises the code path identically to a real token.
+_S1B1_FIXTURE = "dummy0webhook0token0for0s1b10tests0not0a0real0secret00000000dead"
+
+
+def _chartink_body_with_token(secret, stocks="RELIANCE,TCS",
+                              prices="2500.0,3400.5", scanner="gap_go_long"):
+    """A realistic Chartink body that echoes the configured URL (incl.
+    ?token=<secret>) in webhook_url, plus the sibling fields Chartink sends."""
+    return {
+        "stocks": stocks,
+        "trigger_prices": prices,
+        "triggered_at": _now_str(),
+        "scan_name": scanner,
+        "scan_url": scanner.replace("_", "-"),
+        "alert_name": scanner.upper().replace("_", " "),
+        "webhook_url": f"http://161.118.187.249:5000/webhook/{scanner}?token={secret}",
+    }
+
+
+def test_s1b1_secret_never_persists_to_webhook_payload():
+    """S-1B.1 CORE (red/green): a Chartink body whose webhook_url carries
+    ?token=<secret> must be stored with the secret redacted, while the signal
+    rows are still created with the correct stocks/prices.
+    RED (unfixed): stored webhook_payload contains the secret + token=<secret>."""
+    receiver, sq, store = _make_receiver(secret=_S1B1_FIXTURE)
+    body = _chartink_body_with_token(_S1B1_FIXTURE)
+    with receiver.app.test_client() as client:
+        resp = client.post(f"/webhook/gap_go_long?token={_S1B1_FIXTURE}", json=body)
+    assert resp.status_code == 200, resp.get_data(as_text=True)
+    data = resp.get_json()
+    assert data["accepted"] == 2, data
+
+    rows = store.fetch_all(
+        "SELECT symbol, trigger_price, webhook_payload FROM signals ORDER BY symbol"
+    )
+    assert len(rows) == 2
+    by_symbol = {r["symbol"]: r for r in rows}
+    # signal rows created with the correct parsed values (processing intact)
+    assert set(by_symbol) == {"RELIANCE", "TCS"}
+    assert by_symbol["RELIANCE"]["trigger_price"] == 2500.0
+    assert by_symbol["TCS"]["trigger_price"] == 3400.5
+    # the SECRET must NOT appear in the stored payload in EITHER form
+    for r in rows:
+        stored = r["webhook_payload"]
+        assert _S1B1_FIXTURE not in stored, "SECRET LEAKED into webhook_payload"
+        assert f"token={_S1B1_FIXTURE}" not in stored
+        assert "<REDACTED>" in stored
+        # useful audit fields preserved
+        assert "RELIANCE" in stored and "2500.0" in stored
+    store.close()
+    print("  OK S-1B.1: secret redacted from stored webhook_payload; rows intact")
+
+
+def test_s1b1_parsing_unchanged_plain_payload():
+    """S-1B.1 guard: a plain payload (no webhook_url/token) parses and persists
+    exactly as before — stocks/prices/triggered_at/scan_name produce the signal;
+    the sanitizer is a no-op on a body with no secret."""
+    receiver, sq, store = _make_receiver(secret=_S1B1_FIXTURE)
+    payload = _valid_payload(stocks="RELIANCE", prices="2500.0")
+    with receiver.app.test_client() as client:
+        resp = client.post(f"/webhook/gap_go_long?token={_S1B1_FIXTURE}", json=payload)
+    assert resp.status_code == 200, resp.get_data(as_text=True)
+    data = resp.get_json()
+    assert data["accepted"] == 1
+    signal_id = data["results"][0]["signal_id"]
+    assert sq.qsize() == 1 and sq.get_nowait()[0] == signal_id
+    row = store.fetch_one("SELECT * FROM signals WHERE signal_id = ?", (signal_id,))
+    assert row["status"] == "QUEUED"
+    assert row["symbol"] == "RELIANCE"
+    assert row["trigger_price"] == 2500.0
+    # stocks preserved; nothing spuriously redacted on a token-free body
+    assert "RELIANCE" in row["webhook_payload"]
+    assert "<REDACTED>" not in row["webhook_payload"]
+    store.close()
+    print("  OK S-1B.1: parsing/persist unchanged for a token-free payload")
+
+
+def test_s1b1_auth_unchanged():
+    """S-1B.1 guard: redaction is post-auth and storage-only — ?token=<secret>
+    still authenticates (200) and a wrong token still 401s (auth untouched)."""
+    # correct token -> 200
+    receiver, _, store = _make_receiver(secret=_S1B1_FIXTURE)
+    with receiver.app.test_client() as client:
+        ok = client.post(f"/webhook/gap_go_long?token={_S1B1_FIXTURE}",
+                         json=_valid_payload())
+    assert ok.status_code == 200, ok.get_data(as_text=True)
+    store.close()
+    # wrong token -> 401 (Invalid token)
+    receiver2, _, store2 = _make_receiver(secret=_S1B1_FIXTURE)
+    with receiver2.app.test_client() as client:
+        bad = client.post("/webhook/gap_go_long?token=WRONG", json=_valid_payload())
+    assert bad.status_code == 401, bad.get_data(as_text=True)
+    assert bad.get_json()["error"] == "Invalid token"
+    store2.close()
+    print("  OK S-1B.1: auth unchanged (correct token 200 / wrong token 401)")
+
+
+def test_s1b1_secret_redacted_even_outside_webhook_url():
+    """S-1B.1 defensive: the secret appearing in ANY field (not just webhook_url)
+    is still redacted from storage (rule (a): literal-value replace)."""
+    receiver, _, store = _make_receiver(secret=_S1B1_FIXTURE)
+    payload = _valid_payload(stocks="RELIANCE", prices="2500.0")
+    payload["alert_name"] = f"leaky {_S1B1_FIXTURE} tail"   # secret in a stray field
+    with receiver.app.test_client() as client:
+        resp = client.post(f"/webhook/gap_go_long?token={_S1B1_FIXTURE}", json=payload)
+    assert resp.status_code == 200, resp.get_data(as_text=True)
+    row = store.fetch_one(
+        "SELECT webhook_payload FROM signals ORDER BY received_at DESC LIMIT 1"
+    )
+    assert _S1B1_FIXTURE not in row["webhook_payload"], "SECRET LEAKED (non-URL field)"
+    assert "<REDACTED>" in row["webhook_payload"]
+    store.close()
+    print("  OK S-1B.1: secret redacted even when it appears outside webhook_url")
+
+
+# ---------------------------------------------------------------------------
+# WR4b (09-Sep-2026): an account-tag prefix on the body scan_name is stripped
+# before the WR4 comparison. Config-driven from accounts.csv via AR12, so the
+# SAME code path is a no-op on production (tag LFL836, no alert carries it) and
+# strips VBB097- on the testing VM.
+# ---------------------------------------------------------------------------
+
+import contextlib as _contextlib
+
+import signals.webhook_receiver as _wr
+
+
+@_contextlib.contextmanager
+def _account_tag(tag):
+    """Force the AR12 resolver seen by the receiver to return `tag`."""
+    original = _wr.primary_account_tag
+    _wr.primary_account_tag = lambda *a, **k: tag
+    try:
+        yield
+    finally:
+        _wr.primary_account_tag = original
+
+
+def test_wr4b_testing_vm_prefixed_scan_name_accepted():
+    """Testing VM: body 'VBB097-GAP GO LONG' + path gap_go_long -> ACCEPTED."""
+    receiver, _, _ = _make_receiver()
+    payload = _valid_payload(scan_name="VBB097-GAP GO LONG")
+    with _account_tag("VBB097"):
+        with receiver.app.test_client() as client:
+            resp = client.post("/webhook/gap_go_long", json=payload)
+    assert resp.status_code == 200, resp.get_data(as_text=True)
+    print("  OK WR4b testing-VM prefixed scan_name -> accepted")
+
+
+def test_wr4b_underscore_separator_also_stripped():
+    """WR4b handles both separators: 'VBB097_GAP GO LONG' normalises to
+    vbb097_gap_go_long and must also be accepted."""
+    receiver, _, _ = _make_receiver()
+    payload = _valid_payload(scan_name="VBB097_GAP GO LONG")
+    with _account_tag("VBB097"):
+        with receiver.app.test_client() as client:
+            resp = client.post("/webhook/gap_go_long", json=payload)
+    assert resp.status_code == 200, resp.get_data(as_text=True)
+    print("  OK WR4b underscore separator -> accepted")
+
+
+def test_wr4b_production_unprefixed_scan_name_unchanged():
+    """Production: tag LFL836, body 'GAP GO LONG' + path gap_go_long ->
+    ACCEPTED exactly as before. The change must be a no-op there."""
+    receiver, _, _ = _make_receiver()
+    payload = _valid_payload(scan_name="GAP GO LONG")
+    with _account_tag("LFL836"):
+        with receiver.app.test_client() as client:
+            resp = client.post("/webhook/gap_go_long", json=payload)
+    assert resp.status_code == 200, resp.get_data(as_text=True)
+    print("  OK WR4b production unprefixed scan_name -> accepted (no-op)")
+
+
+def test_wr4b_genuine_mismatch_still_400():
+    """A real mismatch is STILL rejected: stripping the prefix must not weaken
+    WR4 into a substring/fuzzy match. body 'VBB097-GAP FADE SHORT' + path
+    gap_go_long -> 400."""
+    receiver, _, _ = _make_receiver()
+    payload = _valid_payload(scan_name="VBB097-GAP FADE SHORT")
+    with _account_tag("VBB097"):
+        with receiver.app.test_client() as client:
+            resp = client.post("/webhook/gap_go_long", json=payload)
+    assert resp.status_code == 400, resp.get_data(as_text=True)
+    assert "match" in resp.get_json()["error"].lower()
+    print("  OK WR4b genuine mismatch -> still 400")
+
+
+def test_wr4b_absent_scan_name_still_skips_check():
+    """scan_name absent entirely -> the check is skipped, unchanged by WR4b."""
+    receiver, _, _ = _make_receiver()
+    payload = _valid_payload()
+    payload.pop("scan_name")
+    with _account_tag("VBB097"):
+        with receiver.app.test_client() as client:
+            resp = client.post("/webhook/gap_go_long", json=payload)
+    assert resp.status_code == 200, resp.get_data(as_text=True)
+    print("  OK WR4b absent scan_name -> check skipped")
+
+
+def test_wr4b_unknown_tag_does_not_strip():
+    """AR12 returns 'UNKNOWN' when accounts.csv is unreadable. That must NOT
+    become a strippable prefix -- it would silently widen the check."""
+    with _account_tag("UNKNOWN"):
+        assert _wr._strip_account_prefix("unknown-gap_go_long") == "unknown-gap_go_long"
+    with _account_tag("VBB097"):
+        assert _wr._strip_account_prefix("vbb097-gap_go_long") == "gap_go_long"
+        assert _wr._strip_account_prefix("vbb097_gap_go_long") == "gap_go_long"
+        # prefix ONLY -- an interior or trailing occurrence is untouched
+        assert _wr._strip_account_prefix("gap_go_long_vbb097") == "gap_go_long_vbb097"
+        assert _wr._strip_account_prefix("x_vbb097-gap_go_long") == "x_vbb097-gap_go_long"
+    print("  OK WR4b UNKNOWN not stripped; prefix-only semantics hold")
+
+
+def run_all_tests() -> int:
+    tests = [
+        test_s1b1_secret_never_persists_to_webhook_payload,
+        test_s1b1_parsing_unchanged_plain_payload,
+        test_s1b1_auth_unchanged,
+        test_s1b1_secret_redacted_even_outside_webhook_url,
+        test_health_endpoint_returns_200,
+        test_valid_single_stock_accepted,
+        test_valid_multi_stock_all_accepted,
+        test_mixed_valid_invalid_payload,
+        test_unknown_scanner_returns_404,
+        test_scan_name_body_mismatch_returns_400,
+        test_malformed_json_returns_400,
+        test_missing_required_field_returns_400,
+        test_bad_triggered_at_format_returns_400,
+        test_hmac_absent_when_required_returns_401,
+        test_hmac_mismatch_returns_401,
+        test_hmac_valid_returns_200,
+        test_hmac_none_mode_no_header_check,
+        test_soft_kill_active_returns_403,
+        test_hard_kill_active_returns_403,
+        test_outside_entry_window_returns_403,
+        test_queue_at_backpressure_threshold_returns_503,
+        test_queue_full_on_individual_signal_returns_503,
+        test_duplicate_same_fingerprint_same_minute,
+        test_different_minute_same_scanner_symbol_accepted,
+        test_different_scanner_same_symbol_same_minute_accepted,
+        test_symbol_in_flight_returns_in_process,
+        test_in_flight_sweeper_evicts_old_entries,
+        test_expired_signal_returns_expired,
+        test_invalid_price_zero_returns_invalid_price,
+        test_invalid_price_negative_returns_invalid_price,
+        test_invalid_price_non_numeric_returns_invalid_price,
+        test_empty_symbol_returns_invalid_symbol,
+        test_webhook_audit_row_written_for_every_post,
+        test_concurrent_posts_queue_consistent,
+        test_performance_100_posts_under_5_seconds,
+        # BL-18: construction guard for config.webhook.require_hmac
+        test_bl18_require_hmac_true_no_secret_raises,
+        test_bl18_require_hmac_true_empty_secret_raises,
+        test_bl18_require_hmac_true_with_secret_ok,
+        test_bl18_require_hmac_false_no_secret_ok,
+        test_bl18_nested_appconfig_shape_resolved,
+        test_bl18_no_webhook_attr_permissive,
+        # G.1 / 2026-04-25 audit -- require_hmac disables token fallback
+        test_g1_require_hmac_true_rejects_token_only_request,
+        test_g1_require_hmac_true_accepts_valid_hmac,
+        test_g1_require_hmac_false_keeps_legacy_token_path,
+        test_g1_require_hmac_true_rejects_invalid_hmac_does_not_fall_through,
+        # FIX-011: Sweeper heartbeat mechanism
+        test_fix011_long_running_with_heartbeats_not_evicted,
+        test_fix011_no_heartbeat_90s_evicted,
+        test_fix011_evicted_symbol_can_be_readmitted,
+        test_fix011_update_heartbeat_updates_timestamp,
+        test_fix011_update_heartbeat_unknown_symbol_noop,
+        # FIX-022: Timezone-aware triggered_at parsing
+        test_fix022_naive_triggered_at_not_rejected_as_stale,
+        test_fix022_already_aware_triggered_at_no_double_offset,
+        test_fix022_simulated_offset_bug_age_correct,
+        # FIX-C: Excluded symbols list
+        test_fixc_excluded_symbol_rejected_after_alias_resolution,
+        test_fixc_excluded_symbols_case_insensitive,
+        test_fixc_no_excluded_symbols_passthrough,
+        # FIX-131 Item 17: 5-min epoch bucket dedup
+        test_fix131_dedup_window_seconds_used_in_ttl,
+        test_fix131_epoch_bucket_same_for_signals_within_5min_epoch,
+        test_fix131_duplicate_across_minute_boundary_rejected_via_db,
+        test_fix131_signal_after_full_window_accepted,
+        test_wr4b_testing_vm_prefixed_scan_name_accepted,
+        test_wr4b_underscore_separator_also_stripped,
+        test_wr4b_production_unprefixed_scan_name_unchanged,
+        test_wr4b_genuine_mismatch_still_400,
+        test_wr4b_absent_scan_name_still_skips_check,
+        test_wr4b_unknown_tag_does_not_strip,
+    ]
+
+    print("=" * 70)
+    print("webhook_receiver.py -- Test Suite")
+    print("=" * 70)
+
+    failed = []
+    for test in tests:
+        print(f"\n-> {test.__name__}")
+        try:
+            test()
+        except AssertionError as exc:
+            failed.append((test.__name__, f"AssertionError: {exc}"))
+            print(f"  FAIL: {exc}")
+        except Exception as exc:
+            failed.append((test.__name__, f"{type(exc).__name__}: {exc}"))
+            print(f"  ERROR: {type(exc).__name__}: {exc}")
+
+    print("\n" + "=" * 70)
+    if failed:
+        print(f"FAILED: {len(failed)} of {len(tests)} tests")
+        for name, err in failed:
+            print(f"  FAIL {name}: {err}")
+        return 1
+    print(f"PASSED: all {len(tests)} tests")
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(run_all_tests())

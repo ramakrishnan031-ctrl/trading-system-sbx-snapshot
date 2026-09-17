@@ -1,0 +1,1073 @@
+================================================================================
+*** DEPLOYMENT CALENDAR — Tue 28-Jul → Tue 4-Aug 2026 ***
+*** THE UNIT IS THE BOOT, NOT THE PUSH. ***
+================================================================================
+Written 27-Jul-2026 Mon 11:0x IST. ⛔ UNTRACKED today (the Monday card asserts 24).
+Dates verified against config/nse_holidays_2026.yaml: NO weekday NSE holiday
+between 26-Jun and 14-Sep-2026. Every date below is a trading day.
+⭐ RE-VERIFIED 31-Jul 22:5x AGAINST THE PRIMARY SOURCE, not the file: NSE circular
+NSE/CMTR/71775 (12-Dec-2025), 15 trading holidays + 4 weekend holidays. The file
+reconciles to it EXACTLY, 15/15 and 4/4, date and description. ⛔ 03-Aug-2026 is a
+MONDAY and appears on NEITHER list; the only August entry in the whole circular is
+15-Aug (a SATURDAY). ⇒ Mon 3-Aug and Tue 4-Aug are NORMAL TRADING DAYS. See §7.9.
+================================================================================
+
+⭐ WHY THIS FILE EXISTS: six things were queued across five documents and nobody
+could see whether two of them collided. §3 found three collisions. One of them
+would have cost a market day.
+
+================================================================================
+1. THE QUEUE — five heads, and what each costs if it fails
+================================================================================
+                                                     failure   blocks the
+  item                          type                 costs     T2 sequence?
+  ─────────────────────────────────────────────────────────────────────────
+  hold-check1-w8-26jul  (24)    v45 MIGRATION        A DAY     YES - everything
+  fix-tests-27jul       (1)     test-only            NOTHING   no
+  fix-boot-27jul        (2)     BOOT PATH x2         A DAY     yes if mistimed
+  T2 band widen         (--)    operator script      RESTART   YES - stage 1-2
+  fix-t2-repair-07jul   (3)     operator script      RESTART   YES - stage 1-2
+  #16b                  (--)    unbuilt              --        no (post-v45)
+  2FA seed move         (--)    one-way credential   A DAY     yes if on a step day
+
+⭐ THE DISTINCTION THAT MATTERS (A4): a DAY-cost failure loses one day and the
+sequence resumes. A RESTART-cost failure sends stage 1-2 back to the beginning
+(2 days + broker turnaround). *** The two operator-script items are RESTART-class
+because they are what Wednesday runs. *** Everything else is DAY-class.
+
+================================================================================
+2. ONE ROW PER EVENING — what lands, what the NEXT MORNING's boot carries
+================================================================================
+
+  EVENING          LANDS ON main                 NEXT BOOT CARRIES        RISK
+  ───────────────────────────────────────────────────────────────────────────
+  Mon 27-Jul       hold-check1-w8-26jul (24)     Tue 08:15: v45 SCHEMA    DAY
+  (after check 7,   -- ONLY after Rama            MIGRATION, alone.       (blocks
+   Rama confirms)      confirms clean             *** SINGLE VARIABLE ***  all)
+
+  Tue 28-Jul       ⚠️ OVERRIDDEN 15:45 -- the    Wed 08:15: STILL         none
+  (after the        16 local commits DO push      unchanged from Tue.     (see the
+   17:35 CLEAN      tonight. Rama: "PC == VM                              measurement
+   self-exit)       100%."                       ⭐ ZERO live boot         -->)
+                   ✅✅ T2: ALREADY DONE           variables even AFTER
+                     27-Jul 22:33 as e6ec75b.     this push.
+                     Nothing owed. See §3.1.
+
+                   ⭐⭐ WHY THE OVERRIDE IS SAFE, AND IT IS A MEASUREMENT, NOT A
+                   CONCESSION: of the 16 commits, *** 15 are DOCS-ONLY and ONE
+                   touches non-doc files *** -- `scripts/system_manager.py` + its
+                   test. ZERO config, ZERO trading/capital path. `main.py` NEVER
+                   imports `system_manager` (it runs in the 18:45 EOD cron).
+                   ⇒ *** THE CALENDAR'S UNIT IS THE BOOT, AND THE BOOT DOES NOT
+                   MOVE. *** Wednesday's 08:15 carries exactly what it would have
+                   carried had nothing been pushed.
+                   ⛔ THE ROW IS REWRITTEN RATHER THAN VIOLATED. A calendar still
+                   reading "NOTHING to main" while main has moved is a stale
+                   document that gets believed later.
+
+                   ORDER TONIGHT (sequenced, not simultaneous):
+                     1. ✅ reflog protection FIRST (done ~15:3x: gc.reflogExpire
+                        + gc.reflogExpireUnreachable = never, read back; 801
+                        entries intact back to 3-May). ⭐ The push itself was the
+                        thing that could have pruned it via `gc --auto`.
+                     2. the 17:10 / 17:40 evening checks + Wed go/no-go
+                     3. ⛔ GATE: 17:35 self-exit CLEAN (ExecMainStatus=0,
+                        inactive(dead), book flat) -- NOT clean => DO NOT PUSH.
+                        You do not deploy into a state you have not explained.
+                     4. push  5. verify PC==origin==VM tree + the reflog entry
+                     6. watch the 18:45 EOD job
+                   ⭐ AND THE SEQUENCING IS BETTER THAN THURSDAY, NOT MERELY OK:
+                   step 6 is the detector's FIRST PRODUCTION RUN, on a FLAT book,
+                   the night BEFORE the overnight position exists.
+                   ✅ PRE-PUSH SAFETY ANSWERED FROM THE HOST, NOT THE TESTS: a
+                   raising check is CONTAINED -- `system_manager.py:1093-1102`
+                   wraps every check in try/except, logs `check_failed`, marks
+                   that section a WARNING and CONTINUES; the report still builds
+                   and it cannot trip soft_kill. Worst case = one bad line.
+
+  ┌──────────────────────────────────────────────────────────────────────────┐
+  │ ⚠️⚠️ OPERATOR AVAILABILITY — APPLIES TO ALL FOUR DAYS BELOW (28-Jul 19:5x) │
+  │ *** RAMA IS UNAVAILABLE 11:00-17:00 IST ON WED 29, THU 30, FRI 31-JUL AND │
+  │ SAT 01-AUG. He IS available BEFORE 11:00 and AFTER 17:00. ***             │
+  │ ⛔ Do not re-discover this on Friday morning. It is a CONSTRAINT, not a    │
+  │ preference, and it lands on the two market-hours events the whole T2      │
+  │ sequence is built around.                                                 │
+  │                                                                           │
+  │ ⭐ THE ARM (Wed) — ⚠️ *** COLLIDES. NEEDS RAMA'S DECISION BEFORE 10:30. *** │
+  │   Runbook §1 P3: AIM 13:00 · acceptable 12:30-14:00 · *** ABORT outside    │
+  │   10:30-14:30 *** · script's own gate 09:15-15:30 · P6 needs ~30 min.     │
+  │   ⇒ The aim AND the whole acceptable band sit inside the unavailable      │
+  │     window. The ONLY legal slot in his availability is *** 10:30-11:00 ***│
+  │     — exactly the 30 minutes P6 requires, with NO slack for §3's by-hand  │
+  │     broker verification, which must complete before he walks away.        │
+  │   ⚠️ COST OF THE EARLIER ANCHOR, from the runbook's own numbers: the 13:00 │
+  │     anchor is HALF the void reduction (-10/+10 band + 13:00 = ~2.8% void; │
+  │     band alone at the measured *** 11:30 *** anchor = ~9.0%). 10:30 is    │
+  │     EARLIER than the measured anchor ⇒ void risk is *** >=9%, and NOT     │
+  │     measured at a 10:30 anchor — do not quote a number for it. *** A void  │
+  │     costs ONE DAY (day trade, no demat debit, nothing proved).            │
+  │   ⭐ One thing gets BETTER, not worse: P3 wants 13:00 partly so a          │
+  │     rejection "leaves room to retry". At 10:30 there is MORE room.        │
+  │                                                                           │
+  │ ⭐ THE CLOSE (Thu) — ✅ *** NO COLLISION. *** Runbook §7 gives the close    │
+  │   NO clock time at all, only "market hours only" (09:15-15:30). It fits   │
+  │   cleanly in *** 09:15-11:00 ***, and EARLY is if anything better: a SELL │
+  │   REJECTED means DDPI unauthorised and restarts the pair (§8), so finding │
+  │   out at 09:30 leaves the day. Thursday's 08:15-08:25 orphan-GTT WARNING  │
+  │   (§5) and §6.B's morning checks are also before 11:00.                   │
+  │   ⭐ And if Thursday is missed entirely, §8: the GTT still protects and    │
+  │     the close can go FRIDAY — the proof is NOT forfeited. (P4's "never a  │
+  │     Friday" bans a Friday ARM, not a Friday CLOSE.)                       │
+  │                                                                           │
+  │ ⭐ THE UNATTENDED 11:00-17:00 WINDOW — verified from SOURCE, not prose:    │
+  │   · The CNC position's protection is the *** broker-side OCO GTT, and     │
+  │     nothing else. *** It lives at Zerodha, independent of our service,    │
+  │     process, DB, the VM and the laptop ⇒ *** being unattended changes     │
+  │     NOTHING about it. *** Max loss bounded at ~Rs 10 (one IDEA share).    │
+  │   · The 15:15 circuit-breaker / EOD squareoff DO fire unattended —        │
+  │     MEASURED 28-Jul 15:15:01, fully automatic — but they are             │
+  │     *** STRUCTURALLY INCAPABLE *** of touching the CNC share:            │
+  │     `orders/eod_squareoff.py:1064-1072` filters `p.product in            │
+  │     ("MIS","CO")`; docstring EOD6 "DELIVERY (CNC) positions NOT touched". │
+  │     ⇒ That is what keeps the test VALID; an EOD square would void it.    │
+  │   · `scripts/liveness_probe.py` is *** DETECTION, NOT PROTECTION *** —    │
+  │     it reads `systemctl show` (read-only) and calls `deliver_alarm()`:    │
+  │     ONE Telegram CRITICAL, sentinel fallback. *** No restart, no start,   │
+  │     no corrective action anywhere in it. *** And it watches the UNIT, not │
+  │     the T2 position.                                                      │
+  │   ⇒ NET: no added MONEY risk to T2. The real exposures are (i) a Wed      │
+  │     afternoon GTT trigger silently VOIDING the arm, unknown until 17:00,  │
+  │     and (ii) the ORDINARY intraday book — a service death at 11:30 raises │
+  │     one CRITICAL nobody can act on for ~5.5 h. (ii) exists every day and  │
+  │     is not created by T2; it is simply un-actionable on these four days.  │
+  │   ⛔ RAMA'S CALL, not the assistant's — facts above, no recommendation.    │
+  └──────────────────────────────────────────────────────────────────────────┘
+
+  Wed 29-Jul       NOTHING.                      Thu 08:15: unchanged     none
+  (T2 ARM day)     ⛔ A position is held
+                     overnight. Change nothing.
+                   ⚠️ ARM TIMING IS AN OPEN
+                     DECISION -- see the
+                     availability box above.
+                     10:30-11:00 or slip.
+
+  ✅✅ THIS ROW IS DONE — PUSHED 30-Jul 19:55:30 IST as `ce08668..4cc4d04`, 15
+     commits. ALL of `fix-tests-27jul` + `fix-boot-27jul` + `214a878` (as `264dd5b`)
+     + `249317d` + the 4 docs commits LANDED. Regression BASE 10F/5435P vs AFTER
+     10F/5469P, NEW-FAILURE SET EMPTY. Verified 3 ways (SHA identity · deployed
+     bytes md5-identical to the pushed blobs · reflog push+checkout @ 19:55:30).
+     `load_all()` on the DEPLOYED tree = CONFIG_LOAD_OK. Schema 45==45==45, NO
+     migration at the Fri 08:15 boot. ⛔ NOTE: the omitted-confirm-flag rehearsal
+     returned EXIT=2 as required but CANNOT reach `load_all()` (it returns at the
+     confirm guard, before `_build_live_adapter()`) — the direct `load_all()` run is
+     what actually closed that coupling. Don't reuse the rehearsal alone as that gate.
+  ⏳ FRI 31-JUL EVENING NOW CARRIES `fix-symdir-27jul` (`300a247`, +7) **ALONE.**
+
+  Thu 30-Jul       fix-tests-27jul (4)           Fri 08:15: ONE live      LOW
+  (after the T2      + fix-boot-27jul (2)         boot variable -- S4      (see §6:
+   close PASSES)      + cherry-pick 214a878       degrade. #16a is INERT   re-counted
+                   ⚠️ RAMA UNAVAILABLE 11:00-
+                     17:00 -- but the CLOSE has
+                     NO clock requirement (§7:
+                     "market hours only"), so
+                     09:15-11:00 works. The
+                     EVENING push is after 17:00
+                     ⇒ ✅ NO COLLISION.
+                      (the alert audit trail)     (delivery_enabled=false) 28-Jul)
+                    ⛔ 28-Jul 15:45: THE .pyc
+                      DETECTOR AND ALL THE DOCS
+                      ARE **GONE FROM THIS ROW**
+                      -- they went TUESDAY under
+                      Rama's PC==VM override.
+                      Thursday now carries ONLY
+                      the three branches left.
+                    ⭐ 28-Jul: counts corrected
+                      and the audit trail MOVED
+                      here from Friday -- §6
+                    ✅ 28-Jul: 214a878 PROVEN to
+                      cherry-pick clean -- §7.6
+                    ⛔ PRE-PUSH GATE -- §7.1:
+                      #16a inert ON THE VM, or
+                      *** THE PUSH DOES NOT
+                      HAPPEN. ***
+                    ✅ REFLOG PROTECTION --
+                      *** DONE 28-Jul ~15:3x,
+                      NOT owed here. *** The
+                      deferral to Thursday was
+                      correct while Tuesday was
+                      a no-deploy day; Rama's
+                      15:45 PC==VM override made
+                      TUESDAY the next push, so
+                      the deadline moved to
+                      tonight and it was applied
+                      BEFORE anything was pushed.
+                      Both keys read back
+                      `never`; 801 entries
+                      intact back to 3-May.
+                      ⭐ The push itself was the
+                      thing that could have
+                      pruned it. See §7.3(a).
+
+  ✅✅ THIS ROW IS DONE — PUSHED 31-Jul 21:44:48 IST as `96a5e66..297b587`, 13
+     commits: `fix-symdir-27jul` merged as `d282322`, plus `297b587` correcting the
+     config go-live comment (Rama-approved; proven value-neutral by parsing the YAML
+     both sides). ⭐ RESUMED AFTER A POWER-DOWN mid-deploy — and BOTH halves of the
+     regression were RE-TAKEN in one session+window per the standing rule, because
+     the killed run's BASE does not carry forward: BASE 10F/5469P (pre-merge
+     `0171bd8`) vs AFTER 10F/5495P (the pushed tree), *** NEW-FAILURE SET EMPTY ***,
+     the sets identical in BOTH directions, and all 26 new tests ran and passed.
+     Verified 3 ways (SHA identity PC==origin==bare · the 3 symdir markers ABSENT
+     before the push and PRESENT after — with CONTROL greps first proving that
+     absence check could have found them · reflog push+checkout both @ 21:44:48).
+     `load_all()` on the DEPLOYED tree = CONFIG_LOAD_OK, and the probe read back the
+     LOADED values, not just the YAML text: one_trade..._per_day=True,
+     mis_filter=(enabled True, shadow True). ZERO schema movement ⇒ no migration at
+     the Mon 08:15 boot and no overnight refusal window.
+  ⭐ MONDAY'S BOOT CHAIN VERIFIED ALIVE, not assumed: there is NO systemd timer —
+     08:15 cron runs `auto_refresh_token.py`, `token-watcher.service`
+     (active + enabled) sees the fresh token and starts the service. That is exactly
+     how it started at 08:15:17 today. ⇒ Monday will carry the rule.
+  ⏳ MON 3-AUG IS THE OBSERVATION DAY — card written to
+     `Downloads/MON_03-AUG_OBSERVATION_CARD.txt`. ⛔ TUE 4-AUG IS GATED ON IT.
+
+  Fri 31-Jul       fix-symdir-27jul MINUS        Mon 03-Aug 08:15: the     DAY
+  (evening)          214a878 (audit trail        symbol+direction rule
+                     already landed Thursday)    LIVE (1 behavioural) +
+                   ⭐ SPLIT OUT -- see below      mis_filter SHADOW (log-only)
+                   ⚠️ RAMA UNAVAILABLE 11:00-
+                     17:00 -- covers the WHOLE
+                     Friday trading day. The
+                     EVENING push is after 17:00
+                     ⇒ ✅ the push does not
+                     collide. ⛔ But an intraday
+                     alert on Fri is DETECTION
+                     ONLY for ~6h (liveness_probe
+                     takes no action). Sat 01-Aug
+                     is also 11:00-17:00 blocked.
+
+                   ⛔ NOT the 2FA seed move (deferred to 7/8-Aug)
+
+  Sat/Sun          --                            --                       --
+
+  Mon 03-Aug       nothing                       Tue 04-Aug: THE FLAG     --
+  (OBSERVE the                                   FLIP + carry pilot D1
+   new rule)       ▶️ CARD: `Downloads/MON_03-AUG_OBSERVATION_CARD.txt`
+                   ⛔⛔ *** HARD GATE ON TUE 4-AUG. *** Run §7.2's query after
+                     the close. ANY UNEXPLAINED row -- both direction counts 0,
+                     or ONLY the opposite direction -- *** POSTPONES THE FLIP. ***
+                     It is the query's answer, not a judgement made on the day.
+                     (Opposite-direction-only is WORSE: the rule blocked a
+                     REVERSAL, which its own docstring says would be wrong ⇒ the
+                     rule also comes back OFF.)
+                   ⭐ ZERO ROWS IS **NOT** A PASS -- it means the rule was never
+                     EXERCISED. It does NOT postpone the flip (the flip is a
+                     DELIVERY change), but it carries forward as an OPEN
+                     observation, and ⚠️ prove the day had signal traffic before
+                     believing the zero.
+                   ⚠️ EXPECT a new `REJECTED_NOT_MIS_TRADABLE (shadow)` WARNING
+                     from Monday. *** That is the mis_filter SHADOW log; nothing
+                     was dropped. *** Do not misread it as the filter enforcing.
+                   ⚠️ STILL OWED BEFORE THE CARRY PILOT: the buy-day product
+                     filter (+ CRITICAL-on-NULL), with Q9's BL9 trace attached.
+                     Schedule it in the gap between Monday and the flip.
+                   ⛔⛔ *** AND THAT GAP IS ONE EVENING. *** Tue 4-Aug carries the
+                     carry pilot D1, so the filter's deadline is Mon NIGHT -- but
+                     Monday DAYTIME is "BUILD NOTHING, MEASURE" and the filter is
+                     a CAREFUL-LOOP item (it decides a PRODUCT on a live order).
+                     ⇒ *** THE REAL WINDOW IS THE WEEKEND: Sat 1-Aug / Sun 2-Aug.***
+                     If it is not built by Monday night it does NOT get rushed on
+                     Monday night -- something slips instead, and §7.9(c) says what.
+                   ✅ THE "3-AUG IS A HOLIDAY" QUESTION IS CLOSED -- FALSE, checked
+                     against the circular itself. ⛔ Do not re-open it. See §7.9.
+
+  Tue 04-Aug       ⭐ THE IRREVERSIBLE STEP: four flags flipped. Different card.
+                   ⛔ GATED on Monday's observation coming back clean -- above.
+                   ⚠️ THE GATE HAS TWO PARTS TODAY, NOT THREE -- see §7.9(c). The
+                     product filter gates the CARRY PILOT half, not the flip.
+                     ⇒ ⭐ RAMA'S CALL IS OPEN: does a filter slip postpone ONLY the
+                     carry pilot, or the WHOLE of 4-Aug? Decide it BEFORE Monday.
+
+*** A2 — I AGREE WITH THE THURSDAY-EVENING SLOT, and here is the reasoning
+    made explicit rather than assumed: ***
+  · NOT Mon evening  - Tuesday belongs to v45 alone.
+  · NOT Tue evening  - Wednesday is the T2 ARM; a failed Wed boot wastes the
+                       first market day of the sequence.
+  · NOT Wed evening  - ⛔ THE WORST SLOT. A real position is held overnight.
+                       A failed Thu boot means the service is down on the
+                       morning the carried CNC must be sold. The GTT still
+                       protects it and a manual sell still works, but it turns
+                       a supervised close into an incident.
+  · THU EVENING      - ✅ the T2 pair is COMPLETE by then, so a failed Friday
+                       boot disturbs nothing already proven, costs one quiet
+                       day, and still leaves Mon 3-Aug + Tue 4-Aug clear.
+  · NOT Mon 3-Aug ev - Tuesday 4-Aug is the flag flip; it must be single-variable.
+
+*** ⭐ AND THE TEST-ONLY HALF RIDES ALONG DELIBERATELY. *** It could go any
+evening (zero deploy consequence - no runtime code), but bundling it with the
+boot half on Thursday keeps ONE deploy event instead of two. If a separate
+evening is ever preferred, it is free to move; nothing depends on its timing.
+
+================================================================================
+3. ⚠️ THE COLLISION CHECK (A3) — three found, one would have cost a day
+================================================================================
+
+3.1 ⭐⭐ *** THE T2 BAND WIDEN AND THE T2 MERGE ARE THE SAME FILE, AND THE
+        RUNBOOK'S STEP-ZERO HASH BREAKS THE MOMENT EITHER HAPPENS. ***
+
+    `scripts/t2_cnc_gtt_realtest.py` is edited by the widen AND carried by the
+    merge. Wrong order = the merge overwrites the widen, or the widen lands on
+    the bit-rotted copy.
+    ⚠️ WORSE, AND THIS IS THE DAY-COSTING PART: the runbook's STEP ZERO says the
+    VM canary copy MUST hash `a5779420d652c606...`. *** Widening the band CHANGES
+    THAT HASH. *** If the runbook is not updated, Wednesday's step zero says STOP
+    and Rama correctly aborts the day -- on a card that is telling him the truth
+    about a file that is now correct.
+
+    ⇒ TUESDAY EVENING, AS ONE OPERATION, IN THIS ORDER:
+       1. widen the band on fix-t2-repair-07jul (-10%/+10%)
+       2. merge that branch to main
+       3. re-sync /home/ubuntu/t2_proof_run/ from the deployed tree
+       4. recompute the sha256 and REWRITE the runbook's STEP ZERO + §1b
+       5. verify: deployed file == VM canary copy == the hash on the card
+
+  ✅✅✅ *** DONE -- AND THE INSTRUCTION ABOVE IS SUPERSEDED. DO NOT RE-RUN IT.
+       RE-DOING THE MERGE OR THE WIDEN TONIGHT WOULD BE A CHANGE ON THE EVE OF
+       THE ARM, WHICH IS EXACTLY WHAT THIS SECTION EXISTS TO PREVENT. ***
+       Verified by MEASUREMENT 28-Jul ~11:0x, not by reading a document:
+
+       · IT LANDED AS **e6ec75b**, 27-Jul-2026 22:33:19 IST, and it really was
+         ONE operation -- that single commit carries BOTH files:
+             docs/T2_RUNBOOK_29-JUL.txt      +170/-57
+             scripts/t2_cnc_gtt_realtest.py  +44/-...
+         ⭐ So the runbook's line 59 does NOT "merely happen to agree": it was
+         rewritten in the same commit that changed the band. That is precisely
+         what step 4 asked for.
+       · `fix-t2-repair-07jul` IS merged into main (`git branch --merged main`).
+       · ALL FOUR COPIES = 0a3c505c25e6518c7b77461965b512bb20f55765842d3b3bfb5fb46a0f582d36
+             PC repo scripts/ · VM ~/systems/trading-system/scripts/ ·
+             VM ~/t2_proof_run/ · runbook line 59
+       · ⭐⭐ AND THE BAND WAS READ AS A **VALUE**, NOT INFERRED FROM THE HASH --
+         because a hash proves SYNC, not CORRECTNESS. On the PC copy, the VM
+         deployed copy AND the VM canary, all three:
+             _OCO_SL_MULT  = 0.90   # -10%    (line 107)
+             _OCO_TGT_MULT = 1.10   # +10%    (line 108)
+         with all THREE use sites deriving from those constants (:238-239 seed,
+         :373-374 the real placement, :483 the dry-run) -- so a dry-run rehearsal
+         reports the same band the real run will arm. ⭐ This is the same trap as
+         "the flag is not the fingerprint", one level up: four agreeing hashes
+         would have looked identical if all four were the NARROW band.
+       · Old hashes are deliberately RETAINED at runbook :74-75 for RECOGNITION
+         (`a5779420` = repaired but NOT widened; `23aca731` = bit-rotted), so a
+         failing step zero tells the operator WHICH wrong file they have.
+
+  ⇒ *** TONIGHT'S T2 LIST IS EMPTY. The only work tonight is the three
+    evening checks + the 17:40 go/no-go. ***
+
+3.2 ⭐ *** #16a's BLOCK FIRST EXECUTES ON THE MOST IMPORTANT BOOT OF THE
+        SEQUENCE — unless it is rehearsed first. ***
+
+    A5 is gated on `delivery_enabled is True`, which is false today, so its
+    no-op path is proven and its FIRING path is not. The first time it can fire
+    is *** Tue 4-Aug — the flag flip ***, the single boot the whole sequence
+    depends on. That is a built-and-never-run component being introduced onto
+    the critical path, which is precisely the class this project keeps getting
+    caught by.
+    ⇒ REHEARSE IT OFF-MARKET before 4-Aug: run the boot path against a THROWAWAY
+      config with the four flags set, confirm exit 3 and the CRITICAL, and
+      confirm the correct combination boots clean. ⛔ Never on the live config.
+
+  ✅✅✅ *** REHEARSED 28-Jul-2026 ~15:5x IST. ALL THREE SCENARIOS PASS. THE
+       "BUILT AND NEVER RUN" LABEL IS RETIRED — A5's FIRING PATH HAS NOW
+       EXECUTED. *** Off-market, THROWAWAY config copies under the session
+       scratchpad; ⛔ the live `config/` was never opened for write and is
+       PROVEN byte-identical (md5 `997d9acc…` before AND after; `git status
+       config/` clean). No new config file entered the repo.
+
+       ⭐ IT DROVE main.py's EXACT EXPRESSION, not a paraphrase of it:
+           _a5 = [f for f in audit_config(app_config.system,
+                     strategies=strategies, groups="A").blocks
+                  if f.code == "A5_delivery_without_conditional_allocation"]
+       loading the throwaway config through the real `config_loader.load_all()`
+       and the real `StrategyLoader`, with `fix-boot-27jul`'s auditor (the branch
+       #16a lives on -- its imports are IDENTICAL to main's, so it loads stand-
+       alone; only 2 non-test files differ on that branch).
+
+         SCENARIO   delivery / force_intraday / conditional / trade_type   RESULT
+         ─────────────────────────────────────────────────────────────────────────
+         FIRING     true  / false / false / DELIVERY   3 live, all DELIVERY
+                    -> *** A5 BLOCK FIRES *** (expected BLOCK)      ✅ PASS
+         CORRECT    true  / false / TRUE  / DELIVERY   3 live, all DELIVERY
+                    -> no A5 block, boot continues     (expected CLEAN) ✅ PASS
+         TODAY      false / true  / false / INTRADAY   gate closed, 12 live INTRADAY
+                    -> no A5 block, boot continues     (expected CLEAN) ✅ PASS
+
+       ⭐ *** B3's HALF MATTERS AS MUCH AS B2's: the CORRECT 4-Aug combination
+       BOOTS CLEAN. *** A gate that refused everything would not be a working
+       gate, and 4-Aug depends on the clean path, not the block path.
+       ⭐ AND A5 FIRES ALONE -- `other_group_A_blocks` was EMPTY in the FIRING
+       scenario, so the operator sees ONE CRITICAL, not a wall of them.
+       ⭐ CROSS-CHECK: 3 live strategies under DELIVERY (positional_momentum_long,
+       positional_sector_rotation, positional_swing_long) vs 12 under today's
+       INTRADAY posture -- consistent with the 10-Jul segregation record (12/3).
+
+    ⚠️ *** PRECISION ON WHAT WAS AND WAS NOT EXECUTED. *** The PREDICATE ran and
+      returned the finding. `main.py` itself was NOT booted, so `_log.critical`
+      and `return 3` were not literally executed -- but they sit UNCONDITIONALLY
+      inside `if _a5:` at main.py:2946-2949 with no branch between them, so a
+      non-empty `_a5` entails both. Stated this way rather than claiming an
+      observed exit code.
+
+  ⭐⭐ B4 -- THE MESSAGE WAS MEASURED, NOT JUST THE EXIT. *** VERDICT: ACTIONABLE;
+      no finding. *** If a real 4-Aug boot hits this, Rama reads only this text,
+      and it names the CAUSE, the COST and three REMEDIES:
+        "CONTRADICTORY CONFIG: delivery_enabled=true and every strategy that can
+         trade is DELIVERY (positional_momentum_long, positional_sector_rotation,
+         positional_swing_long), but capital.conditional_allocation_enabled=false
+         pins the fixed bucket split -- the intraday bucket is unreachable, so
+         *** 70% of capital is stranded *** and every delivery position is sized
+         off the remainder. Set capital.conditional_allocation_enabled=true, or
+         enable an INTRADAY strategy, or set delivery_enabled=false."
+      ⭐ It names the offending strategies BY NAME and the stranded share as a
+      COMPUTED percentage (70%, from `intraday_bucket_pct`), not a generic
+      warning. Nothing to fix here.
+
+3.3 ✅ *** B3's DEGRADE vs THURSDAY'S CLOSE — checked, NOT a collision. ***
+    If the webhook self-check fails on Thu 30-Jul, the old behaviour killed the
+    service on the morning a real CNC had to be sold. The degrade is strictly
+    better there. But it ships Thursday EVENING, so Thursday morning still runs
+    the old code. Noted so nobody assumes protection that has not shipped.
+
+3.4 ✅ *** v45 vs fix-boot-27jul — VERIFIED DISJOINT. ***
+    `git diff --name-only` on both: ZERO overlapping files. v45 does not touch
+    main.py or core/config_auditor.py. No merge conflict, no interaction.
+
+3.5 ⛔ *** A COLLISION THAT ALREADY EXISTED AND IS NOW RESOLVED: my B4 test-
+        hygiene commit DUPLICATED work already inside the 24. ***
+    `aaccbda` (26-Jul, in the v45 package) had already converted scanners==16,
+    holidays==15 and _COLSPECS==69 to properties -- and BETTER. Its comment
+    explicitly rejects the assertion I wrote today:
+        "Deliberately NOT len(cfg.scanners) == len(raw['scanners']): pydantic
+         RAISES on a bad entry rather than dropping it, so that comparison can
+         never fail -- it would have replaced one weak assertion with a vacuous
+         one."
+    *** MEASURED today and confirmed: feeding a bad entry raises ValidationError,
+    so the predicate is unreachable. *** B4 was DROPPED. It would also have been
+    the only merge conflict in the queue (two shared test files).
+    ▶️ ONE genuine item survives and is NOT in the 24: `ws.max_column == 69`
+      (test_daily_trade_review.py:211) and `== 21` (:311) are still bare on the
+      v45 branch. Apply AFTER v45 lands, on top of the v45 tree -- with the
+      header-ROW equality, because the width check alone is near-tautological
+      (three loops write from _COLSPECS; measured).
+
+================================================================================
+4. WHAT WOULD MAKE ME CHANGE THIS PLAN
+================================================================================
+  · Tuesday's v45 boot is NOT clean  -> everything below it shifts one day; the
+    T2 arm cannot be Wednesday.
+  · The T2 arm VOIDS (same-day trigger) -> the arm repeats; the boot-path slot
+    moves to the evening after the eventual close, never before it.
+  · Rama wants the boot-path pair earlier -> the only safe earlier slot is
+    Tuesday evening, and that costs Wednesday's arm if the Wed boot fails.
+    Not recommended: it trades a quiet Friday for a scarce market day.
+================================================================================
+END
+================================================================================
+
+================================================================================
+5. ⭐⭐ THE THURSDAY SLOT SPLIT — 27-Jul EVENING. THE RULE GOING ON CHANGED IT.
+================================================================================
+*** THE EARLIER ANSWER IS NO LONGER TRUE AND I AM RETRACTING IT. *** At 15:5x I
+argued fix-symdir-27jul could take ONE slot because it carried "three changes but
+ZERO behavioural variables" -- the symbol+direction rule was INERT at its default.
+
+*** Rama then turned that rule ON. It is no longer inert. It now REJECTS ENTRIES. ***
+
+So the single Thursday slot would have put on ONE Friday boot:
+   · #16a BLOCK gate          -- boot path, CAN STOP THE SERVICE
+   · S4 degrade               -- boot path, changes failure behaviour
+   · symbol+direction rule ON -- signal path, CHANGES WHAT TRADES
+   · mis_filter SHADOW        -- log only
+   · send-side audit trail    -- log only
+Three consequential changes, two of which can stop the boot and one of which
+changes what trades. *** If Friday went wrong you could not tell which. That is
+precisely the multi-variable boot this whole calendar exists to prevent. ***
+
+  ⇒ SPLIT, as scheduled above:
+     Thu 30-Jul eve -> Fri 31-Jul boot : BOOT-PATH PAIR ALONE (+ test-only)
+     Fri 31-Jul eve -> Mon 03-Aug boot : the RULE LIVE (+ 2 log-only)
+     Tue 04-Aug                        : the flag flip, unchanged
+
+  ⭐ THE SPLIT IS BETTER, NOT MERELY SAFER. Mon 3-Aug becomes a FULL TRADING DAY
+  of observation for a brand-new entry rejection rule -- BEFORE Tue 4-Aug, which
+  is the first irreversible delivery step. A new rule that silently over-blocks
+  would otherwise first be seen on the same day delivery goes live.
+
+  ⚠️ THE COST, STATED: 3-Aug stops being an empty buffer. It now carries ONE
+  variable. That does not compromise 4-Aug's single-variable requirement (the
+  rule lands a day earlier and is observed), and the credential variable that
+  originally reserved 3-Aug -- the 2FA seed move -- is already deferred to 7/8-Aug.
+  ⚠️ AND: if the rule misbehaves on Mon 3-Aug, it DELAYS Tue 4-Aug. That is the
+  correct outcome, not a regression -- you would want to know before the flip.
+================================================================================
+
+================================================================================
+6. ⭐⭐ RE-COUNTED 28-JUL — THE OVERLOAD IS NOT THURSDAY. IT WAS FRIDAY.
+================================================================================
+*** Re-counted by MEASUREMENT (git diff against each branch's own fork point,
+non-test files only), not from the queue description. Two counts in §2 were
+stale. ***
+
+  branch            commits  files  tests  NON-TEST files it changes
+  ──────────────────────────────────────────────────────────────────────────
+  fix-tests-27jul      4        7      7   *** NONE. ZERO. ***
+  fix-boot-27jul       2        4      2   main.py (+72), core/config_auditor.py (+57)
+  fix-symdir-27jul     7       14      7   alerts/telegram_notifier.py (+54),
+                                           signals/signal_processor.py (+51),
+                                           core/state_store.py (+26),
+                                           config/system_config.yaml (+23),
+                                           capital/risk_engine.py (+7),
+                                           core/config_loader.py (+7), main.py (+1)
+
+*** THE TEST: "IF FRIDAY'S BOOT MISBEHAVES, COULD YOU TELL WHICH CHANGE CAUSED
+IT?" -- YES. Thursday's slot is NOT overloaded, and the count was misleading. ***
+
+  · fix-tests-27jul changes *** 0 non-test files ***. main.py never imports
+    tests/. It contributes ZERO boot variables. Six commits, but only two of them
+    can reach a boot at all.
+  · #16a (f2e34bc) is *** INERT ***, by its own measured precondition: it fires
+    only when delivery_enabled=true AND conditional_allocation_enabled=false AND
+    every live strategy resolves DELIVERY-only. delivery_enabled has been false
+    since the 15-Jun incident. *** It CANNOT fire on Friday's boot. ***
+  · ⇒ Friday's boot carries exactly *** ONE *** live change: the S4 degrade.
+
+⭐⭐ AND THE PART THAT ANSWERS B3 PROPERLY -- THE PAIR'S FAILURE MODES HAVE
+   OPPOSITE SIGNS, which is a stronger safety property than "each is safe":
+     · #16a can only ADD a boot refusal   (it is a new BLOCK gate)
+     · S4  can only REMOVE one            (it turns a halt into degrade+alarm)
+   So a Friday boot *** FAILURE *** cannot be S4, and cannot be #16a either
+   (inert) -- it would be something unrelated, and that itself is the diagnosis.
+   A Friday boot that *** SUCCEEDS WHERE IT PREVIOUSLY WOULD HAVE HALTED *** is
+   S4, unambiguously. The pair does NOT need its own boot. Rama's instinct that
+   boot-path items deserve isolation is right in general; measured here, it does
+   not bind.
+
+*** SO THE REAL OVERLOAD WAS FRIDAY 31-JUL (-> Mon 3-Aug boot): 7 non-test files
+across 3 subsystems -- alerts, signals, capital -- and 3 distinct behavioural
+changes in one boot. THAT is the slot that failed the test. ***
+
+--------------------------------------------------------------------------------
+THE CHANGE, AND WHY IT ALSO SETTLES THE AUDIT TRAIL'S SLOT (register C1)
+--------------------------------------------------------------------------------
+*** MOVE THE ALERT AUDIT TRAIL (214a878) FROM FRIDAY TO THURSDAY. ***
+
+  WHY IT IS SAFE TO MOVE: it is *** exactly two files *** --
+  alerts/telegram_notifier.py (+54) and its own test (+150). *** NO schema
+  change, NO config change, NO state_store change. *** A clean cherry-pick; it
+  sits before the config flips in symdir's history, so nothing depends on it.
+  It cannot prevent a boot -- its failure mode is a missing log line.
+
+  WHY IT SHOULD MOVE -- THE COST OF DELAY IS PERMANENT, NOT DEFERRED:
+  *** the audit trail only answers from deployment forward. *** Every day it
+  waits is a day that is permanently unauditable -- you cannot backfill "did the
+  send succeed" for a day the instrumentation did not exist. That is the
+  strongest possible argument for the earliest safe slot, and Thursday is the
+  earliest safe slot that exists. Waiting until Mon 3-Aug costs two more
+  permanently-blind trading days for no risk reduction whatsoever.
+
+  ⚠️ HONEST COST: it makes Friday's boot 2 live changes rather than 1 (S4 +
+  the audit trail). They remain distinguishable -- different subsystems, and the
+  audit trail cannot produce a boot failure at all. The test still passes.
+
+  AFTER THE MOVE:
+    Thu 30-Jul -> Fri boot : S4 (live, boot path) + audit trail (live, alerts)
+                             + #16a (inert) + 4 test-only commits
+    Fri 31-Jul -> Mon boot : the one-trade rule (1 behavioural) +
+                             mis_filter SHADOW (log-only, enabled-not-enforcing)
+  *** Both boots now pass the "could you tell which change" test. ***
+
+⛔ NOT DONE TODAY. Nothing deploys 28-Jul. This section is the proposal + the
+   measurement behind it; the cherry-pick happens Thursday evening with the rest.
+================================================================================
+
+================================================================================
+7. ⭐⭐ INDEPENDENT REVIEW 28-JUL — THE AMENDMENTS, WRITTEN AS EXECUTABLE GATES
+================================================================================
+Verdict 28-Jul: P1 (this calendar) APPROVE-WITH-AMEND · P2 (.pyc detector)
+APPROVE-WITH-AMEND · *** NO blocking architectural objection. *** The measured
+re-count (§6), the opposite-sign argument (§6) and the cost-of-delay argument for
+moving the audit trail to Thursday ALL SURVIVED review. Nothing in §2's slot
+allocation changes. The amendments are ADDITIVE.
+
+⭐ A STEP IS ONLY A GATE IF IT PRINTS A VERDICT. Everything below is a command
+with an exact expected output and a binary outcome. "Check that X is still true"
+is a sentence, not a gate, and has been deliberately avoided.
+
+--------------------------------------------------------------------------------
+7.1 *** P1-1 — THURSDAY PRE-PUSH GATE: #16a MUST STILL BE INERT. ***
+--------------------------------------------------------------------------------
+WHY: §6 rests Friday's entire "ONE live boot variable" claim on #16a being inert.
+*** That is a CONFIG fact, not a code fact. *** Anyone could flip it between now
+and Thursday evening and nothing in the system would notice.
+
+THE PREDICATE, READ FROM SOURCE (fix-boot-27jul:core/config_auditor.py:269-291),
+not from the queue description. A5/#16a raises BLOCK only when ALL FOUR hold:
+    T1  delivery_enabled == true
+    T2  capital.conditional_allocation_enabled == false
+    T3  the live-strategy set is NON-EMPTY
+    T4  EVERY live strategy resolves product == "DELIVERY"
+
+⚠️⚠️ THE MEASUREMENT THAT MAKES THIS GATE WORTH HAVING — *** T2 IS ALREADY IN ITS
+FIRING STATE. *** `conditional_allocation_enabled: false` (system_config.yaml:138)
+is the DEFAULT and is deliberate. So one of the four terms is permanently
+satisfied, and today's inertness rests ENTIRELY on T1 and T4. *** A single edit --
+`delivery_enabled: true` -- takes the config from two falsifiers to one. *** That
+is exactly why inertness must not be certified from the first term alone.
+
+⭐ A PRECISION, BECAUSE THE WORDING MATTERS. The amendment says inertness needs
+"the whole conjunction to be false". Strictly, a conjunction is false when ANY ONE
+term is false, so one falsifier is logically sufficient. The gate below keeps the
+amendment's INTENT, which is the operationally correct part: read EVERY term, and
+require TWO INDEPENDENT falsifiers, so that no single config edit can arm #16a
+unobserved.
+
+  ▶️ THE GATE — RUN IT ON THE VM. *** The VM's copy is the one the service loads.
+     ⛔ The PC copy does not count and must not be substituted. ***
+
+     ssh trading-vm '
+       cfg=$HOME/systems/trading-system/config/system_config.yaml
+       d=$(sed -n "s/^delivery_enabled:[[:space:]]*\([a-z]*\).*/\1/p" $cfg)
+       f=$(sed -n "s/^force_intraday_only:[[:space:]]*\([a-z]*\).*/\1/p" $cfg)
+       c=$(sed -n "s/^[[:space:]]*conditional_allocation_enabled:[[:space:]]*\([a-z]*\).*/\1/p" $cfg)
+       echo "T1 delivery_enabled=$d | T2 conditional_allocation_enabled=$c | T4-proxy force_intraday_only=$f"
+       if [ "$d" = "false" ] && [ "$f" = "true" ]; then echo PROCEED; else echo ABORT; fi
+     '
+
+     EXPECTED, EXACTLY:
+       T1 delivery_enabled=false | T2 conditional_allocation_enabled=false | T4-proxy force_intraday_only=true
+       PROCEED
+
+     ⛔ ANY other output -> *** ABORT. THE THURSDAY PUSH DOES NOT HAPPEN. *** Do
+       not reason around it on the night: if either falsifier moved, §6's safety
+       argument no longer holds and the slot moves. That is the whole point.
+
+  WHY force_intraday_only IS A SOUND PROXY FOR T4, and not a hand-wave:
+  force_intraday_only=true coerces EVERY entry to INTRADAY, so no live strategy
+  can resolve product == "DELIVERY" and T4 is false BY CONSTRUCTION.
+  ⭐ CORROBORATED LIVE, NOT ONLY IN CONFIG: on 28-Jul the deployed system logged
+  *** 99 × REJECTED_STRATEGY_CONTROL *** carrying "WON'T TRADE — emergency breaker
+  (force_intraday_only)" (strategies/control.py:90). The coercion is observably
+  RUNNING, not merely configured.
+
+  ⭐ OPTIONAL CORROBORATION (read-only; NOT the gate):
+     ssh trading-vm "sqlite3 -readonly ~/systems/trading-system/data_store/trading_system.db \
+       \"SELECT COUNT(*) FROM signals WHERE DATE(received_at)=DATE('now','localtime') \
+         AND status='REJECTED_STRATEGY_CONTROL';\""
+     Non-zero on a trading day = the breaker visibly working. ⚠️ A ZERO IS NOT A
+     FAILURE -- it can simply mean no signal reached that stage -- so this never
+     blocks. The YAML gate above is the decision.
+
+--------------------------------------------------------------------------------
+7.2 *** P1-3 — MON 3-AUG IS AN OBSERVATION DAY. THE TRIGGER IS A QUERY. ***
+--------------------------------------------------------------------------------
+⭐⭐ FIRST, THE PART THAT COULD HAVE INVALIDATED THE WHOLE OBSERVATION DAY —
+CHECKED 28-JUL, AND IT PASSES. The rejection is DISTINGUISHABLE and STRUCTURED:
+  · signal_processor.py:686 raises _PipelineReject("SYMBOL_DIRECTION_DAILY_LIMIT",
+    ...) -- its OWN code, deliberately not folded into the H-7 cap's (the
+    docstring records why, and a test enforces it).
+  · f"REJECTED_{rej.check}" (5 sites) writes
+    *** signals.status = REJECTED_SYMBOL_DIRECTION_DAILY_LIMIT ***
+  · schema.sql:66 permits it (status GLOB 'REJECTED*'), so the INSERT cannot fail
+    -- worth checking, because a rejected status write would crash the pipeline.
+  · CONFIRMED EMPIRICALLY on the live DB the same day, not from source alone: the
+    sibling REJECTED_ENTRY_THROTTLED appears ×10. The convention is real.
+⇒ *** Monday measures something. The amendment CAN be satisfied. ***
+
+⚠️ THE ONE CONSTRAINT: *** `signals` HAS NO DIRECTION COLUMN *** (schema.sql:42-72).
+   Direction exists on `trades` only. So the query is built on the STRUCTURED side
+   and the free text is RENDERED, never branched on -- the register's standing rule.
+
+⭐ AND THE QUERY MUST COUNT TRADES THE WAY THE RULE COUNTS THEM, or it will
+manufacture false UNEXPLAINED rows. Read from source:
+  · the rule calls count_executed_trades_today_for_symbol_direction()
+  · which matches SUBSTR(created_at,1,10) -- NOT entry_time, NOT exit_time
+  · and status IN _EXECUTED_TRADE_STATUSES =
+        PENDING_FILL, OPEN, PARTIAL, EXITING, CLOSED, CLOSED_MANUAL
+  ⛔ THE AMENDMENT'S WORD "COMPLETED" IS LOOSER THAN THE CODE, AND THE CODE WINS:
+    an OPEN or PENDING_FILL trade ALSO consumes the day's slot. A query written on
+    status='CLOSED' would report correctly-working rejections as UNEXPLAINED and
+    could postpone 4-Aug for no reason at all.
+
+  ▶️ THE MON 3-AUG QUERY — read-only, after the close:
+
+     ssh trading-vm "sqlite3 -readonly -header -column \
+       ~/systems/trading-system/data_store/trading_system.db \"
+       SELECT s.received_at, s.symbol, s.status,
+         (SELECT COUNT(*) FROM trades t WHERE t.symbol=s.symbol
+            AND SUBSTR(t.created_at,1,10)='2026-08-03' AND t.direction='LONG'
+            AND t.status IN ('PENDING_FILL','OPEN','PARTIAL','EXITING','CLOSED','CLOSED_MANUAL')) AS long_today,
+         (SELECT COUNT(*) FROM trades t WHERE t.symbol=s.symbol
+            AND SUBSTR(t.created_at,1,10)='2026-08-03' AND t.direction='SHORT'
+            AND t.status IN ('PENDING_FILL','OPEN','PARTIAL','EXITING','CLOSED','CLOSED_MANUAL')) AS short_today,
+         s.rejection_reason
+       FROM signals s
+       WHERE DATE(s.received_at)='2026-08-03'
+         AND s.status='REJECTED_SYMBOL_DIRECTION_DAILY_LIMIT'
+       ORDER BY s.received_at;\""
+
+     HOW TO READ EACH ROW. `rejection_reason` renders as
+       "<SYMBOL> <DIRECTION> already traded today (<n> executed trade(s)); ..."
+     so the direction is HUMAN-VISIBLE without being parsed:
+       · the named direction's count >= 1  -> ✅ THE RULE WORKING. Expected.
+       · BOTH counts 0                     -> 🔴 *** UNEXPLAINED. POSTPONES 4-AUG. ***
+       · ONLY THE OPPOSITE direction >= 1  -> 🔴 *** WORSE THAN UNEXPLAINED. *** The
+         rule blocked a REVERSAL, which its own docstring (:659-661) says would be
+         wrong: "Exiting a LONG and entering a SHORT on the same symbol is a
+         different bet ... blocking it would be wrong." POSTPONES 4-AUG **and the
+         rule comes back off**.
+
+  ⭐ THE ZERO CASE, RECORDED AS THE AMENDMENT REQUIRES. *** ZERO ROWS IS NOT A
+    PASS. *** It means the rule was never EXERCISED -- 3-Aug simply had no second
+    signal on an already-traded symbol+direction. Read it as NO EVIDENCE, never as
+    good evidence, and say so out loud on the night.
+    · It does NOT postpone 4-Aug: the flip is a DELIVERY change and the
+      symbol+direction rule is not one of the four flags.
+    · It DOES mean the rule enters 4-Aug still unexercised in production -- the
+      "configured but never covered" shape the register already tracks. Carry it
+      forward as an OPEN observation, not a closed one.
+    · ⚠️ AND A ZERO MUST NOT BE A SILENT PLUMBING FAILURE. Prove the day had
+      traffic before believing the zero:
+        ssh trading-vm "sqlite3 -readonly ~/systems/trading-system/data_store/trading_system.db \
+          \"SELECT status, COUNT(*) FROM signals WHERE DATE(received_at)='2026-08-03' \
+            GROUP BY status ORDER BY 2 DESC;\""
+      A day with entries and no such rejection is believable. A day with NO
+      signals at all proves nothing about anything.
+
+  ▶️ THE HARD GATE ON TUE 4-AUG: *** any UNEXPLAINED row -- both counts 0, or only
+    the opposite direction -- POSTPONES THE FLAG FLIP. *** It is not a judgement
+    made at 16:00 on the day. It is the query above, and its answer is binary.
+
+--------------------------------------------------------------------------------
+7.3 *** P1-4 — DEPLOYED-COMMIT ATTRIBUTION. ANTI-DUPLICATION FIRST. ***
+--------------------------------------------------------------------------------
+⛔ THE AMENDMENT SAYS FIND WHAT ALREADY RECORDS THIS BEFORE ADDING ANYTHING —
+*** AND DOING SO OVERTURNED MY OWN EARLIER ANSWER. RECORDED, NOT SILENTLY EDITED. ***
+
+⛔⛔ WHAT I REPORTED EARLIER TODAY WAS WRONG: "the bare repo has NO REFLOG AT ALL,
+there is no logs/ dir, NOTHING records deployment." *** ALL THREE CLAUSES ARE
+FALSE. *** The check behind them ran `git reflog show main`, got nothing, saw
+`core.logAllRefUpdates` unset, and concluded absence. *** It looked at the wrong
+ref. *** The register's own rule caught it: an audit finding is a HYPOTHESIS.
+
+  ✅ *** THE DEPLOY RECORD EXISTS, AND IT IS GOOD. *** `~/trading-system.git/logs/HEAD`
+     -- **801 entries, unbroken back to 3-May-2026 15:13 IST**, 125,774 B.
+     It records BOTH halves of every deploy, timestamped to the second:
+         52ead46 HEAD@{2026-07-28 09:15:25 +0530}: checkout: moving from main to main
+         52ead46 HEAD@{2026-07-28 09:15:25 +0530}: push
+     the `push` = receive-pack taking the commit; the `checkout` = post-receive's
+     `git checkout -f` WRITING THE DEPLOYED TREE. *** That second line is the
+     deploy event itself, not a proxy for it. ***
+
+     ▶️ THE QUERY. There is nothing to build:
+        ssh trading-vm "git -C ~/trading-system.git reflog show HEAD --date=iso | head -20"
+
+     ⭐ AND IT INDEPENDENTLY CORROBORATES §3.1: `e6ec75b` shows push+checkout at
+       *** 27-Jul 22:33:58 IST ***, 39s after its 22:33:19 commit stamp. §3.1's
+       conclusion was reached from the PC's git history; this is a SECOND,
+       VM-side witness that never entered that reasoning.
+
+  WHY IT EXISTS THOUGH THE CONFIG IS OFF -- the mechanism, so nobody "fixes" it:
+  *** git appends to a reflog file that ALREADY EXISTS regardless of
+  core.logAllRefUpdates; the setting only governs whether one is CREATED. ***
+  `logs/HEAD` was created 3-May by the initial `checkout: moving from master to
+  main` (first entry), and every push since has appended to it. It is bare
+  (`core.bare=true`), so no per-ref log was ever created --
+  `git reflog show main` is EMPTY (0 lines) and always has been. That emptiness is
+  what produced the wrong answer.
+
+  THE OTHER CANDIDATES, for completeness:
+  · post-receive hook -> echoes to the PUSHER'S TERMINAL only; nothing persists.
+  · a dedicated deploy log -> does not exist, AND IS NOT NEEDED.
+  · UNPUSHED_PENDING_DEPLOY_LEDGER -> records INTENT (queued/owed) by design.
+      ⛔ Must NOT be turned into an observed log too; it would be both a plan and
+      a record, and reliably wrong as one of them.
+
+  ▶️ SO THE ADDITION IS SMALLER THAN PROPOSED — AND THE REAL ITEM IS PRESERVATION,
+     NOT CREATION:
+
+     (a) ⏰ *** TIME-SENSITIVE, AND THIS IS THE ACTUAL FINDING. *** `gc.reflogExpire`
+         is UNSET -> git's default *** 90 DAYS ***. The oldest entries are dated
+         3-May; on 28-Jul they are ~86 days old. *** The record starts expiring in
+         DAYS, and any `gc --auto` triggered by a push can prune it. *** Two
+         one-line fixes, neither of which touches the hook:
+             ssh trading-vm "git -C ~/trading-system.git config gc.reflogExpire never"
+             ssh trading-vm "git -C ~/trading-system.git config gc.reflogExpireUnreachable never"
+         ⭐ Do this BEFORE the next push, i.e. before Thursday, or three months of
+           deployment history is lost to a default nobody chose.
+     (b) Then, and only as belt-and-braces, create the per-ref log going forward:
+             ssh trading-vm "git -C ~/trading-system.git config core.logAllRefUpdates true"
+         This makes `git reflog show main` work FROM THAT MOMENT. It adds nothing
+         retroactively -- HEAD's log already has the history -- but it stops the
+         whole record depending on one file's continued existence.
+
+  ⚠️ HONEST LIMIT, UNCHANGED: this records what the bare repo RECEIVED and
+     CHECKED OUT. It is NOT a check that the working tree still matches -- that is
+     7.4, a different item. ⭐ But it is now clear that 7.4's harder half is
+     already solved: *** the "known commit" side of "does the tree match a known
+     commit" has existed all along. ***
+  ✅ **(a) DONE 28-Jul ~15:3x — BEFORE ANY PUSH.** `gc.reflogExpire` and
+     `gc.reflogExpireUnreachable` both read back `never`; 801 entries intact back
+     to 3-May. ⭐ The Thursday deferral was correct while Tuesday was a no-deploy
+     day; Rama's 15:45 PC==VM override moved the deadline to tonight, and the
+     push was the very thing that could have pruned it. **(b) still owed** —
+     belt-and-braces, no deadline.
+
+--------------------------------------------------------------------------------
+7.4 *** P2-3 — DEPLOYED-TREE-vs-HEAD INTEGRITY. REGISTERED, NOT BUILT. ***
+--------------------------------------------------------------------------------
+⛔ DO NOT BUILD IT. ⛔ DO NOT WIDEN THE .pyc DETECTOR TOWARD IT. Separate task,
+its own gate. It is recorded HERE rather than in a report because a report is not
+a place that gets read, and this is.
+
+  THE ITEM: *** the invariant "the deployed tree equals HEAD" is verified by
+  NOTHING. *** The deployed tree has no `.git` at all, so there is no local
+  `git status` to catch drift, and `checkout -f` overwrites tracked files while
+  never removing untracked ones.
+  ⭐ THIS IS THE MORE IMPORTANT OF THE TWO .pyc FINDINGS. The entire Thursday
+  cherry-pick decision (§6) was made to PROTECT the deployed tree's correspondence
+  to a known commit -- and that correspondence is ASSUMED, never measured. The
+  .pyc detector closes one narrow real hole in it; it does not close this.
+  ITS GATE: build and prove it only AFTER Tue 4-Aug's flag flip is complete and
+  observed. It is diagnostics, it competes with nothing, and it must not add a
+  variable to any boot between now and then.
+  ⭐ DEPENDENCY, AND IT GOT CHEAPER ON 28-JUL: "does the deployed tree match a
+  known commit" has two halves, and 7.3 established that the *known commit* half
+  *** ALREADY EXISTS *** -- the HEAD reflog names the exact commit `checkout -f`
+  wrote, with a timestamp, back to 3-May. So this item is now only the SECOND
+  half: compare the tree against that commit. Cheaper than it looked, and it is
+  one more reason to protect the reflog from expiry (7.3a) BEFORE building this.
+
+--------------------------------------------------------------------------------
+7.5 *** P2-4 — THE .pyc DETECTOR RIDES THURSDAY. MONITORING-ONLY. ***
+--------------------------------------------------------------------------------
+WHAT IT IS: an 11th check in scripts/system_manager.py (`stray_pyc_check`),
+surfaced in the EOD report. <BUILT> 28-Jul, plant-tested, NOT PUSHED.
+  · It CANNOT change trading behaviour: it never sets `soft_kill_reason`. A stray
+    build artefact must not be able to stop tomorrow's trading. *** Asserted by
+    test, not merely intended. ***
+  · It changes ZERO boot variables -- system_manager runs at EOD, not at 08:15,
+    and main.py does not import it.
+  · Its worst failure mode is a wrong line in a report.
+⇒ It belongs in Thursday's bundle with the other zero-consequence items.
+
+  ⭐ FRIDAY'S BOOT INVENTORY, RE-STATED AFTER ADDING IT (§6's test, re-run):
+      Thu 30-Jul eve -> Fri 31-Jul boot now carries
+        · S4 degrade          -- LIVE, boot path         <- 1 live boot variable
+        · alert audit trail   -- LIVE, alerts, log-only   (cannot fail a boot)
+        · #16a                -- INERT, and now GATED by 7.1
+        · .pyc detector       -- MONITORING-ONLY, EOD path, NOT a boot variable
+        · 4 test-only commits -- 0 non-test files
+    *** THE COUNT OF LIVE BOOT VARIABLES IS UNCHANGED AT ONE. *** The detector
+    does not move it, because it cannot execute during a boot at all.
+    "If Friday's boot misbehaves, could you tell which change caused it?" -- still
+    YES, and for §6's reason: the detector cannot produce a boot outcome, so it is
+    never a candidate.
+
+--------------------------------------------------------------------------------
+7.6 ✅ *** P1-2 — 214a878 PROVEN TO CHERRY-PICK CLEAN, 28-JUL, NOT THURSDAY. ***
+--------------------------------------------------------------------------------
+*** Thursday evening must not be the first time anyone finds out. *** Proven today
+on a THROWAWAY branch off `main`, since deleted:
+  · cherry-pick exit 0, NO conflicts, exactly 2 files.
+  · *** ZERO new imports *** in alerts/telegram_notifier.py -- so it does NOT lean
+    on anything that lands later in fix-symdir's history. That was the specific
+    risk and it is refuted by measurement, not by reading the diff.
+  · 7 own tests GREEN + the full alerts/notifier set, *** 204 passed ***.
+⇒ VERDICT: **CLEAN**. It stays on Thursday. §6's move is confirmed executable.
+
+⚠️⚠️ A HAZARD FOUND IN THE INSTRUCTION ITSELF, AND IT GENERALISES:
+*** the outbound-network guard is NOT on `main` -- it lives only on
+fix-tests-27jul. *** Running the alerts suite off bare `main` would have risked
+REAL Telegram sends: the exact class that posted ~50 live alerts since 6-May.
+  ⇒ fix-tests-27jul was merged into the throwaway FIRST. That is also the more
+    representative tree, because Thursday carries both.
+  ⛔ STANDING RULE: *** never run the alerts suite on a tree that lacks the guard. ***
+
+--------------------------------------------------------------------------------
+7.7 ⭐ THE INVENTORY — ⚠️ RE-ASSIGNED 15:45 FROM THURSDAY TO **TUESDAY**
+--------------------------------------------------------------------------------
+⚠️ *** THIS BLOCK ORIGINALLY DESCRIBED THURSDAY'S PUSH. Rama's 15:45 "PC == VM
+100%" moved ALL of it to TUESDAY NIGHT, so it is re-labelled rather than left
+pointing at the wrong evening. *** Thursday now carries ONLY `fix-tests-27jul`,
+`fix-boot-27jul` and the `214a878` cherry-pick.
+
+*** The "could you tell which change caused it?" test only stays honest if the
+inventory is COMPLETE. *** By 28-Jul evening `main` is **16 commits ahead** of
+origin, most of them documentation, so the count is re-derived here rather than
+assumed.
+
+  MEASURED (`git rev-list origin/main..main`, per-commit file list):
+    · 16 local commits
+    · *** 15 of 16 are DOCS-ONLY ***
+    · *** EXACTLY ONE touches a non-doc file: `8331fb0` *** —
+          scripts/system_manager.py
+          tests/unit/test_system_manager.py
+    ⇒ THE COMPLETE NON-DOC SET ACROSS ALL 12 COMMITS IS **TWO FILES**.
+    ⇒ *** ZERO config. ZERO trading/capital-path (config/ capital/ core/
+      orders/ signals/ main.py all empty in the diff). ***
+
+  ▶️ *** FRIDAY'S LIVE BOOT-VARIABLE COUNT IS STILL **ONE** — the S4 degrade. ***
+     ⭐ RE-RUN 28-Jul 15:5x AFTER the Tuesday re-assignment: moving the docs and
+     the detector OFF Thursday cannot RAISE Friday's count, and it does not lower
+     it either, because neither was ever a boot variable. Term by term:
+       · the 15 doc commits    -- text. CANNOT execute. Not variables.
+         (they land TUESDAY now, and Wednesday's boot is unaffected for the
+          same reason: text does not execute.)
+       · `8331fb0` detector    -- runs in the 18:45 EOD job; `main.py` never
+                                  imports `system_manager`. NOT a boot variable.
+                                  ⭐ Lands TUESDAY; its first production run is
+                                  Tue 18:45, on a FLAT book.
+       · #16a                  -- INERT, and now GATED by 7.1.
+       · the alert audit trail -- LIVE but log-only; cannot fail a boot.
+       · S4 degrade            -- **the one live boot variable.**
+     ⛔ IF THAT COUNT EVER MOVES, THE SLOT MOVES. It has not moved.
+
+  ▶️ PRE-PUSH STEPS ON THURSDAY, IN ORDER — *** both BEFORE the push: ***
+       1. §7.1  #16a inert on the VM  -> PROCEED, or the push does not happen.
+       2. §7.3(a) protect the deploy reflog (2 `git config` one-liners).
+          ⚠️ *** BEFORE, not after: a `gc --auto` triggered BY THIS PUSH is
+          exactly what would prune the 3-May-onward history. ***
+================================================================================
+
+================================================================================
+7.8 ⏰⛔ *** STANDING RULE: NO PUSH BETWEEN 18:05 AND 18:25 IST ON A WEEKDAY ***
+================================================================================
+cron `15 18 * * 1-5` runs `forward_shadow_record`; it completed 18:16 on 27-Jul,
+so the bracket is 10 minutes either side. *** Its output CANNOT BE REGENERATED ***
+-- it is the ONLY out-of-sample evidence producer and D3/D4 both depend on it --
+so a push landing mid-run, or changing what it loads, costs a day that never
+comes back. ⛔ NEVER produce a missing day manually: a gap is a loss, a
+manufactured day CORRUPTS the only clean evidence set.
+
+⭐ WHY THIS IS A RULE AND NOT A NOTE: on 27-Jul the recorder wrote at 18:16 and
+the v45 deploy landed at *** 18:17:37 -- a 71-SECOND margin. *** Safe BY LUCK,
+NOT DESIGN. A near-miss that is only written down happens again. ⭐ And a rule an
+operator has to ESTIMATE is not a rule, which is why this is a clock time.
+
+⭐⭐ THE STRONGER FORM, stated once: *** any push that could change what
+`state_store` EXPECTS must land IMMEDIATELY BEFORE an off-market boot, never the
+evening before. *** That is M1's first direction and the half that needs no code.
+⛔ The other half (non-boot processes DEGRADE instead of aborting whole) is
+REGISTERED, gated after 4-Aug, and is NOT covered by Thursday's S4 change -- S4 is
+a webhook self-check at BOOT; this is a non-boot cron hitting a SCHEMA guard.
+
+✅ 28-Jul: this did NOT constrain tonight. The push was expected ~17:40-17:45,
+clear of the bracket, and tonight's commits were VERIFIED to carry no schema
+expectation change (0 schema-bearing files in the diff; 0 lines touching
+`EXPECTED_SCHEMA_VERSION`; PC == VM == live DB == 45) ⇒ no refusal window opened.
+================================================================================
+
+================================================================================
+7.9 ⛔⛔ *** "3-AUG IS A HOLIDAY" — RAISED 31-Jul ~22:0x, FALSE, AND IT NEVER
+    REACHED AN ARTIFACT. THE ROOT CAUSE WAS A MISREAD, NOT A BAD DATA FILE. ***
+================================================================================
+(a) WHAT THE CLAIM WAS, AND WHAT THE SOURCE SAYS.
+    A claim was made that Mon 3-Aug-2026 is an NSE holiday (offered as "Sunday /
+    Independence-Day weekend"), and on that basis the observe-Mon → flip-Tue
+    sequence was said to need re-gating. Rama pulled the primary source
+    (`~/Downloads/NSE_HOLIDAY.pdf` = circular NSE/CMTR/71775, 12-Dec-2025) at
+    22:09 and it refutes the claim on BOTH counts:
+      · 03-Aug-2026 is a **MONDAY**, not a Sunday.
+      · Independence Day is **15-Aug**, and in 2026 it falls on a **SATURDAY** --
+        it is on the circular's weekend list, not its trading-holiday list.
+    ⇒ *** 03-Aug-2026 AND 04-Aug-2026 ARE NORMAL NSE TRADING DAYS. ***
+
+(b) ⭐⭐ ROOT CAUSE: **THE DATA FILE IS CORRECT. THE READ OF IT WAS NOT.**
+    This distinction is the whole finding, because the two have opposite fixes.
+    `config/nse_holidays_2026.yaml` -- resolved by year at `config_loader.py:2166`,
+    and the SOLE source, since every consumer routes through
+    `utils/holiday_guard.py` -- contains **NO 2026-08-03 entry**. It contains no
+    August entry AT ALL: the list jumps `2026-06-26` (Muharram) → `2026-09-14`
+    (Ganesh Chaturthi). The only string "Aug" anywhere in the file is a COMMENT
+    in the weekend block, quoted verbatim:
+
+        #   15-Aug-2026 (Sat) Independence Day
+
+    ⛔ *** THAT COMMENT IS THE MOST LIKELY ORIGIN OF THE ERROR: the one August
+    line in the file is a holiday name next to a weekend marker, and it was read
+    as if it applied to the August date then under discussion. *** A comment in a
+    data file was treated as data. ⇒ **MISREAD / FABRICATION IN THE PRIOR
+    SESSION, NOT A DATA DEFECT.** There is NO holiday-file fix owed, and D's
+    "register a gated file edit" branch does NOT apply.
+
+    The system's own loader agrees, run 31-Jul on the current config:
+        is_trading_day(2026-08-03) = True   get_holiday_name = None
+        is_trading_day(2026-08-04) = True   get_holiday_name = None
+        is_trading_day(2026-08-15) = False  get_holiday_name = None   (SATURDAY --
+          correctly non-trading for the WEEKEND reason, not the holiday reason)
+        loaded holiday set size = 15
+
+(c) ⭐⭐ **THERE WAS NOTHING TO REVERT — THE FALSE CLAIM NEVER LANDED.**
+    Checked at 22:5x, and stated with its WIDTH so the zero can be trusted:
+      · `git status --short` -- EMPTY. No uncommitted calendar edit.
+      · HEAD is `2b2ea77` (21:51:02) and NO commit exists after it, on ANY branch
+        (`git log --since=21:51 --all` = that one commit). `git stash list` empty.
+      · `2b2ea77`'s own diff is what SET Mon 3-Aug = OBSERVE and Tue 4-Aug = FLIP.
+        The correct sequence is the LAST thing written, not something restored.
+      · The card is still `Downloads/MON_03-AUG_OBSERVATION_CARD.txt`, mtime
+        21:50, and its BODY is dated 3-Aug throughout (the query filters
+        `'2026-08-03'`, twice in the trades sub-selects and once on `signals`).
+      · The Downloads calendar copy is **md5-identical** to the tracked one
+        (`4030bd0…`) ⇒ the single-authority property from `2b2ea77` still holds.
+      · CONTENT sweep for holiday/regate language across the calendar + card:
+        no hit. ⭐ CONTROL FIRST: the same corpus returns 17 and 2 hits for
+        "3-Aug", so the search could have found a regate had one existed.
+    ⇒ The claim was raised in conversation, was refuted in the same evening, and
+    was **never propagated into the calendar, the card, or the memory index.**
+    ⭐ THE ARTIFACTS WERE RIGHT THE WHOLE TIME. The damage was confined to one
+    session's reasoning -- which is exactly why it must still be registered.
+
+(d) ⭐ THE WHOLE FILE RECONCILED TO THE CIRCULAR WHILE IT WAS OPEN (asked for in
+    A2). **15/15 trading holidays and 4/4 weekend holidays MATCH EXACTLY**, on
+    both date and description, with no extra and no missing row:
+      26-Jan Republic Day · 03-Mar Holi · 26-Mar Shri Ram Navami · 31-Mar Shri
+      Mahavir Jayanti · 03-Apr Good Friday · 14-Apr Dr Baba Saheb Ambedkar
+      Jayanti · 01-May Maharashtra Day · 28-May Bakri Id · 26-Jun Muharram ·
+      14-Sep Ganesh Chaturthi · 02-Oct Mahatma Gandhi Jayanti · 20-Oct Dussehra ·
+      10-Nov Diwali Balipratipada · 24-Nov Prakash Gurpurb · 25-Dec Christmas
+      weekend: 15-Feb (Sun) · 21-Mar (Sat) · 15-Aug (Sat) · 08-Nov (Sun, Muhurat)
+    ⇒ **NO MISMATCH FOUND ⇒ NO GATED FILE EDIT TO REGISTER.** The 15-count also
+    matches the property test noted at line 429.
+
+(e) ⚠️ **2027 IS STILL ABSENT — UNCHANGED, STILL OWED.** `config/nse_holidays_2027.yaml`
+    does not exist (checked tonight). MEASURED previously: the first 08:15 boot of
+    2027 raises `ConfigMissingError` and does NOT start. The 15-Dec email reminder
+    is DEPLOYED (`cbcad2c`). ⛔ NOT created tonight, and ⛔ NEVER invent the dates --
+    they come from NSE's 2027 circular when published.
+
+(f) ⛔⛔ **THE ONE THING THAT DID CHANGE: THE PRODUCT FILTER'S WINDOW.**
+    The false slip would have bought a day; the real calendar does not. Tue 4-Aug
+    carries the flag flip **and** carry pilot D1, and the buy-day product filter
+    (+ CRITICAL-on-NULL, with Q9's BL9 trace) gates the carry pilot. Its deadline
+    is therefore Monday night -- but Monday DAYTIME is "BUILD NOTHING, MEASURE",
+    and the filter decides a PRODUCT on a live order, i.e. a careful-loop item
+    (design → review → implement), not an evening patch.
+    ⇒ *** THE HONEST WINDOW IS THE WEEKEND: Sat 1-Aug / Sun 2-Aug. ***
+    ⭐ AND AN OPEN DECISION FOR RAMA, WHICH THIS FILE WILL NOT MAKE: tonight's
+    instruction described the flip's hard gate as THREE-part (observation ran ·
+    came back clean · filter shipped). **AS RECORDED it is TWO-part on the flip,
+    with the filter gating the CARRY PILOT half.** Both readings share the same
+    deadline, so nothing moves today -- but they differ if the filter SLIPS:
+      two-part  ⇒ the four flags still flip Tue; only the carry pilot waits.
+      three-part ⇒ a filter slip postpones ALL of 4-Aug.
+    ⛔ Do not resolve this by picking one on the day. Decide it BEFORE Monday.
+
+(g) 🔴 **THE PROCESS FINDING, WHICH IS THE REAL OUTPUT OF TONIGHT.**
+    A trading-day assertion was made from recollection, was not checked against
+    the file text or the circular, and was allowed to reach a proposal to move an
+    IRREVERSIBLE step. It was caught only because Rama went to the primary source.
+    ⇒ **CONTROL: any holiday / trading-day / weekday claim that affects SCHEDULING
+    must be verified against the file TEXT before it drives a decision -- quote
+    the line, or do not make the claim.** A weekday is a one-line check; there is
+    no version of this that is cheaper to assume than to verify.
+    Registered as **F6** in `docs/MASTER_PENDING_30-Jul-2026.md` §3.8.
+================================================================================

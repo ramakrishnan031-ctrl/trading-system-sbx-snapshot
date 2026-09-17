@@ -1,0 +1,580 @@
+{% extends "base.html" %}
+{% block title %}Strategies — Control Tower{% endblock %}
+{% block nav_strategies %}active{% endblock %}
+{% block content %}
+<div x-data="strategiesPage()" x-init="initCols(); load()" @ops-refresh.window="load()" class="dash-page strat-page">
+
+  <!-- Merged Alerts banner -->
+  <div class="info-banner" x-show="alerts && alerts.length" x-cloak>
+    <span x-text="alerts.length + ' alert(s) today'"></span>
+  </div>
+
+  <!-- ── Title ── -->
+  <div class="pg-title">
+    <h1>Strategies</h1>
+    <span class="pg-sub">Strategy Control Tower</span>
+  </div>
+
+  <!-- ═══ SUMMARY KPIs (8) ═══ -->
+  <div class="sk-deck">
+    <template x-for="k in kpiCards()" :key="k.key">
+      <div class="kc" :class="'kc-' + k.tone">
+        <div class="kc-top">
+          <span class="kc-ic" :class="'ic-' + k.tone" x-html="stratIcon(k.key)"></span>
+          <span class="kc-label" x-text="k.label"></span>
+        </div>
+        <span class="kc-val num" x-text="k.val"></span>
+        <div class="kc-foot">
+          <span class="kc-sub" :class="k.subClass || ''" x-text="k.sub"></span>
+          <svg x-show="k.spark && sparkOf(k.spark)" x-cloak class="sk-spark"
+               :class="'spark-' + k.spark" viewBox="0 0 80 22"
+               preserveAspectRatio="none" aria-hidden="true">
+            <polyline :points="sparkOf(k.spark, 80, 22)" fill="none" class="spark-line"/>
+          </svg>
+        </div>
+      </div>
+    </template>
+  </div>
+
+  <!-- ═══ FILTERS ═══ -->
+  <section class="panel mc-panel">
+    <div class="mc-head"><h2 class="mc-title">Filters</h2></div>
+    <div class="flt-row">
+      <label class="flt-field">
+        <span class="flt-k">Date Range</span>
+        <!-- ⭐ The artwork draws a CHIP: a calendar glyph, the date, and a reload
+             glyph on the right. The control underneath is the SAME native date
+             input with the SAME behaviour — only its presentation changes. -->
+        <span class="flt-date">
+          <button class="flt-date-ic" type="button" aria-label="Open date picker"
+                  @click="$refs.s3date.showPicker && $refs.s3date.showPicker()"><svg viewBox="0 0 24 24" stroke="currentColor" stroke-width="2" fill="none" stroke-linecap="round" stroke-linejoin="round"><rect x="3" y="5" width="18" height="16" rx="2"/><path d="M3 10h18M8 3v4M16 3v4"/></svg></button>
+          <input class="flt-c flt-date-in" type="date" x-model="f.date" x-ref="s3date">
+          <button class="flt-date-rf" type="button" title="Reload for this date"
+                  @click="load()" aria-label="Reload">↻</button>
+        </span>
+      </label>
+      <label class="flt-field">
+        <span class="flt-k">Strategy</span>
+        <select class="flt-c" x-model="f.strategy">
+          <option value="">All Strategies</option>
+          <template x-for="s in strategyOptions()" :key="s"><option :value="s" x-text="s"></option></template>
+        </select>
+      </label>
+      <!-- ⛔ NO SCANNER FILTER. Scanner is not an independent identity here:
+           scanner and strategy are 1:1 and carry the same name (measured on the
+           running config), which is why the Scanner COLUMN was removed from this
+           table earlier. A filter on an identity the screen does not show, and
+           the architecture does not recognise, is a control with no referent. -->
+      <label class="flt-field">
+        <span class="flt-k">Status</span>
+        <select class="flt-c" x-model="f.status">
+          <option value="">All Status</option>
+          <option value="ACTIVE">Active</option>
+          <option value="QUIET">Quiet</option>
+          <option value="SILENT">Silent</option>
+        </select>
+      </label>
+      <label class="flt-field">
+        <span class="flt-k">Trade Type</span>
+        <select class="flt-c" x-model="f.trade_type">
+          <option value="">All Types</option>
+          <option value="Intraday">Intraday</option>
+          <option value="Delivery">Delivery</option>
+        </select>
+      </label>
+      <label class="flt-field">
+        <span class="flt-k">Direction</span>
+        <select class="flt-c" x-model="f.direction">
+          <option value="">All Directions</option>
+          <option value="LONG">Long</option>
+          <option value="SHORT">Short</option>
+        </select>
+      </label>
+      <div class="flt-actions">
+        <button class="btn-ghost" type="button" @click="resetFilters()">Reset Filters</button>
+        <button class="btn-primary" type="button" @click="applyFilters()">Apply Filters</button>
+      </div>
+    </div>
+  </section>
+
+  <!-- ═══ STRATEGY HIERARCHY ═══ -->
+  <section class="panel mc-panel">
+    <div class="mc-head"><h2 class="mc-title">Strategy Hierarchy</h2></div>
+    <div class="hier-grid">
+      <template x-for="h in hierarchyShown()" :key="h.name">
+        <div class="hier-card">
+          <span class="hier-name" x-text="h.name"></span>
+          <span class="hier-legs">
+            <span class="hier-connector"></span>
+            <span class="hier-leg">
+              <span class="hier-dir hier-long" :class="h.long ? '' : 'hier-muted'">Long</span>
+              <span class="hier-dir hier-short" :class="h.short ? '' : 'hier-muted'">Short</span>
+            </span>
+          </span>
+        </div>
+      </template>
+      {# ⭐ RULED 19-Aug-2026 (Rama): EVERY configured family is shown. The artwork
+         drew four cards + a "… and more" card, but that cap hid real strategies —
+         production configures SIXTEEN (config/strategies/*.yaml), which is twelve
+         families, so the cap would have concealed eight of them.
+         ⛔ NO new visual concept: the same `.hier-card` treatment, the same
+         typography, spacing and density. `.hier-grid` is already
+         `repeat(auto-fill, minmax(240px, 1fr))`, so the cards simply WRAP onto
+         further rows — the design's own overflow behaviour. #}
+      <div class="hier-card hier-more" x-show="!hierarchy().length" x-cloak>
+        <span class="hier-name">No strategies</span>
+      </div>
+    </div>
+  </section>
+
+  <!-- ═══ MAIN TABLE ═══ -->
+  <section class="panel mc-panel">
+    <div class="st-toolbar">
+      <label class="st-show">Show
+        <select class="flt-c flt-sm" x-model.number="tPageSize" @change="tPage = 1">
+          <option :value="50">50</option><option :value="60">60</option>
+        </select>
+        entries</label>
+      {# ⭐ B6 RULED 19-Aug-2026 — `03. Strategies.txt`, EXPORT: "Download XLSX".
+         The SHARED `export_button` macro is flag-gated OFF for every screen at
+         once, and the seventeen screens that already ship an export use this
+         per-screen anchor instead. Screen 03 joins THEM rather than flipping a
+         global flag that would also un-disable S04/S08/S09, ⛔ which have no
+         export route behind them. #}
+      <span class="st-tb-right">
+        <button class="st-colreset" type="button" x-show="!isDefaultOrder()" x-cloak
+                @click="resetCols()"
+                title="Restore the default column order">↺ Reset column order</button>
+        <a class="btn-export st-exp" :href="exportUrl()">⇩ Export XLSX</a>
+      </span>
+    </div>
+    <div class="tbl-scroll">
+      <table class="st-tbl">
+        <thead><tr>
+          {# ⭐ VERBATIM the approved Screen-04 / Screen-05 header: grip, draggable,
+             the same four drag handlers and the same is-drag / is-over states.
+             Sorting stays keyed on `c.key`, so it follows its column. #}
+          <template x-for="c in cols" :key="c.key">
+            <th :class="[c.num ? 'rt' : '', dragKey === c.key ? 'is-drag' : '',
+                         overKey === c.key ? 'is-over' : '']"
+                draggable="true" role="button" tabindex="0"
+                :title="c.label + ' — click to sort, drag to reorder'"
+                @dragstart="onDragStart(c.key, $event)"
+                @dragover.prevent="overKey = c.key"
+                @dragleave="overKey === c.key && (overKey = '')"
+                @drop.prevent="onDrop(c.key)"
+                @dragend="onDragEnd()"
+                @click="headClick(c.key)" @keyup.enter="tSort(c.key)">
+              <span class="st-grip" aria-hidden="true">⠿</span><span x-text="c.label"></span><span
+                    class="st-arw" x-text="tArrow(c.key)"></span>
+            </th>
+          </template>
+        </tr></thead>
+        <tbody>
+          {# ⭐ THE BODY IS DRIVEN BY `cols`, SO A DRAGGED HEADING CARRIES ITS DATA.
+             ⛔ Do not put fixed <td>s back here: the header would then reorder
+             while the values stayed put, which is the failure mode the ruling
+             names explicitly. #}
+          <template x-for="(r, i) in tPaged(filtered())" :key="i">
+            <tr>
+              <template x-for="c in cols" :key="c.key">
+                <td :class="cellCls(c, r)">
+                  <template x-if="c.kind === 'name'">
+                    <span class="st-nm">
+                      <span class="st-glyph" :class="dirCls(r.direction)" x-html="dirGlyph(r.direction)"></span>
+                      <span x-text="r.strategy"></span>
+                    </span>
+                  </template>
+                  <template x-if="c.kind === 'usage'">
+                    <span class="st-usage-cell">
+                      <span x-show="r.usage === null" x-cloak>—</span>
+                      <span class="st-usage" x-show="r.usage !== null" x-cloak>
+                        <span class="st-usage-pct num" x-text="r.usage + '%'"></span>
+                        <span class="st-usage-bar"><span class="st-usage-fill" :class="'uf-' + capTier(r.usage)"
+                              :style="'width:' + Math.min(100, Math.max(0, r.usage || 0)) + '%'"></span></span>
+                      </span>
+                    </span>
+                  </template>
+                  <template x-if="c.kind === 'status'">
+                    <span class="st-status" :class="'sts-' + r.status" x-text="r.status"></span>
+                  </template>
+                  <template x-if="c.kind !== 'name' && c.kind !== 'usage' && c.kind !== 'status'">
+                    <span x-text="cellText(c, r)"></span>
+                  </template>
+                </td>
+              </template>
+            </tr>
+          </template>
+          <tr x-show="!filtered().length" x-cloak><td :colspan="cols.length" class="ev-empty">No strategies match the current filters.</td></tr>
+        </tbody>
+      </table>
+    </div>
+    <div class="st-foot">
+      <span class="st-count" x-text="pageInfo()"></span>
+      <div class="st-pager">
+        <span class="st-rpp">Rows per page
+          <select class="flt-c flt-sm" x-model.number="tPageSize" @change="tPage = 1">
+            <option :value="50">50</option><option :value="60">60</option>
+          </select>
+        </span>
+        <!-- ⭐ NUMBERED PAGES, the artwork's own control and the SAME pattern
+             approved Screen 22 already ships (`pageList()` + `is-on`), reused
+             rather than invented so the two cannot drift. -->
+        <button class="st-pg" type="button" title="Previous page"
+                @click="tPage = Math.max(1, tPage-1)" :disabled="tPage<=1">‹</button>
+        <template x-for="pg in pageList()" :key="pg">
+          <span>
+            <button x-show="pg !== '…'" class="st-pg st-pg-n"
+                    :class="pg === tPage ? 'is-on' : ''" type="button"
+                    @click="tPage = pg" x-text="pg"></button>
+            <span x-show="pg === '…'" class="st-pg-gap">…</span>
+          </span>
+        </template>
+        <button class="st-pg" type="button" title="Next page"
+                @click="tPage = Math.min(tPageCount(filtered()), tPage+1)"
+                :disabled="tPage >= tPageCount(filtered())">›</button>
+      </div>
+    </div>
+  </section>
+
+  <!-- ═══ QUICK ACTIONS & INSIGHTS ═══ -->
+  <section class="panel mc-panel">
+    <div class="mc-head"><h2 class="mc-title">Quick Actions &amp; Insights</h2></div>
+    <div class="qa-grid">
+      <template x-for="q in quickActions" :key="q.key">
+        <a class="qa-card" :href="q.href">
+          <span class="qa-ic" :class="'ic-' + q.tone" x-html="stratIcon(q.key)"></span>
+          <span class="qa-body">
+            <span class="qa-title" x-text="q.title"></span>
+            <span class="qa-desc" x-text="q.desc"></span>
+          </span>
+          <span class="qa-chev">›</span>
+        </a>
+      </template>
+    </div>
+  </section>
+
+  <!-- ═══ STATUS LOGIC ═══ -->
+  <div class="stlogic">
+    <span class="stlogic-ic">ⓘ</span>
+    <span class="stlogic-k">Status Logic:</span>
+    <span class="stlogic-item"><span class="sts-ACTIVE stlogic-pill">ACTIVE</span> Signal within 30 mins</span>
+    <span class="stlogic-sep">·</span>
+    <span class="stlogic-item"><span class="sts-QUIET stlogic-pill">QUIET</span> 30 mins – 1.5 hrs</span>
+    <span class="stlogic-sep">·</span>
+    <span class="stlogic-item"><span class="sts-SILENT stlogic-pill">SILENT</span> No signal entire day</span>
+  </div>
+
+</div>
+
+<script>
+function strategiesPage() {
+  return Object.assign(
+    colDragMixin(),pageBase("/api/strategies"), tableMixin({ defaultSize: 50 }), {
+    alerts: [],
+    f:  { date: "", strategy: "", status: "", trade_type: "", direction: "" },
+    af: { strategy: "", status: "", trade_type: "", direction: "" },
+    /* F3 + F4 (19-Aug-2026, Rama Q3 = the TXT wins over the artwork).
+       `03. Strategies.txt` lists `Trading type: (INTRADAY/DELIVERY)` in the MAIN
+       TABLE, second, right after Strategy — the artwork's table does not draw it.
+       ⛔ Scanner stays absent by the earlier approved override (scanner=strategy).
+       ⚠️ PLACEMENT DEVIATION, STATED: the TXT lists SL Hit Count / TGT Hit Count /
+       ROI % under `DETAIL PAGE → Additional`, ⛔ NOT in the main table — and
+       Screen 03 HAS NO DETAIL PAGE ("Strategy Details" is a quick-action link to
+       /strategy-health). They are therefore rendered in the only per-strategy
+       surface that exists. ⛔ Building a detail page would be the speculative
+       redesign the brief forbids.
+       ⭐ NOTHING IS INVENTED — all four already existed in the payload and were
+       simply never rendered: `basic.trade_type` (from the strategy YAML `intent`),
+       `sl_tgt_hits.{sl_hits,tgt_hits}`, and `performance.roi_pct`, whose base is
+       fixed by attribution R4 = net ÷ Σ margin_reserved today. */
+    /* ⭐ ONE list drives the header AND the body, which is what makes a column
+       the MOVABLE UNIT: reordering this array moves the heading, its data cells,
+       its sort control and its alignment together. ⛔ The body used to be
+       hard-coded <td>s in fixed order — dragging THAT would have moved labels
+       while leaving the data behind, the cosmetic-only effect the brief forbids.
+       `kind` selects the cell renderer; `num` keeps the approved right alignment. */
+    DEFAULT_COLS: [
+      { key: "strategy", label: "Strategy", kind: "name" },
+      { key: "trade_type", label: "Trading Type", kind: "type" },
+      { key: "signals", label: "Signals", num: true, kind: "int" },
+      { key: "orders", label: "Orders", num: true, kind: "int" },
+      { key: "trades", label: "Trades", num: true, kind: "int" },
+      { key: "success", label: "Success %", num: true, kind: "pct" },
+      { key: "win_rate", label: "Win %", num: true, kind: "pct" },
+      { key: "sl_hits", label: "SL Hit", num: true, kind: "int" },
+      { key: "tgt_hits", label: "TGT Hit", num: true, kind: "int" },
+      { key: "pnl", label: "P&L (₹)", num: true, kind: "pnl" },
+      { key: "roi", label: "ROI %", num: true, kind: "pct" },
+      { key: "allocated", label: "Allocated (₹)", num: true, kind: "moneyDash" },
+      { key: "used", label: "Used (₹)", num: true, kind: "money" },
+      { key: "remaining", label: "Remaining (₹)", num: true, kind: "moneyDash" },
+      { key: "usage", label: "Usage %", num: true, kind: "usage" },
+      { key: "last_signal", label: "Last Signal", num: true, kind: "clock" },
+      { key: "last_trade", label: "Last Trade", num: true, kind: "clock" },
+      { key: "status", label: "Status", kind: "status" },
+    ],
+    cols: [],
+    COLS_KEY: "screen03.strategies.colOrder.v1",
+    quickActions: [
+      { key: "details", tone: "info", title: "Strategy Details", desc: "View detailed performance", href: "/strategy-health" },
+      { key: "signals", tone: "info", title: "Signals", desc: "View signals for selected strategy", href: "/signals" },
+      { key: "orders", tone: "info", title: "Orders", desc: "View orders for selected strategy", href: "/orders" },
+      { key: "trades", tone: "pos", title: "Trades", desc: "View trades for selected strategy", href: "/trades" },
+      { key: "performance", tone: "pos", title: "Performance", desc: "Deep performance analytics", href: "/pnl" },
+      { key: "capital", tone: "warn", title: "Capital & Risk", desc: "Capital, risk & allocation", href: "/capital-risk" },
+      { key: "logs", tone: "info", title: "Logs", desc: "View strategy logs & events", href: "/logs" },
+    ],
+
+    // ── mapping ────────────────────────────────────────────────────────────
+    statusOf(r) {
+      const c = r.silence && r.silence.color;
+      if (c === "RED") return "SILENT";
+      if (c === "YELLOW") return "QUIET";
+      return "ACTIVE";
+    },
+    rowsMapped() {
+      return (this.data.rows || []).map(r => {
+        // Capital: no per-strategy ₹ cap exists — Allocated is the shared global
+        // intraday bucket (= used + remaining); "—" when the bucket isn't set yet.
+        const cv = r.capital_view || {};
+        const used = Number(cv.capital_used || 0);
+        const rem = (cv.capital_remaining === null || cv.capital_remaining === undefined) ? null : Number(cv.capital_remaining);
+        const alloc = (rem === null) ? null : (used + rem);
+        const usage = (alloc && alloc > 0) ? Math.round(1000 * used / alloc) / 10 : null;
+        return {
+          name: r.basic.name, strategy: r.basic.display_name,
+          direction: r.basic.direction, trade_type: r.basic.trade_type,
+          signals: Number(r.signals.received || 0),
+          orders: Number(r.processing.created || 0),
+          trades: Number((r.trading.open || 0) + (r.trading.closed || 0)),
+          success: (r.success_rate === null || r.success_rate === undefined) ? null : r.success_rate,
+          win_rate: (r.trading.win_rate === null || r.trading.win_rate === undefined) ? null : r.trading.win_rate,
+          pnl: Number(r.performance.net_pnl || 0),
+          /* F4: already in the payload, never rendered. ⛔ roi is nullable and
+             stays null — it is NOT coerced to 0, because "no margin reserved
+             today" and "0% return" are different states. */
+          sl_hits: Number((r.sl_tgt_hits || {}).sl_hits || 0),
+          tgt_hits: Number((r.sl_tgt_hits || {}).tgt_hits || 0),
+          roi: (r.performance.roi_pct === null || r.performance.roi_pct === undefined)
+               ? null : Number(r.performance.roi_pct),
+          allocated: alloc, used: used, remaining: rem, usage: usage,
+          last_signal: r.health.last_signal, last_trade: r.health.last_trade,
+          status: this.statusOf(r), family: r.family,
+        };
+      });
+    },
+    filtered() {
+      const a = this.af;
+      return this.rowsMapped().filter(r => {
+        if (a.strategy && r.strategy !== a.strategy) return false;
+        if (a.status && r.status !== a.status) return false;
+        if (a.trade_type && r.trade_type !== a.trade_type) return false;
+        if (a.direction && String(r.direction || "").toUpperCase() !== a.direction) return false;
+        return true;
+      });
+    },
+    /* ⭐ The SAME four filters the table applies, so the workbook is the view
+       on screen — ⛔ not "everything, unfiltered", which is how an export
+       quietly stops matching what the operator is looking at. */
+    exportUrl() {
+      const p = new URLSearchParams();
+      if (this.af.strategy) p.set("strategy", this.af.strategy);
+      if (this.af.status) p.set("status", this.af.status);
+      if (this.af.trade_type) p.set("trade_type", this.af.trade_type);
+      if (this.af.direction) p.set("direction", this.af.direction);
+      const q = p.toString();
+      return "/api/export/strategies" + (q ? "?" + q : "");
+    },
+    applyFilters() {
+      this.af = { strategy: this.f.strategy, status: this.f.status,
+                  trade_type: this.f.trade_type, direction: this.f.direction };
+      this.tPage = 1;
+    },
+    resetFilters() {
+      this.f = { date: this.data.today || "", strategy: "", status: "", trade_type: "", direction: "" };
+      this.af = { strategy: "", status: "", trade_type: "", direction: "" };
+      this.tPage = 1;
+    },
+    strategyOptions() { return [...new Set(this.rowsMapped().map(r => r.strategy))].sort(); },
+
+    // ── KPI deck (aggregate over the full day, all strategies) ──────────────
+    kpiAgg() {
+      const rows = this.rowsMapped();
+      const total = rows.length;
+      let active = 0, quiet = 0, silent = 0, sig = 0, trd = 0, pnl = 0, wins = 0, losses = 0;
+      rows.forEach(r => {
+        if (r.status === "ACTIVE") active++; else if (r.status === "QUIET") quiet++; else if (r.status === "SILENT") silent++;
+        sig += r.signals; trd += r.trades; pnl += r.pnl;
+      });
+      (this.data.rows || []).forEach(r => { wins += r.trading.wins || 0; losses += r.trading.losses || 0; });
+      const wr = (wins + losses) ? Math.round(1000 * wins / (wins + losses)) / 10 : null;
+      const pct = (n) => total ? (Math.round(1000 * n / total) / 10) : 0;
+      return { total, active, quiet, silent, activePct: pct(active), quietPct: pct(quiet), silentPct: pct(silent),
+               signals: sig, trades: trd, pnl, winRate: wr };
+    },
+    kpiCards() {
+      const k = this.kpiAgg();
+      return [
+        { key: "total",  tone: "info", label: "Total Strategies", val: this.fmtInt(k.total), sub: "All strategies" },
+        { key: "active", tone: "pos",  label: "Active",  val: this.fmtInt(k.active), sub: k.activePct + "%", subClass: "txt-green" },
+        { key: "quiet",  tone: "warn", label: "Quiet",   val: this.fmtInt(k.quiet),  sub: k.quietPct + "%",  subClass: "txt-orange" },
+        { key: "silent", tone: "neg",  label: "Silent",  val: this.fmtInt(k.silent), sub: k.silentPct + "%", subClass: "txt-red" },
+        { key: "signals", tone: "info", label: "Total Signals", val: this.fmtInt(k.signals), sub: "Today" },
+        { key: "trades",  tone: "info", label: "Total Trades",  val: this.fmtInt(k.trades),  sub: "Today" },
+        { key: "pnl", tone: (k.pnl < 0 ? "neg" : "pos"), label: "Total P&L", val: this.money(k.pnl), sub: "Today", spark: "pnl" },
+        { key: "winrate", tone: "info", label: "Win Rate", val: (k.winRate === null ? "—" : k.winRate + "%"), sub: "Today", spark: "winrate" },
+      ];
+    },
+
+    // ── hierarchy ───────────────────────────────────────────────────────────
+    /* ── column order: default → restored → drag-reordered ────────────────
+       ⭐ VERBATIM the approved Screen-04 machinery, including its rebuild-from-
+       current-definitions rule: a stale saved order can never hide a column or
+       resurrect a removed one (⛔ e.g. `scanner`, retired from this screen). */
+    initCols() {
+      this.cols = this.DEFAULT_COLS.slice();
+      let saved = null;
+      try { saved = JSON.parse(window.localStorage.getItem(this.COLS_KEY) || "null"); }
+      catch (e) { saved = null; }              /* storage blocked/corrupt → default */
+      if (!Array.isArray(saved) || !saved.length) return;
+      const byKey = {};
+      this.DEFAULT_COLS.forEach(c => { byKey[c.key] = c; });
+      const next = [];
+      saved.forEach(k => { if (byKey[k] && next.indexOf(byKey[k]) === -1) next.push(byKey[k]); });
+      this.DEFAULT_COLS.forEach(c => { if (next.indexOf(c) === -1) next.push(c); });
+      if (next.length === this.DEFAULT_COLS.length) this.cols = next;
+    },
+    saveCols() {
+      try { window.localStorage.setItem(this.COLS_KEY, JSON.stringify(this.cols.map(c => c.key))); }
+      catch (e) { /* private mode / quota — reordering still works this session */ }
+    },
+    isDefaultOrder() {
+      return this.cols.every((c, i) => c.key === this.DEFAULT_COLS[i].key);
+    },
+    resetCols() {
+      this.cols = this.DEFAULT_COLS.slice();
+      try { window.localStorage.removeItem(this.COLS_KEY); } catch (e) {}
+    },
+    /* ⛔ A drag must never be read as a sort click. */
+    headClick(key) { if (Date.now() - this._dragEndAt < 250) return; this.tSort(key); },
+
+    /* ── cell rendering, driven by the SAME column list as the header ────── */
+    cellCls(c, r) {
+      if (c.kind === "name") return "st-name";
+      if (c.kind === "status") return "";
+      if (c.kind === "pnl") {
+        return "rt num " + (r.pnl > 0 ? "txt-green" : (r.pnl < 0 ? "txt-red" : ""));
+      }
+      if (c.kind === "usage" || c.kind === "type") return "rt";
+      return c.num ? "rt num" : "";
+    },
+    cellText(c, r) {
+      const v = r[c.key];
+      if (c.kind === "type") return v || "—";
+      if (c.kind === "int") return this.fmtInt(v);
+      if (c.kind === "pct") return this.pctFmt(v);
+      if (c.kind === "pnl") return this.money(v);
+      if (c.kind === "money") return this.moneyInt(v);
+      if (c.kind === "moneyDash") return this.moneyIntOrDash(v);
+      if (c.kind === "clock") return this.clockOf(v);
+      return v;
+    },
+
+    hierarchy() {
+      const fam = {};
+      this.rowsMapped().forEach(r => {
+        const f = r.family || r.strategy;
+        fam[f] = fam[f] || { name: f, long: false, short: false };
+        const d = String(r.direction || "").toUpperCase();
+        if (d === "LONG") fam[f].long = true;
+        if (d === "SHORT") fam[f].short = true;
+      });
+      return Object.values(fam);
+    },
+
+    //: ⭐ EVERY family, ⛔ no cap (ruled 19-Aug-2026). The four-card limit was a
+    //: presentation cap taken from the artwork; it hid real strategies once the
+    //: configured set grew past four families, so it is retired. Sorted by name
+    //: so the strip has a stable order rather than payload order.
+    hierarchyShown() {
+      return this.hierarchy().slice().sort((a, b) => a.name.localeCompare(b.name));
+    },
+
+    //: ⭐ REUSED FROM APPROVED SCREEN 22 (holdings `pageList()`), same window and
+    //: same ellipsis rule, so the two pagers cannot drift apart.
+    PAGE_WINDOW: 7,
+    pageList() {
+      const last = this.tPageCount(this.filtered());
+      if (last <= this.PAGE_WINDOW) return Array.from({length: last}, (_, i) => i + 1);
+      const cur = Math.min(Math.max(1, this.tPage), last);
+      const out = [1];
+      const lo = Math.max(2, cur - 1), hi = Math.min(last - 1, cur + 1);
+      if (lo > 2) out.push("\u2026");
+      for (let pg = lo; pg <= hi; pg++) out.push(pg);
+      if (hi < last - 1) out.push("\u2026");
+      out.push(last);
+      return out;
+    },
+
+    //: ⭐ The artwork's TWO KPI sparklines. Both series are built server-side from
+    //: today's CLOSED trades in the order they closed (`build_strategy_sparks`);
+    //: ⛔ nothing is synthesised here, and a series with fewer than two points
+    //: draws NO line rather than a flat one along the axis.
+    sparkSeries(which) {
+      const s = (this.data.sparks || {})[which];
+      return (s && s.available) ? (s.points || []) : [];
+    },
+    sparkOf(which, w, h) {
+      w = w || 80; h = h || 22;
+      const pts = this.sparkSeries(which);
+      if (pts.length < 2) return "";
+      let min = Math.min(...pts), max = Math.max(...pts);
+      if (min === max) { min -= 1; max += 1; }
+      const step = w / (pts.length - 1);
+      return pts.map((v, i) =>
+        (i * step).toFixed(1) + "," + ((h - 2) - (h - 4) * (v - min) / (max - min) + 1).toFixed(1)
+      ).join(" ");
+    },
+
+    // ── formatters / glyphs ──────────────────────────────────────────────────
+    money(v) { const n = Number(v || 0); return (n < 0 ? "-₹" : "₹") + Math.abs(n).toLocaleString("en-IN", { minimumFractionDigits: 2, maximumFractionDigits: 2 }); },
+    moneyInt(v) { const n = Number(v || 0); return (n < 0 ? "-₹" : "₹") + Math.round(Math.abs(n)).toLocaleString("en-IN"); },
+    moneyIntOrDash(v) { return (v === null || v === undefined) ? "—" : this.moneyInt(v); },
+    capTier(pct) { const p = Number(pct || 0); return p >= 80 ? "crit" : (p >= 60 ? "warn" : "ok"); },
+    fmtInt(v) { return Number(v || 0).toLocaleString("en-IN"); },
+    pctFmt(v) { return (v === null || v === undefined || v < 0) ? "—" : (v + "%"); },
+    clockOf(ts) { if (!ts) return "—"; const s = String(ts).replace("T", " "); return s.slice(11, 19) || "—"; },
+    dirCls(d) { return String(d || "").toUpperCase() === "SHORT" ? "glyph-short" : "glyph-long"; },
+    dirGlyph(d) { return String(d || "").toUpperCase() === "SHORT" ? STRAT_ICONS._down : STRAT_ICONS._up; },
+    stratIcon(k) { return STRAT_ICONS[k] || STRAT_ICONS._up; },
+    pageInfo() {
+      const n = this.filtered().length;
+      if (!n) return "Showing 0 of 0 entries";
+      const from = (this.tPage - 1) * this.tPageSize + 1;
+      const to = Math.min(n, this.tPage * this.tPageSize);
+      return "Showing " + from + " to " + to + " of " + n + " entries";
+    },
+  });
+}
+
+const _S = 'stroke="currentColor" stroke-width="2" fill="none" stroke-linecap="round" stroke-linejoin="round"';
+const STRAT_ICONS = {
+  total:       `<svg viewBox="0 0 24 24" ${_S}><circle cx="9" cy="8" r="3"/><path d="M3 20a6 6 0 0 1 12 0"/><path d="M16 6a3 3 0 0 1 0 6M15 20a6 6 0 0 1 6-6"/></svg>`,
+  active:      `<svg viewBox="0 0 24 24" ${_S}><path d="M3 17l6-6 4 4 8-8"/><path d="M21 7v5h-5"/></svg>`,
+  quiet:       `<svg viewBox="0 0 24 24" ${_S}><path d="M4 7h16M4 12h10M4 17h7"/></svg>`,
+  silent:      `<svg viewBox="0 0 24 24" ${_S}><circle cx="12" cy="12" r="9"/><path d="M12 8v4M12 15.5v.5"/></svg>`,
+  signals:     `<svg viewBox="0 0 24 24" ${_S}><circle cx="12" cy="12" r="8"/><path d="M12 8v8M8 12h8"/></svg>`,
+  trades:      `<svg viewBox="0 0 24 24" ${_S}><path d="M3 8h13l-3-3M21 16H8l3 3"/></svg>`,
+  pnl:         `<svg viewBox="0 0 24 24" ${_S}><path d="M8 6h8M8 10h8M14 6a4 4 0 0 1 0 8H9l6 5"/></svg>`,
+  winrate:     `<svg viewBox="0 0 24 24" ${_S}><path d="M19 5L5 19"/><circle cx="7.5" cy="7.5" r="2.5"/><circle cx="16.5" cy="16.5" r="2.5"/></svg>`,
+  details:     `<svg viewBox="0 0 24 24" ${_S}><circle cx="11" cy="11" r="7"/><path d="M21 21l-4.3-4.3"/></svg>`,
+  orders:      `<svg viewBox="0 0 24 24" ${_S}><rect x="5" y="3" width="14" height="18" rx="2"/><path d="M9 8h6M9 12h6M9 16h4"/></svg>`,
+  performance: `<svg viewBox="0 0 24 24" ${_S}><path d="M3 3v18h18"/><path d="M7 14l3-3 3 3 5-6"/></svg>`,
+  capital:     `<svg viewBox="0 0 24 24" ${_S}><path d="M12 3l7 3v5c0 4-3 7-7 9-4-2-7-5-7-9V6z"/></svg>`,
+  logs:        `<svg viewBox="0 0 24 24" ${_S}><rect x="5" y="3" width="14" height="18" rx="2"/><path d="M9 8h6M9 12h6M9 16h4"/></svg>`,
+  _up:         `<svg viewBox="0 0 24 24" ${_S}><path d="M3 17l6-6 4 4 8-8"/><path d="M21 7v5h-5"/></svg>`,
+  _down:       `<svg viewBox="0 0 24 24" ${_S}><path d="M3 7l6 6 4-4 8 8"/><path d="M21 17v-5h-5"/></svg>`,
+};
+</script>
+{% endblock %}

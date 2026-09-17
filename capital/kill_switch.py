@@ -1,0 +1,2151 @@
+"""
+capital/kill_switch.py -- Trading System v2
+
+Purpose:
+    System-wide trading halt mechanism. Three modes: INACTIVE (normal),
+    SOFT_KILL (block new entries, allow exits), HARD_KILL (block ALL orders,
+    attempt broker cancellation). Last-mile gate per Project Rule 13.
+
+Locked Design Decisions:
+    KS1  -- Three modes: INACTIVE / SOFT_KILL / HARD_KILL.
+            is_active(intent) tests by intent type.
+    KS2  -- Single state: KillState enum. Persisted to kill_switch_state
+            table for restart recovery.
+    KS3  -- Startup recovery: constructor reads persisted state. If state
+            != INACTIVE, log CRITICAL and remain halted. Operator must
+            call resume() to clear. Audit Issue #18 fix.
+    KS4  -- Deadlock prevention: RLock not Lock. soft_kill() / hard_kill()
+            may call internal methods that re-acquire the lock. RLock
+            allows reentrant acquisition by the same thread.
+            Audit Issue #4 fix.
+    KS5  -- Constructor: KillSwitch(state_store, bus, logger,
+            on_hard_kill_cancel_fn=None, api_failure_threshold=3,
+            enable_auto_trip=True).
+    KS6  -- Public API: is_active(intent), current_state(), status(),
+            soft_kill(), hard_kill(), resume(), record_api_failure(),
+            record_success().
+    KS7  -- Auto-trip: api_failure_threshold consecutive failures trigger
+            soft_kill(). Disabled when enable_auto_trip=False.
+    KS8  -- KillSwitchActivated event on every state change including
+            resume(). Payload includes previous_state, new_state,
+            triggered_by (per KS8 extension).
+    KS9  -- State persisted in kill_switch_state table (single row,
+            id=1). Persist BEFORE in-memory update. If persist fails,
+            abort: no state change, no event.
+    KS10 -- get_kill_info() convenience method for startup_checks /
+            --status flag. Audit Issue: was missing.
+    KS11 -- Layer 4 (capital/). Imports: stdlib, core.exceptions,
+            core.events, core.logger, core.time_authority, core.state_store.
+            NO cancel logic inside (injected callback).
+    KS12 -- Deterministic: is_active() depends ONLY on current state.
+    KS13 -- NOT in scope: deciding when to auto-trip, performing broker
+            cancellations, restart after halt.
+
+    [SUPERSEDED 2026-07-22, doc-only — KS5/KS11/KS13 originals above left
+    legible.] These predate the adapter-driven HARD_KILL flatten. The
+    constructor now ALSO takes adapter (FIX-087), notifier, mode and
+    emergency_exit_buffer_pct (see __init__), and the kill_switch PERFORMS the
+    flatten + broker cancellations DIRECTLY via that injected adapter — the
+    M-C8 async flatten worker + FIX-181 marketable-LIMIT exits/orphan sweep +
+    FIX-190 Bug A/E reverse-aware cancel-then-flatten. The on_hard_kill_cancel_fn
+    callback is retained only as a LEGACY FALLBACK when no adapter is injected
+    (_run_cancel_fn, ~:904/939). So "no cancel logic inside / does not perform
+    broker cancellations (injected callback)" describes the pre-adapter design,
+    not the current one.
+
+What This Module Does NOT Do:
+    - Does not decide WHEN to call record_api_failure (callers decide)
+    - Does not perform broker order cancellations (injected callback)
+      [SUPERSEDED 2026-07-22: NOW performs them DIRECTLY via the injected adapter;
+      the callback is a legacy fallback — see the KS5/KS11/KS13 note above]
+    - Does not restart trading after halt (manual resume() only)
+    - Does not send Telegram alerts (logger CRITICAL is the signal)
+    - Does not import from any layer above capital/
+"""
+from __future__ import annotations
+
+import threading
+from dataclasses import dataclass, field
+from datetime import date, datetime, timedelta
+from enum import Enum
+from typing import Callable, List, Optional, TYPE_CHECKING
+
+from broker.position_helpers import (  # FIX-190 (Bug A)
+    cancel_co_bracket,  # ledger #2d
+    determine_close_direction,
+)
+from core.constants import (
+    EMERGENCY_FLATTEN_PRODUCTS as _EMERGENCY_FLATTEN_PRODUCTS,
+    PRODUCT_TO_INTENT as _PRODUCT_TO_INTENT,
+)
+
+# Part 11 (FIX-180): HARD_KILL emergency-exit retry guards.
+# Max wall-clock time to keep retrying a trade that won't exit before we stop
+# the loop and escalate (instead of looping forever and freezing the thread).
+_HARD_KILL_MAX_RETRY_HOURS = 2.0
+# Per-trade Telegram dedup window for the "exit failed" escalation alert.
+_EXIT_ALERT_DEDUP_SEC = 300.0
+
+# M-C8: trade statuses the flatten treats as live. SINGLE source for both the
+# flatten's SELECT and its EXITING write-condition — they MUST agree. If they
+# drift (a status added to one but not the other) the write silently no-ops and
+# the trade stays re-selectable, i.e. a double-sell risk. Derive, don't duplicate.
+_FLATTEN_LIVE_TRADE_STATUSES = ("OPEN", "PARTIAL", "PENDING_FILL")
+# M-C8: terminal order statuses. An order that reached one of these must NEVER be
+# overwritten with CANCELLED — above all COMPLETE, which means the resting SL/TGT
+# actually FILLED. Clobbering that would record a filled exit as cancelled and
+# leave the reconciler believing a closed position is still open.
+_FLATTEN_TERMINAL_ORDER_STATUSES = ("CANCELLED", "FAILED", "EXPIRED", "COMPLETE")
+# Throttle for the actionable Kite IP-allowlist (403) alert: one per hour, so a
+# burst of failed entries does not spam the channel (the system self-recovers on
+# the next signal once the IP is allowlisted).
+_IP403_ALERT_THROTTLE_SEC = 3600.0
+from core.effect_telemetry import handle as _effect_handle
+from core.events import EventBus, KillSwitchActivated
+from core.exceptions import (
+    BrokerAuthError,
+    BrokerRateLimitError,
+    BrokerTimeoutError,
+)
+from alerts.delivery import send_alert_recorded
+from core.time_authority import now_ist
+
+if TYPE_CHECKING:
+    import logging
+    from core.state_store import StateStore
+
+# DUP-1 (2026-04-26 audit): _IST removed; never read locally.
+
+# Kill reasons that are part of normal daily operations (safe to auto-clear on
+# next startup when no open positions exist). Emergency kills are everything
+# else — they require manual --resume.
+SCHEDULED_KILL_REASONS = frozenset({
+    "circuit_breaker_force_close_15:15",
+    "EOD_SQUAREOFF",
+})
+
+# 25-Jul-2026: WARN threshold for the _persist_state timing (measure-only).
+# WHY 1.0s: the write is a single-row `INSERT OR REPLACE` and every competing
+# writer is a single-row cron heartbeat INSERT, so the expected cost is
+# sub-millisecond to low-milliseconds. 1.0s is therefore ~1000x the expected
+# time — far too large to fire in normal operation — while still being 1/30th of
+# the `busy_timeout = 30000` ceiling, leaving ample headroom to notice
+# degradation long before a write could actually time out. A threshold that
+# fires routinely would be noise; one set near the ceiling would only tell us
+# what the absence of SQLITE_BUSY already tells us.
+_PERSIST_SLOW_WARN_SEC = 1.0
+
+
+def _is_scheduled_reason(reason: str) -> bool:
+    """Return True if the kill reason matches a scheduled (non-emergency) pattern."""
+    return reason in SCHEDULED_KILL_REASONS
+
+
+# The one reason for which "positions are managed to SL/TGT/EOD" is FALSE BY
+# CONSTRUCTION: order_reconciler's CHECK9 trips this kill precisely BECAUSE the
+# protective orders are gone from the broker.
+#
+# 03-Sep-2026, ANANTRAJ (docs/incident/2026-09-03_naked_position_ANANTRAJ.md):
+# the MIS squareoff cancelled the SL and TGT and then declined to submit an exit;
+# the emergency fallback was rejected 8 times; and THIS alert told the operator
+# "Intraday positions: managed to SL/TGT/EOD". It was false when it was sent,
+# and the position was flattened by hand 2 minutes later.
+#
+# The shared-body reasoning in test_kill_alerts_delivery_carveout.py -- "it holds
+# for both because SOFT_KILL never flattens, it blocks entries and lets exits
+# run" -- is sound only while exits EXIST. MISSING_EXITS is the measured
+# exception, so it gets its own body.
+MISSING_EXITS_REASON_PREFIX = "MISSING_EXITS"
+
+
+def _is_missing_exits_reason(reason: str) -> bool:
+    """True if this kill was tripped by a naked position (CHECK9 MISSING_EXITS).
+
+    Matched on the prefix order_reconciler actually emits (:2836) --
+    "MISSING_EXITS: naked position <SYM> trade_id=... sl_order=..." -- so a
+    reworded suffix cannot silently reintroduce the false reassurance.
+    """
+    return (reason or "").startswith(MISSING_EXITS_REASON_PREFIX)
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Types
+# ─────────────────────────────────────────────────────────────────────────────
+
+class KillState(Enum):
+    """The three operational modes of the kill switch (KS1)."""
+    INACTIVE  = "INACTIVE"
+    SOFT_KILL = "SOFT_KILL"
+    HARD_KILL = "HARD_KILL"
+
+
+class FlattenState(Enum):
+    """M-C8: lifecycle of the async HARD_KILL flatten worker.
+
+    IDLE     -- no flatten has been dispatched (or none ever ran)
+    RUNNING  -- the worker thread is executing the indestructible exit loop
+    DRAINING -- shutdown asked the worker to finish; we are awaiting it
+    COMPLETE -- the worker finished (successfully, by deadline, or by crashing)
+
+    "In progress" == RUNNING or DRAINING. This is the SINGLE source of truth for
+    "a flatten is in flight" — deliberately NOT StateStore.count_active_positions(),
+    which counts only OPEN/PARTIAL/PENDING_FILL and is therefore blind to the
+    EXITING rows the flatten creates (see M-C8 report / main._eod_self_exit_due).
+    """
+    IDLE = "IDLE"
+    RUNNING = "RUNNING"
+    DRAINING = "DRAINING"
+    COMPLETE = "COMPLETE"
+
+
+@dataclass(frozen=True)
+class CancellationReport:
+    """
+    Result of attempting to cancel all open broker orders on hard_kill() (KS6).
+
+    Fields:
+        attempted: number of orders the callback tried to cancel
+        succeeded: number successfully cancelled
+        failed:    list of order IDs that could not be cancelled
+        dispatched: M-C8 — True when hard_kill handed the flatten to the async
+            worker and returned immediately. The other three fields are then
+            NOT a result (nothing has been attempted yet at return time); they
+            are zero/empty purely to satisfy the type. A False value means the
+            report IS a completed result (the legacy cancel_fn path, or a direct
+            call to _exit_all_trades_indestructible). No production caller reads
+            this — all six call hard_kill for effect — but it keeps the async
+            return honest instead of masquerading as "nothing to do".
+    """
+    attempted: int
+    succeeded: int
+    failed: List[str] = field(default_factory=list)
+    dispatched: bool = False
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# KillSwitch
+# ─────────────────────────────────────────────────────────────────────────────
+
+class KillSwitch:
+    """
+    System-wide trading halt mechanism (KS1-KS13).
+
+    Thread-safe: all public methods acquire self._lock (RLock) before reading
+    or mutating state. RLock (not Lock) was Audit Issue #4's fix for the
+    record_api_failure -> soft_kill reentrant deadlock (KS4). M-C4 (16-Jul-2026)
+    since moved that auto-trip call OUTSIDE the lock — so the lock is never held
+    across soft_kill's publish/send — and that path no longer re-enters; RLock is
+    retained (other internal calls may still re-acquire; reentrancy-safe).
+
+    Usage::
+        ks = KillSwitch(
+            state_store=store,
+            bus=bus,
+            logger=get_logger(__name__),
+            on_hard_kill_cancel_fn=order_placer.cancel_all_open,
+            api_failure_threshold=3,
+            enable_auto_trip=True,
+        )
+        if ks.is_active():
+            return  # block new entry orders
+    """
+
+    def __init__(
+        self,
+        state_store: "StateStore",
+        bus: EventBus,
+        logger: "logging.Logger",
+        on_hard_kill_cancel_fn: Optional[Callable[[], object]] = None,
+        api_failure_threshold: int = 3,
+        enable_auto_trip: bool = True,
+        notifier: Optional[object] = None,   # TelegramNotifier; optional
+        mode: str = "LIVE",                   # session mode label for alert title
+        adapter: Optional[object] = None,    # FIX-087: ZerodhaAdapter for indestructible exits
+        emergency_exit_buffer_pct: float = 0.01,  # FIX-181: marketable-LIMIT buffer
+    ) -> None:
+        self._store = state_store
+        self._bus = bus
+        self._log = logger
+        # effect-telemetry (ledger #1, frozen contract A2.1): one handle,
+        # resolved once — the hot-path op is a single integer increment.
+        self._fx_activation = _effect_handle("kill_switch")
+        self._cancel_fn = on_hard_kill_cancel_fn
+        self._threshold = api_failure_threshold
+        self._auto_trip = enable_auto_trip
+        self._notifier = notifier
+        self._mode = mode
+        self._adapter = adapter  # FIX-087
+        # FIX-181: HARD_KILL exits use a marketable LIMIT (LTP ± buffer) instead
+        # of MARKET so they fill but cap worst-case slippage. The adapter snaps
+        # the price to a valid tick, so we pass the raw LTP ± buffer here.
+        self._emergency_exit_buffer_pct = emergency_exit_buffer_pct
+
+        # KS4: RLock allows same-thread reentrant acquisition (deadlock fix).
+        self._lock = threading.RLock()
+
+        # In-memory state — authoritative after construction
+        self._state = KillState.INACTIVE
+        self._reason = ""
+        self._triggered_at: Optional[datetime] = None
+        self._triggered_by = ""
+        self._api_failure_count = 0
+
+        # Part 11 (FIX-180): per-trade timestamp of the last "exit failed"
+        # escalation alert, for 5-min Telegram dedup during the retry loop.
+        self._exit_alert_ts: dict[str, float] = {}
+
+        # Monotonic ts of the last Kite IP-403 actionable alert (1/hr throttle);
+        # None = never alerted (so the first IP-403 always alerts).
+        self._ip403_last_alert_ts: Optional[float] = None
+
+        # M-C8: async flatten worker state. A DEDICATED lock, deliberately NOT the
+        # KS4 RLock above: this lock is taken around the thread handle and a state
+        # read/write only, never across a publish/send/join. Reusing self._lock
+        # would re-create the M-C4 defect in a worse place — a 2h join under the
+        # lock that gates is_active() would block the last-mile order check for
+        # the entire flatten. Lock ORDER (never violated here): a holder of
+        # _flatten_lock must not acquire self._lock.
+        self._flatten_lock = threading.Lock()
+        self._flatten_state = FlattenState.IDLE
+        self._flatten_thread: Optional[threading.Thread] = None
+
+        # KS3: recover persisted state on startup (Audit Issue #18 fix)
+        self._load_state_from_store()
+
+    def clear_stale_state(self, today: "date") -> bool:
+        """Auto-clear ANY kill switch triggered on a PREVIOUS calendar day.
+
+        HEADLESS GUARANTEE (Rama's 2026-06-20 decision): a new trading day ALWAYS
+        starts with a clean slate — EVERY prior-day kill is cleared regardless of
+        type (SOFT_KILL / HARD_KILL, scheduled, emergency, loss-limit, System
+        Manager EOD). The system never blocks the next-day startup; the safety net
+        shifts from "block startup" to the EOD report's analysis of what was
+        cleared (Task B). Each clear is audited to system_events
+        (event_type=KILL_AUTO_CLEARED) so that report has the data.
+
+        Same-day kills are intentionally NOT touched here (triggered_date >= today
+        returns False) — within a trading day an active kill stays active (loss
+        limit, HARD_KILL, etc. persist correctly). Returns True if cleared.
+        """
+        with self._lock:
+            if self._state == KillState.INACTIVE:
+                return False
+            if self._triggered_at is None:
+                return False
+            triggered_date = self._triggered_at.date()
+            if triggered_date >= today:
+                return False  # same-day (or future-dated) kill — must persist within the day
+
+            prev_reason = self._reason
+            prev_by = self._triggered_by
+            prev_state = self._state
+            prev_triggered_at = self._triggered_at
+            ts = now_ist()
+            clear_reason = (
+                f"auto_clear_stale: was {prev_state.value} from {triggered_date.isoformat()} "
+                f"(reason={prev_reason}, by={prev_by})"
+            )
+
+            self._persist_state(KillState.INACTIVE, clear_reason, ts, "main.auto_clear_stale")
+            self._state = KillState.INACTIVE
+            self._reason = clear_reason
+            self._triggered_at = ts
+            self._triggered_by = "main.auto_clear_stale"
+
+        # Audit + log OUTSIDE the lock (the insert opens its own transaction).
+        self._record_cleared_kill(
+            prev_state, prev_reason, prev_by, prev_triggered_at, "clear_stale_state",
+        )
+        self._log.warning(
+            "Kill switch auto-cleared: prior %s from %s (reason=%s by=%s) "
+            "-- new day %s starts clean (HEADLESS); audited to system_events",
+            prev_state.value, triggered_date, prev_reason, prev_by, today,
+        )
+        return True
+
+    def auto_clear_scheduled_kill(self) -> bool:
+        """Auto-clear kill switch if reason is a scheduled daily operation.
+
+        Scheduled kills (force_close at 15:15, EOD squareoff) are normal daily
+        events that should not block the next startup. This clears them
+        regardless of date — even same-day restarts — as long as there are no
+        open positions. HARD_KILL is never auto-cleared.
+
+        Returns True if state was cleared, False if no action taken.
+        """
+        with self._lock:
+            if self._state == KillState.INACTIVE:
+                return False
+
+            if self._state == KillState.HARD_KILL:
+                self._log.warning(
+                    "HARD_KILL active (reason=%s). Cannot auto-clear. "
+                    "Manual --resume required.",
+                    self._reason,
+                )
+                return False
+
+            reason = self._reason
+            if not _is_scheduled_reason(reason):
+                self._log.warning(
+                    "Kill switch active with EMERGENCY reason %r (triggered_by=%s). "
+                    "Manual --resume required.",
+                    reason, self._triggered_by,
+                )
+                return False
+
+            open_count = self._count_open_positions()
+            if open_count > 0:
+                self._log.warning(
+                    "Scheduled kill switch (%s) but %d open positions remain. "
+                    "Manual --resume required.",
+                    reason, open_count,
+                )
+                return False
+
+            prev_state = self._state
+            prev_reason = reason
+            prev_by = self._triggered_by
+            prev_triggered_at = self._triggered_at
+            ts = now_ist()
+            clear_reason = (
+                f"auto_clear_scheduled: was {prev_state.value} "
+                f"(reason={prev_reason}, by={prev_by}), no open positions"
+            )
+
+            self._persist_state(KillState.INACTIVE, clear_reason, ts, "auto_clear_scheduled")
+            self._state = KillState.INACTIVE
+            self._reason = clear_reason
+            self._triggered_at = ts
+            self._triggered_by = "auto_clear_scheduled"
+
+        self._record_cleared_kill(
+            prev_state, prev_reason, prev_by, prev_triggered_at, "auto_clear_scheduled",
+        )
+        self._log.info(
+            "Auto-cleared scheduled kill switch: %s (was %s, reason=%s, by=%s)",
+            clear_reason, prev_state.value, prev_reason, prev_by,
+        )
+        return True
+
+    def _count_open_positions(self) -> int:
+        """Count trades with live exposure (OPEN, PARTIAL, or PENDING_FILL)."""
+        try:
+            row = self._store.fetch_one(
+                "SELECT COUNT(*) as cnt FROM trades "
+                "WHERE status IN ('OPEN', 'PARTIAL', 'PENDING_FILL')"
+            )
+            return row["cnt"] if row else 0
+        except Exception as exc:
+            self._log.error("Failed to count open positions: %s; assuming non-zero", exc)
+            return 1
+
+    def _record_cleared_kill(
+        self,
+        prev_state: KillState,
+        prev_reason: str,
+        prev_by: str,
+        prev_triggered_at: Optional[datetime],
+        cleared_via: str,
+    ) -> None:
+        """Audit an auto-cleared kill to system_events (event_type
+        KILL_AUTO_CLEARED) so the EOD report (Task B) can analyse what the headless
+        startup cleared — especially a prior-day HARD_KILL / emergency that no
+        longer blocks trading. Best-effort: a failure here must NEVER block the
+        clear (the headless guarantee comes first)."""
+        try:
+            import json
+            details = json.dumps({
+                "previous_state": prev_state.value,
+                "reason": prev_reason,
+                "triggered_by": prev_by,
+                "triggered_at": (
+                    prev_triggered_at.isoformat() if prev_triggered_at else None
+                ),
+                "classification": (
+                    "scheduled" if _is_scheduled_reason(prev_reason) else "emergency"
+                ),
+                "cleared_via": cleared_via,
+            })
+            self._store.insert_system_event(
+                event_type="KILL_AUTO_CLEARED",
+                timestamp=now_ist().isoformat(),
+                details=details,
+            )
+        except Exception as exc:
+            self._log.error(
+                "kill_switch: failed to audit cleared kill (%s): %s", cleared_via, exc
+            )
+
+    def set_notifier(
+        self,
+        notifier: Optional[object],
+        mode: Optional[str] = None,
+    ) -> None:
+        """Wire TelegramNotifier after construction.
+
+        main.py builds KillSwitch BEFORE the notifier (notifier needs config
+        that is loaded after KS is used by startup checks). This setter lets
+        main wire the notifier after it is constructed so soft_kill alerts
+        can still fire. ``mode`` may also be refreshed here since interactive
+        startup can change args.mode after KS construction.
+        """
+        self._notifier = notifier
+        if mode is not None:
+            self._mode = mode
+
+    def set_adapter(self, adapter: object) -> None:
+        """Wire ZerodhaAdapter after construction (FIX-166 F22).
+
+        main.py builds KillSwitch BEFORE the adapter. This setter lets main
+        wire the adapter so hard_kill can exit positions via
+        ``_exit_all_trades_indestructible``.
+        """
+        self._adapter = adapter
+
+    # ─────────────────────────────────────────────────────────────────────────
+    # Read API (KS6, KS10, KS12)
+    # ─────────────────────────────────────────────────────────────────────────
+
+    def is_active(self, intent: str = "entry") -> bool:
+        """
+        Return True if the kill switch should block the given intent (KS6).
+
+        intent="entry"  -> True for SOFT_KILL or HARD_KILL
+        intent="exit"   -> True only for HARD_KILL (soft_kill allows exits)
+        intent="any"    -> True for SOFT_KILL or HARD_KILL
+        """
+        with self._lock:
+            if intent in ("entry", "any"):
+                return self._state in (KillState.SOFT_KILL, KillState.HARD_KILL)
+            elif intent == "exit":
+                return self._state == KillState.HARD_KILL
+            else:
+                raise ValueError(
+                    f"Unknown intent {intent!r}. Must be 'entry', 'exit', or 'any'."
+                )
+
+    def current_state(self) -> KillState:
+        """Return the current KillState enum value."""
+        with self._lock:
+            return self._state
+
+    def status(self) -> dict:
+        """
+        Return current status as a dict (KS6).
+
+        Keys: state, reason, triggered_at (ISO str or None), triggered_by.
+        """
+        with self._lock:
+            return {
+                "state":        self._state.value,
+                "reason":       self._reason,
+                "triggered_at": (
+                    self._triggered_at.isoformat()
+                    if self._triggered_at else None
+                ),
+                "triggered_by": self._triggered_by,
+            }
+
+    def get_kill_info(self) -> dict:
+        """
+        Convenience method returning the same dict as status() (KS10).
+        Exists because audit Issue #10 found calls to a non-existent
+        get_kill_info() method in the old codebase. Callers can use either
+        name; both are identical.
+        """
+        return self.status()
+
+    # ─────────────────────────────────────────────────────────────────────────
+    # Mutation API (KS6)
+    # ─────────────────────────────────────────────────────────────────────────
+
+    def soft_kill(self, reason: str, triggered_by: str = "system") -> None:
+        """
+        Activate SOFT_KILL: block new entry orders; allow exits and monitoring.
+
+        Idempotent: no-op if already SOFT_KILL (DEBUG log).
+        Ignored if already HARD_KILL (WARNING log — cannot downgrade).
+        Persist-first: if state_store write fails, in-memory state is NOT
+        changed and no event is published (KS9 atomicity).
+        """
+        with self._lock:
+            if self._state == KillState.SOFT_KILL:
+                self._log.debug(
+                    "soft_kill() called but already SOFT_KILL (no-op): reason=%s", reason
+                )
+                return
+            if self._state == KillState.HARD_KILL:
+                self._log.warning(
+                    "soft_kill() ignored: cannot downgrade HARD_KILL -> SOFT_KILL "
+                    "(reason=%s, triggered_by=%s)",
+                    reason, triggered_by,
+                )
+                return
+
+            prev_state = self._state
+            ts = now_ist()
+
+            # Persist FIRST — if this raises, abort (KS9)
+            self._persist_state(KillState.SOFT_KILL, reason, ts, triggered_by)
+
+            # Only reached on successful persist
+            self._state = KillState.SOFT_KILL
+            self._reason = reason
+            self._triggered_at = ts
+            self._triggered_by = triggered_by
+
+        # Publish and log outside the lock (bus handlers must not re-enter)
+        self._publish_event("soft", reason, prev_state, KillState.SOFT_KILL, triggered_by)
+        self._log.critical(
+            "SOFT_KILL ACTIVATED reason=%s triggered_by=%s", reason, triggered_by
+        )
+
+        # HALT alert. FIX-191 addendum (23-Jun-2026): severity CRITICAL (was WARN)
+        # so a trading halt reaches the operator via the notifier's CRITICAL
+        # email-fallback path even when Telegram is down (a halt IS critical-grade;
+        # WARN drops silently on a send failure with no fallback). Routing/severity
+        # ONLY — the kill stays a SOFT_KILL. (Never crash on notifier failure.)
+        #
+        # SK-B (26-Jul-2026): a SCHEDULED kill — the 15:15 circuit breaker and the EOD
+        # squareoff — fires on a timer every trading day. It is a normal daily event,
+        # not a halt to page about, and it produced 5 of the CRITICALs in the 82-alert
+        # review. It routes at WARNING instead.
+        #
+        # ⭐ This REUSES the existing taxonomy rather than inventing one:
+        # `auto_clear_scheduled_kill()` already consults `_is_scheduled_reason` to
+        # decide whether a persisted kill SILENTLY CLEARS at the next 08:15 boot — i.e.
+        # whether the system resumes trading unattended. Choosing a severity is a
+        # strictly smaller trust than the one already placed in that predicate.
+        #
+        # ⚠️ EMERGENCY kills are untouched and stay CRITICAL. The test is exact
+        # equality against a 2-element frozenset, and every non-scheduled caller
+        # constructs a reason that cannot collide with either literal (auto-trip
+        # prefixes "Auto-trip:", system_manager "System Manager EOD <day>:",
+        # cnc_gtt_monitor "cnc_gtt_monitor: ", main.py "<source>: ", live_feed passes
+        # LIVEFEED_*). Pinned by test_scheduled_kill_severity.py, which plants one real
+        # reason from every emergency caller in the tree.
+        #
+        # ⭐ It does NOT go quiet: the alert still SENDS and still names the reason;
+        # the CRITICAL log line above (:562) and the persisted `kill_switch_state` row
+        # are unchanged; and the 15:15 event separately carries a dedicated, more
+        # informative WARNING from a DIFFERENT module (main.py:699). A scheduled kill
+        # that stopped happening therefore remains detectable.
+        if self._notifier is not None:
+            scheduled = _is_scheduled_reason(reason)
+            try:
+                self._notifier.send(
+                    severity="WARNING" if scheduled else "CRITICAL",
+                    title=(
+                        f"[{self._mode}] SOFT KILL — scheduled ({reason})"
+                        if scheduled
+                        else f"[{self._mode}] ⚠️ SOFT KILL ACTIVATED"
+                    ),
+                    # ⛔ Do NOT restore the unqualified "Open positions: managed
+                    # to SL/TGT/EOD". EOD6 (eod_squareoff.py:23/:34/:1073) does
+                    # NOT touch DELIVERY (CNC) — it is CARRIED by design
+                    # (ledger #2 / Q4), so "managed to EOD" is false for it.
+                    # This body is shared by BOTH the scheduled (WARNING) and
+                    # the emergency (CRITICAL) path above; the wording holds for
+                    # both because SOFT_KILL never flattens — it blocks entries
+                    # and lets exits run. Pinned by
+                    # test_kill_alerts_delivery_carveout.py, which asserts the
+                    # SAME property here and at main.py's force-close alert —
+                    # the two arrive together at 15:15 and must not disagree.
+                    # T1 (03-Sep-2026): MISSING_EXITS gets its own body. The
+                    # shared wording below is true whenever exits exist; this
+                    # kill fires BECAUSE they do not. See
+                    # _is_missing_exits_reason and the ANANTRAJ incident.
+                    # Both bodies keep the same delivery carve-out property
+                    # (no "all positions"; intraday scoped; CNC + delivery
+                    # named), so test_kill_alerts_delivery_carveout holds for
+                    # this branch too.
+                    body=(
+                        (
+                            # ASCII-safe punctuation only (plus the em dash the
+                            # sibling body already uses): this string is echoed
+                            # into pytest failure messages, and a cp1252 console
+                            # dies mid-report on characters outside it.
+                            f"Reason: {reason}\n"
+                            "New signals: BLOCKED | NO EXIT ORDER AT THE BROKER "
+                            "for this intraday position — it is NOT managed to "
+                            "SL/TGT.\n"
+                            "MANUAL FLATTENING MAY BE REQUIRED NOW: the automated "
+                            "emergency exit may have failed. Check the broker order "
+                            "book and position book before relying on any automation.\n"
+                            "Delivery (CNC) is carried by design (EOD6) — not squared off."
+                        )
+                        if _is_missing_exits_reason(reason)
+                        else (
+                            f"Reason: {reason}\n"
+                            "New signals: BLOCKED | Intraday positions: managed to SL/TGT/EOD\n"
+                            "Delivery (CNC) is carried by design (EOD6) — not squared off."
+                        )
+                    ),
+                    source_module="kill_switch",
+                )
+            except Exception as exc:
+                self._log.error("kill_switch: soft_kill notifier.send failed: %s", exc)
+
+    def hard_kill(
+        self, reason: str, triggered_by: str = "system"
+    ) -> CancellationReport:
+        """
+        Activate HARD_KILL: block ALL orders, attempt to cancel open broker orders.
+
+        The kill STATE is tripped synchronously before this returns, so is_active()
+        blocks new orders the instant the caller regains control — that has not
+        changed and must not.
+
+        M-C8 (16-Jul-2026) — WHAT CHANGED: the FLATTEN is now asynchronous on the
+        adapter path (production). This call dispatches the exit loop to a worker
+        and RETURNS IMMEDIATELY; the returned report carries dispatched=True and is
+        NOT a result. Previously the caller's thread ran the whole retry loop, up to
+        _HARD_KILL_MAX_RETRY_HOURS — and the callers are on the fill/commit path,
+        so an emergency froze the fill pipeline it needed.
+
+        Returns:
+            CancellationReport. On the ADAPTER path: dispatched=True, counters
+            zero/empty (nothing has happened yet — do not read them). On the LEGACY
+            cancel_fn path: a real, completed report (dispatched=False), exactly as
+            before. Empty report if no callback is set.
+
+        Idempotent. If already HARD_KILL: no state change, no event re-published.
+        The LEGACY path re-runs cancellation in case orders reappeared (KS6,
+        unchanged). The ADAPTER path is SINGLE-FLIGHT — a repeat call will not
+        start a second flatten worker; the running loop already re-derives from
+        broker truth on every retry, so it covers late-appearing positions.
+
+        Persist-first atomicity same as soft_kill().
+        """
+        with self._lock:
+            prev_state = self._state
+            ts = now_ist()
+
+            if self._state != KillState.HARD_KILL:
+                # Persist FIRST — if this raises, abort (KS9)
+                self._persist_state(KillState.HARD_KILL, reason, ts, triggered_by)
+
+                # Update in-memory state
+                self._state = KillState.HARD_KILL
+                self._reason = reason
+                self._triggered_at = ts
+                self._triggered_by = triggered_by
+
+                # Publish and log outside lock scope is preferred, but we need the
+                # report first. Release lock for event publication below.
+                do_publish = True
+            else:
+                self._log.warning(
+                    "hard_kill() called but already HARD_KILL; re-running cancellation "
+                    "(reason=%s triggered_by=%s)", reason, triggered_by
+                )
+                do_publish = False
+
+        if do_publish:
+            self._publish_event(
+                "hard", reason, prev_state, KillState.HARD_KILL, triggered_by
+            )
+            self._log.critical(
+                "HARD_KILL ACTIVATED reason=%s triggered_by=%s", reason, triggered_by
+            )
+
+        report = self._run_cancel()
+        return report
+
+    def resume(self, reason: str, resumed_by: str) -> None:
+        """
+        Resume trading: set state to INACTIVE.
+
+        Manual operator action only. Logs INFO with reason.
+        Persists first. Publishes KillSwitchActivated(kill_type='resume').
+
+        Raises:
+            ValueError: if already INACTIVE, or if resumed_by is empty.
+        """
+        if not resumed_by:
+            raise ValueError("resumed_by must be non-empty (required for audit trail)")
+        with self._lock:
+            if self._state == KillState.INACTIVE:
+                raise ValueError(
+                    "Cannot resume: kill switch is already INACTIVE"
+                )
+
+            prev_state = self._state
+            ts = now_ist()
+
+            # Persist FIRST (KS9)
+            self._persist_state(KillState.INACTIVE, reason, ts, resumed_by)
+
+            self._state = KillState.INACTIVE
+            self._reason = reason
+            self._triggered_at = ts
+            self._triggered_by = resumed_by
+
+        self._publish_event("resume", reason, prev_state, KillState.INACTIVE, resumed_by)
+        self._log.info(
+            "Kill switch RESUMED reason=%s resumed_by=%s previous_state=%s",
+            reason, resumed_by, prev_state.value,
+        )
+
+    def record_api_failure(self, exc: Optional[BaseException] = None) -> None:
+        """
+        Increment the consecutive API failure counter.
+        If counter reaches api_failure_threshold AND enable_auto_trip is True
+        AND state is currently INACTIVE, auto-trigger soft_kill() (KS7).
+        The RLock (KS4) prevents deadlock when soft_kill() re-acquires the lock
+        from within the same thread.
+
+        FIX-185: a BrokerAuthError (auth/permission, e.g. Zerodha 403 "IP not
+        allowed to place orders") is a CONFIGURATION/credential problem, not the
+        kind of transient API failure this consecutive-failure circuit breaker is
+        meant for. Retrying never clears it, so counting it toward the auto-trip
+        only produces a misleading "consecutive API failures" SOFT_KILL (which on
+        the 18-Jun IP-allowlist incident then HALT-crash-looped the service on
+        restart). Such errors are surfaced via CRITICAL logs/alerts at the call
+        site and must NOT increment the counter. Callers forward the caught
+        exception; ``exc=None`` preserves the legacy "always count" behaviour.
+
+        FIX-191 (23-Jun-2026): generalised to a WHITELIST — only
+        BrokerTimeoutError and BrokerRateLimitError (genuine transient/
+        connectivity failures) count toward the auto-trip. Business rejections
+        (OrderRejectedError from a broker reject OR the client-side slippage
+        guard, ProductNotSupportedError, SLUnplaceableError, generic BrokerError)
+        are NOT outages and never trip this connectivity breaker.
+        """
+        if isinstance(exc, BrokerAuthError):
+            self._log.critical(
+                "record_api_failure: BrokerAuthError NOT counted toward auto-trip "
+                "(config/credential error, not a transient API failure): %s", exc,
+            )
+            # Kite IP-allowlist (403): the token is valid; only the VM IP needs
+            # updating. Fire ONE actionable alert/hour with the IP + exact steps.
+            # Trading self-recovers on the next signal once allowlisted (no halt,
+            # no restart) — record_api_failure deliberately does NOT trip here.
+            self._maybe_alert_ip403(exc)
+            return
+
+        # FIX-191 (23-Jun-2026 false SOFT_KILL): this is a CONNECTIVITY breaker —
+        # it exists to halt trading when the broker API is unreachable (the FIX-069
+        # timeout/rate-limit path). ONLY those two transient types may count. A
+        # business rejection is NOT an outage and must never trip it:
+        #   - OrderRejectedError covers BOTH a broker order-reject (e.g. MIS/F&O-ban
+        #     block) AND the client-side slippage-guard abort (order_placer raises
+        #     OrderRejectedError BEFORE any broker call) — declining a bad fill is
+        #     correct behaviour, not a failure.
+        #   - SLUnplaceableError / ProductNotSupportedError / generic BrokerError are
+        #     likewise not connectivity outages.
+        # On 23-Jun, 1 MIS-block + 2 slippage aborts (all OrderRejectedError) tripped
+        # a false SOFT_KILL that 403'd every signal for the rest of the day. So:
+        # WHITELIST the genuine transient types; log-and-ignore everything else.
+        # exc=None keeps the legacy "always count" path (manual/test callers).
+        if exc is not None and not isinstance(
+            exc, (BrokerTimeoutError, BrokerRateLimitError)
+        ):
+            self._log.warning(
+                "record_api_failure: %s NOT counted toward auto-trip "
+                "(not a transient connectivity error; breaker is connectivity-only)",
+                type(exc).__name__,
+            )
+            return
+
+        # M-C4 (16-Jul-2026): COUNT + DECIDE inside the lock; TRIP outside it.
+        # Calling soft_kill() from INSIDE this `with` held self._lock across
+        # soft_kill's bus.publish (a slow subscriber) AND its Telegram send
+        # (network I/O) — soft_kill releases only its own reentrant acquisition,
+        # never this outer one. That blocked is_active()/current_state() — the
+        # last-mile order gate checked on every entry/exit — on every thread for
+        # the duration of that I/O, exactly during a broker wobble. So: capture
+        # the decision + reason under the lock, release, then trip.
+        with self._lock:
+            self._api_failure_count += 1
+            should_trip = (
+                self._auto_trip
+                and self._api_failure_count >= self._threshold
+                and self._state == KillState.INACTIVE
+            )
+            # Built under the lock so it reports the count at the moment of the
+            # decision (byte-identical to the pre-fix message).
+            trip_reason = (
+                f"Auto-trip: {self._api_failure_count} consecutive "
+                f"API failures (threshold={self._threshold})"
+            ) if should_trip else ""
+
+        # Lock RELEASED. soft_kill re-acquires it briefly for the persist + state
+        # mutation, then publishes/sends with NO lock held. A concurrent
+        # double-trip is collapsed by soft_kill's own in-lock idempotency check
+        # (already-SOFT_KILL -> return, no republish/renotify), so releasing here
+        # cannot produce a second publish or send.
+        if should_trip:
+            self.soft_kill(reason=trip_reason, triggered_by="auto_trip")
+
+    def record_success(self) -> None:
+        """Reset the consecutive API failure counter on any successful API call."""
+        with self._lock:
+            self._api_failure_count = 0
+
+    def _maybe_alert_ip403(self, exc: object) -> None:
+        """If `exc` is a Kite IP-allowlist 403, send ONE actionable CRITICAL alert
+        per hour: the VM's current public IP + the exact steps to fix it. The
+        token is VALID (do not invalidate it), and new entries self-recover on the
+        next signal once the IP is allowlisted — so this is an alert, not a halt.
+
+        Runs OUTSIDE self._lock (record_api_failure returns before acquiring it),
+        so the public-IP network probe never blocks the lock. Best-effort: any
+        failure here is logged and swallowed — it must never affect trading."""
+        try:
+            from broker.auth_recovery import (
+                build_ip403_alert_body,
+                classify_broker_auth_error,
+                get_public_ip,
+            )
+            if classify_broker_auth_error(exc) != "IP_NOT_ALLOWLISTED":
+                return
+            import time
+            now_mono = time.monotonic()
+            if (self._ip403_last_alert_ts is not None
+                    and (now_mono - self._ip403_last_alert_ts) < _IP403_ALERT_THROTTLE_SEC):
+                return  # already alerted within the last hour
+            self._ip403_last_alert_ts = now_mono
+
+            if self._notifier is None:
+                self._log.critical(
+                    "KITE IP NOT ALLOWLISTED (no notifier wired to alert): %s", exc
+                )
+                return
+            ip = get_public_ip()
+            self._notifier.send(
+                severity="CRITICAL",
+                title=f"[{self._mode}] 🚫 KITE IP NOT ALLOWLISTED",
+                body=build_ip403_alert_body(ip, str(exc)),
+                source_module="kill_switch",
+            )
+            self._log.critical(
+                "KITE IP NOT ALLOWLISTED — actionable alert sent (VM IP %s). New "
+                "entries self-recover on the next signal once allowlisted.", ip,
+            )
+        except Exception as alert_exc:  # noqa: BLE001 — alerting must never raise
+            self._log.error("kill_switch: IP-403 alert failed: %s", alert_exc)
+
+    # ─────────────────────────────────────────────────────────────────────────
+    # Internal helpers
+    # ─────────────────────────────────────────────────────────────────────────
+
+    def _persist_state(
+        self,
+        state: KillState,
+        reason: str,
+        ts: datetime,
+        triggered_by: str,
+    ) -> None:
+        """
+        Write (or replace) the single kill_switch_state row (KS9).
+        Raises on state_store failure — caller must treat this as abort.
+
+        25-Jul-2026 — MEASURE-ONLY instrumentation. This call runs INSIDE
+        `self._lock`, and `is_active()` (the last-mile order check before every
+        placement) takes that SAME lock, so a slow persist stalls order placement,
+        not just /health. It inherits `PRAGMA busy_timeout = 30000` and real
+        cross-process writers exist (33 cron heartbeat jobs, two on */5 during
+        market hours). Production shows the 30 s CEILING has never been hit — zero
+        SQLITE_BUSY / "database is locked" in any log against 25 real kills — but
+        nothing timed the call, so "never blocked for ≥30 s" was proven while
+        "never blocked" was not. This closes that gap by MEASURING.
+        ⛔ It deliberately does NOT redesign: `busy_timeout` is untouched and the
+        write stays inside the lock, because KS9's persist-first trades latency
+        for atomicity ON PURPOSE (a failed write must not leave a believed-active
+        kill unrecorded). See docs/audit/kill_persist_busy_timeout_25jul2026.md.
+        """
+        import time  # function-local, matching this module's existing idiom
+
+        _t0 = time.monotonic()
+        try:
+            with self._store.transaction() as cur:
+                cur.execute(
+                    """
+                    INSERT OR REPLACE INTO kill_switch_state
+                      (id, state, reason, triggered_at, triggered_by)
+                    VALUES (1, ?, ?, ?, ?)
+                    """,
+                    (state.value, reason, ts.isoformat(), triggered_by),
+                )
+            # effect-telemetry (frozen A2.1 predicate): a kill ACTIVATION
+            # persisted — SOFT/HARD only; INACTIVE clears deliberately not
+            # counted. Runs only after the persist transaction committed.
+            if state in (KillState.SOFT_KILL, KillState.HARD_KILL):
+                self._fx_activation.inc()
+        finally:
+            # `finally`, not the happy path: the case most worth seeing is a write
+            # that WAITS and then FAILS (the busy-timeout case). The original
+            # exception continues to propagate untouched — KS9's abort is intact.
+            try:
+                _elapsed = time.monotonic() - _t0
+                if _elapsed >= _PERSIST_SLOW_WARN_SEC:
+                    self._log.warning(
+                        "kill_switch: _persist_state took %.2fs (>= %.1fs) — "
+                        "self._lock was held throughout, so is_active() and the "
+                        "last-mile order check were blocked for that duration "
+                        "(busy_timeout ceiling is 30s)",
+                        _elapsed,
+                        _PERSIST_SLOW_WARN_SEC,
+                        extra={
+                            "elapsed_sec": round(_elapsed, 3),
+                            "state": state.value,
+                            "reason": reason,
+                        },
+                    )
+            except Exception:
+                # The kill path is the last thing that should die of an
+                # instrumentation error. Swallow deliberately — and note this
+                # cannot mask a real failure: any exception from the write above
+                # is already propagating through this `finally`.
+                pass
+
+    def _load_state_from_store(self) -> None:
+        """
+        Read persisted state from state_store on construction (KS3).
+        If a non-INACTIVE state is found, log CRITICAL and use it.
+        Operator must call resume() to clear.
+        """
+        try:
+            row = self._store.fetch_one(
+                "SELECT state, reason, triggered_at, triggered_by "
+                "FROM kill_switch_state WHERE id = 1"
+            )
+        except Exception as exc:
+            self._log.error(
+                "KillSwitch: could not read persisted state: %s; starting INACTIVE",
+                exc,
+            )
+            return
+
+        if row is None:
+            return  # No persisted state — start INACTIVE
+
+        try:
+            state = KillState(row["state"])
+        except ValueError:
+            self._log.error(
+                "KillSwitch: unknown persisted state %r; ignoring, starting INACTIVE",
+                row["state"],
+            )
+            return
+
+        if state != KillState.INACTIVE:
+            self._state = state
+            self._reason = row["reason"]
+            self._triggered_by = row["triggered_by"]
+            try:
+                self._triggered_at = datetime.fromisoformat(row["triggered_at"])
+            except (ValueError, TypeError):
+                self._triggered_at = None
+
+            self._log.critical(
+                "KILL SWITCH ACTIVE AT STARTUP: state=%s reason=%s triggered_by=%s "
+                "-- operator must call resume() to clear (Audit Issue #18 fix)",
+                state.value, self._reason, self._triggered_by,
+            )
+
+    def _publish_event(
+        self,
+        kill_type: str,
+        reason: str,
+        prev_state: KillState,
+        new_state: KillState,
+        triggered_by: str,
+    ) -> None:
+        """Publish KillSwitchActivated; log ERROR on dispatch failure (never raises)."""
+        try:
+            self._bus.publish(
+                KillSwitchActivated(
+                    source_module="capital.kill_switch",
+                    kill_type=kill_type,
+                    reason=reason,
+                    previous_state=prev_state.value,
+                    new_state=new_state.value,
+                    triggered_by=triggered_by,
+                )
+            )
+        except Exception as exc:
+            self._log.error(
+                "KillSwitch: failed to publish KillSwitchActivated event: %s", exc
+            )
+
+    def _run_cancel(self) -> CancellationReport:
+        """
+        FIX-087: Indestructible per-trade exit loop.
+
+        If adapter is set, fetch all open trades and exit each with MARKET orders.
+        Each trade is wrapped in try/except; failed trades are retried infinitely
+        with exponential backoff (5s, 15s, 45s, then capped at 45s). This is
+        intentional - during HARD_KILL the system MUST NOT give up on flattening.
+
+        If adapter is not set, falls back to legacy callback (on_hard_kill_cancel_fn).
+
+        M-C8 (16-Jul-2026): the ADAPTER path now DISPATCHES the exit loop to a
+        worker thread and returns immediately (fire-and-return). It used to run on
+        the caller's thread, and several callers are on the fill/commit path
+        (order_placer:1499/:3750, fund_manager:974/:2259, drift_handler:231,
+        main:647) — so a HARD_KILL could starve the fill/event pipeline for up to
+        _HARD_KILL_MAX_RETRY_HOURS while the flatten retried. The flatten itself
+        was never the problem; blocking the caller was.
+
+        The LEGACY cancel_fn path below stays SYNCHRONOUS, and
+        _exit_all_trades_indestructible stays a synchronous internal method. That
+        split is load-bearing, not incidental: production always calls set_adapter
+        (main.py:1983) so production always takes the adapter path, while the tests
+        that assert on a real CancellationReport reach the loop through the legacy
+        cancel_fn or by calling the internal method directly. Keeping both sync is
+        what lets the async change land without disturbing them. Do not "tidy" the
+        two paths into one.
+
+        Caveat, learned the hard way (M-C8): the claim "no existing test calls
+        hard_kill() with an adapter set" was WRONG when this was written —
+        test_p0_live_day1_fixes.py::TestBugC_KillSwitchExit did exactly that and
+        broke. Those tests now call the internal method directly like their
+        siblings. If you add a test that drives hard_kill() with an adapter, it
+        gets a DISPATCH, not a result: drain_flatten() first, then assert.
+        """
+        # FIX-087: New indestructible exit logic if adapter is available
+        if self._adapter is not None:
+            # M-C8: fire-and-return. Single-flight lives in the dispatcher.
+            self._dispatch_flatten_worker()
+            return CancellationReport(
+                attempted=0, succeeded=0, failed=[], dispatched=True
+            )
+
+        # Legacy callback path (backward compat)
+        if self._cancel_fn is None:
+            return CancellationReport(attempted=0, succeeded=0, failed=[])
+        try:
+            result = self._cancel_fn()
+            # Accept both CancellationReport and plain dict from callbacks
+            if isinstance(result, CancellationReport):
+                return result
+            if isinstance(result, dict):
+                return CancellationReport(
+                    attempted=result.get("attempted", 0),
+                    succeeded=result.get("succeeded", 0),
+                    failed=list(result.get("failed", [])),
+                )
+            self._log.warning(
+                "on_hard_kill_cancel_fn returned unexpected type %s; "
+                "using empty report", type(result).__name__
+            )
+            return CancellationReport(attempted=0, succeeded=0, failed=[])
+        except Exception as exc:
+            self._log.critical(
+                "on_hard_kill_cancel_fn raised %s: %s", type(exc).__name__, exc
+            )
+            return CancellationReport(attempted=0, succeeded=0, failed=[str(exc)])
+
+    # ─────────────────────────────────────────────────────────────────────────
+    # M-C8: async flatten worker (dispatch / lifecycle / drain)
+    # ─────────────────────────────────────────────────────────────────────────
+
+    @property
+    def flatten_state(self) -> FlattenState:
+        """Current FlattenState (thread-safe snapshot)."""
+        with self._flatten_lock:
+            return self._flatten_state
+
+    def is_flatten_in_progress(self) -> bool:
+        """True while a HARD_KILL flatten worker is running or being drained.
+
+        This is the gate main.py's eod-self-exit MUST consult before deciding the
+        process may exit. count_active_positions() cannot answer this question: it
+        counts OPEN/PARTIAL/PENDING_FILL only, and the flatten marks trades EXITING
+        *early* (before the retry confirms the fill), so a flatten in progress can
+        read as "0 active positions" — i.e. as flat. That blindness is the
+        today-latent race M-C8 closes.
+        """
+        with self._flatten_lock:
+            return self._flatten_state in (FlattenState.RUNNING, FlattenState.DRAINING)
+
+    def _dispatch_flatten_worker(self) -> bool:
+        """Start the flatten worker unless one is already in flight (single-flight).
+
+        Returns True iff THIS call started the worker.
+
+        SINGLE-FLIGHT (adapter path only): a repeat hard_kill — including the
+        re-entrant already-HARD_KILL path and calls from other threads — must not
+        start a second flatten. Two concurrent flatten loops would race each other
+        placing exit orders for the same positions. It is also unnecessary: the
+        running loop re-derives every decision from CURRENT broker truth on every
+        retry (H-4), so it already picks up anything that appeared after it
+        started. The legacy cancel_fn path keeps its KS6 "re-runs cancellation"
+        behaviour unchanged.
+        """
+        with self._flatten_lock:
+            if self._flatten_state in (FlattenState.RUNNING, FlattenState.DRAINING):
+                self._log.warning(
+                    "kill_switch: flatten already in progress (%s) — single-flight "
+                    "no-op, NOT starting a second worker (the running loop re-derives "
+                    "from broker truth every retry, so it covers new positions too)",
+                    self._flatten_state.value,
+                )
+                return False
+            self._flatten_state = FlattenState.RUNNING
+            # NON-daemon: a daemon thread would be killed the instant the process
+            # decides to exit — mid-flatten, with positions still open. Non-daemon
+            # means the interpreter itself will not tear down under a running
+            # flatten. main._shutdown drains it explicitly; this is the backstop.
+            t = threading.Thread(
+                target=self._flatten_worker_main,
+                name="ks-hard-kill-flatten",
+                daemon=False,
+            )
+            self._flatten_thread = t
+        # start() OUTSIDE the lock (M-C4 lesson: never hold a lock across work).
+        try:
+            t.start()
+        except Exception as exc:  # noqa: BLE001 — e.g. RuntimeError: can't start new thread
+            # Thread exhaustion is most likely EXACTLY here: the process is in
+            # distress, which is why a HARD_KILL is firing. Two things must not
+            # happen. (1) Leaving the state at RUNNING with a thread that never
+            # ran would make is_flatten_in_progress() answer True forever — the
+            # eod-self-exit gate would hold the process open all night, and
+            # drain_flatten would join() a never-started thread and raise. (2) Not
+            # flattening at all. An unflattened book is far worse than a blocked
+            # caller, so fall back to running the flatten INLINE (the pre-M-C8
+            # behaviour) rather than dropping it. _flatten_worker_main sets
+            # COMPLETE in its finally either way.
+            with self._flatten_lock:
+                self._flatten_thread = None
+            self._log.critical(
+                "kill_switch: could NOT start the flatten worker (%s: %s) — running "
+                "the flatten INLINE on the caller's thread instead. The caller is "
+                "blocked for the duration, but the positions WILL be flattened.",
+                type(exc).__name__, exc,
+            )
+            self._flatten_worker_main()
+            return True
+        self._log.critical(
+            "kill_switch: HARD_KILL flatten dispatched to worker thread "
+            "(hard_kill returns immediately; the fill/commit path is not blocked)"
+        )
+        return True
+
+    def _flatten_worker_main(self) -> None:
+        """Worker body: run the SAME synchronous flatten, then always mark COMPLETE.
+
+        The `finally` is safety-critical, not tidiness. If this worker died leaving
+        the state at RUNNING, is_flatten_in_progress() would answer True forever and
+        the eod-self-exit gate would hold the process up all night waiting on a
+        flatten that is not running. COMPLETE-on-crash keeps the gate honest.
+        """
+        try:
+            report = self._exit_all_trades_indestructible()
+            if report.failed:
+                self._log.critical(
+                    "kill_switch: flatten worker finished with %d UNEXITED trade(s) "
+                    "%s — MANUAL INTERVENTION REQUIRED",
+                    len(report.failed), report.failed,
+                )
+            else:
+                self._log.critical(
+                    "kill_switch: flatten worker finished — all %d attempted "
+                    "position(s) flat", report.attempted,
+                )
+        except Exception as exc:  # noqa: BLE001 — the worker must never die silently
+            self._log.critical(
+                "kill_switch: flatten worker CRASHED (%s: %s) — positions may remain "
+                "OPEN, MANUAL INTERVENTION REQUIRED",
+                type(exc).__name__, exc, exc_info=True,
+            )
+        finally:
+            with self._flatten_lock:
+                self._flatten_state = FlattenState.COMPLETE
+
+    def drain_flatten(self, timeout: Optional[float] = None) -> bool:
+        """Wait for an in-flight flatten to finish. Returns True iff nothing is left running.
+
+        Called by main._shutdown before tearing anything down. Returns True
+        immediately when no flatten is in flight (the overwhelmingly common case).
+
+        timeout=None waits indefinitely (bounded in practice by the loop's own
+        _HARD_KILL_MAX_RETRY_HOURS deadline) — that is the INTERNAL eod-self-exit
+        case, which can afford to wait. An EXTERNAL SIGTERM passes a bounded grace
+        instead: systemd will SIGKILL at TimeoutStopSec regardless, so holding on
+        is not an option there.
+
+        The join happens OUTSIDE _flatten_lock — holding it across a potentially
+        2h join would block every is_flatten_in_progress()/flatten_state reader.
+        """
+        with self._flatten_lock:
+            # The STATE is authoritative, not the handle. In the thread-start
+            # fallback the flatten runs INLINE on some other caller's thread and
+            # _flatten_thread is None — a handle-first check would read that as
+            # "nothing in flight" and cheerfully let _shutdown close the store out
+            # from under a live flatten. There is nothing to join in that case, so
+            # say so honestly rather than claim a drain we did not perform.
+            if self._flatten_state not in (
+                FlattenState.RUNNING, FlattenState.DRAINING
+            ):
+                return True  # nothing in flight
+            t = self._flatten_thread
+            if t is None:
+                self._log.critical(
+                    "kill_switch: a flatten is in progress INLINE (no worker thread "
+                    "to join) — cannot drain it from here; it holds its own caller's "
+                    "thread until it finishes"
+                )
+                return False
+            self._flatten_state = FlattenState.DRAINING
+        self._log.critical(
+            "kill_switch: draining HARD_KILL flatten worker before shutdown "
+            "(timeout=%s)", "none" if timeout is None else f"{timeout:.1f}s",
+        )
+        t.join(timeout)
+        if t.is_alive():
+            # State stays DRAINING: the worker really is still running. Do NOT
+            # force it to COMPLETE — that would be a lie to every other reader.
+            return False
+        with self._flatten_lock:
+            self._flatten_state = FlattenState.COMPLETE
+        return True
+
+    def _is_position_flat(self, symbol: str) -> bool:
+        """
+        Part 11 (FIX-180): True if the broker reports no open position for
+        `symbol`.
+
+        Used to avoid re-firing an emergency MARKET exit on a position that is
+        already closed (manually at the broker, or an earlier exit that filled).
+        Re-firing on a flat position would open a NEW naked position — the exact
+        failure that caused repeated SULA exit attempts on first-live-day.
+
+        On any broker error this returns False (cannot confirm flat) so the
+        caller falls back to attempting the exit — the kill switch must always
+        err toward flattening, never toward leaving a position open.
+
+        Parity: self._adapter is the paper adapter in PAPER mode and the Zerodha
+        adapter in LIVE mode, so both paths run this check identically.
+        """
+        # Fully defensive: this runs inside the "indestructible" exit loop, so
+        # ANY failure (broker error, non-iterable/garbage payload, bad qty type)
+        # must degrade to "cannot confirm flat" -> return False -> attempt exit,
+        # never crash the loop.
+        try:
+            positions = self._adapter.get_positions()
+            for p in positions:
+                if getattr(p, "symbol", None) != symbol:
+                    continue
+                if abs(int(getattr(p, "qty", 0) or 0)) > 0:
+                    return False   # position still open
+                return True        # symbol present, qty 0 -> flat
+            return True            # symbol not present -> flat
+        except Exception as exc:
+            self._log.warning(
+                "kill_switch: could not verify flat for %s (%s); will attempt exit",
+                symbol, exc,
+            )
+            return False
+
+    def _fetch_ltp(self, symbol: str) -> Optional[float]:
+        """
+        FIX-181: best-effort LTP via the broker adapter for marketable-LIMIT
+        emergency exits. Mirrors order_placer._fetch_ltp (adapter.get_quote_raw,
+        the same source _check_liquidity uses). Returns None on any error so the
+        caller falls back to a MARKET exit (a LIMIT needs a price).
+        """
+        if self._adapter is None:
+            return None
+        try:
+            raw_quote = self._adapter.get_quote_raw([f"NSE:{symbol}"])
+            if not raw_quote:
+                return None
+            q = raw_quote.get(f"NSE:{symbol}")
+            if not q:
+                return None
+            ltp = float(q.get("last_price", 0) or 0)
+            return ltp if ltp > 0 else None
+        except Exception:
+            return None
+
+    def _marketable_exit_params(
+        self, symbol: str, exit_side: str
+    ) -> tuple[str, float]:
+        """
+        FIX-181: compute (order_type, price) for a forced exit. Returns a
+        marketable LIMIT (LTP ± buffer) when an LTP is available, else falls
+        back to MARKET. The adapter snaps the LIMIT price to a valid tick.
+
+            SELL exit -> price below LTP (sell lower to ensure fill)
+            BUY  exit -> price above LTP (buy higher to ensure fill)
+        """
+        ltp = self._fetch_ltp(symbol)
+        if not ltp or ltp <= 0:
+            return "MARKET", 0.0
+        buf = self._emergency_exit_buffer_pct
+        if exit_side == "SELL":
+            return "LIMIT", ltp * (1.0 - buf)
+        return "LIMIT", ltp * (1.0 + buf)
+
+    def _alert_unknown_product(
+        self,
+        *,
+        site: str,
+        symbol: str,
+        raw_product: str,
+        qty: int,
+        trade_id: Optional[str],
+    ) -> None:
+        """
+        Q4 / ledger #2 (G2): a position reached the emergency flatten with a
+        NULL/unrecognised product. Policy is FLATTEN + CRITICAL — never soften,
+        never silently spare — this replaces the former silent ""->INTRADAY
+        fallback. One shared emitter for both sites (no duplicate wording to
+        drift). Best-effort: alerting must never break the flatten itself.
+        """
+        shown = raw_product if raw_product else "<NULL>"
+        self._log.critical(
+            "kill_switch: UNKNOWN PRODUCT %s on %s (qty=%d, trade=%s, site=%s) "
+            "— flattening LOUDLY under the INTRADAY fallback (Q4/G2); a product "
+            "outside %s and not CNC should not exist on this account",
+            shown, symbol, qty, trade_id or "-", site,
+            sorted(_EMERGENCY_FLATTEN_PRODUCTS),
+        )
+        if self._notifier is None:
+            return
+        try:
+            self._notifier.send(
+                severity="CRITICAL",
+                title=f"[{self._mode}] HARD_KILL UNKNOWN PRODUCT -- {symbol}",
+                body=(
+                    f"Emergency flatten met product={shown} on {symbol} "
+                    f"(qty={qty}, trade={trade_id or '-'}, site={site}).\n"
+                    f"Position IS being flattened (fail-loud, Q4/G2). "
+                    f"Investigate how a product outside "
+                    f"{sorted(_EMERGENCY_FLATTEN_PRODUCTS)}/CNC entered the book."
+                ),
+                source_module="kill_switch",
+            )
+        except Exception as exc:  # noqa: BLE001 — never break the flatten
+            self._log.error(
+                "kill_switch: unknown-product CRITICAL send failed: %s", exc
+            )
+
+    def _alert_co_refused(
+        self,
+        *,
+        site: str,
+        symbol: str,
+        qty: int,
+        trade_id: Optional[str],
+        sentinel: str,
+        detail: str,
+    ) -> None:
+        """
+        Ledger #2d: the HARD_KILL could NOT close a CO position and refused
+        rather than guess. This is a money-path event -- the Q4 invariant is
+        "no live INTRADAY position" and a CO position is intraday -- so it must
+        reach the operator, not just the log. Per AR8 the refusal IS the
+        accepted noise, and per expected_alarms only a CRITICAL leaves a durable
+        trace, so a bare _log.critical would not be enough.
+
+        One shared emitter for all three refusal sites so the alert envelope
+        cannot drift; `sentinel` and `detail` carry each site's specific cause.
+        Best-effort: alerting must never break the flatten itself.
+        """
+        self._log.critical(
+            "kill_switch: %s -- CO position %s (qty=%d, trade=%s, site=%s) was "
+            "NOT closed: %s. Position may still be LIVE -- MANUAL INTERVENTION "
+            "REQUIRED.",
+            sentinel, symbol, qty, trade_id or "-", site, detail,
+        )
+        if self._notifier is None:
+            return
+        try:
+            self._notifier.send(
+                severity="CRITICAL",
+                title=f"[{self._mode}] HARD_KILL CO NOT CLOSED -- {symbol}",
+                body=(
+                    f"{sentinel}: {detail}\n"
+                    f"Symbol {symbol} (qty={qty}, trade={trade_id or '-'}, "
+                    f"site={site}).\n"
+                    f"A CO position cannot be closed by a reverse order "
+                    f"(Audit 3.1) and was NOT reversed. It may still be LIVE -- "
+                    f"verify and flatten at the broker."
+                ),
+                source_module="kill_switch",
+            )
+        except Exception as exc:  # noqa: BLE001 — never break the flatten
+            self._log.error(
+                "kill_switch: CO-refusal CRITICAL send failed: %s", exc
+            )
+
+    def _alert_exit_failed(self, failed_trades: list) -> None:
+        """
+        Part 11 (FIX-180): escalate trades that could not be exited within the
+        max retry window via CRITICAL Telegram, with a per-trade 5-min dedup so
+        we do not spam the channel every retry cycle.
+        """
+        if self._notifier is None:
+            return
+        import time
+        now_mono = time.monotonic()
+        # Ledger #2d: the 6th element is the CO bracket order id (None for a
+        # normal reverse-order exit). Unused here -- the escalation text is the
+        # same either way -- but it must be unpacked.
+        for trade_id, symbol, exit_side, qty, intent, _co_oid in failed_trades:
+            last = self._exit_alert_ts.get(trade_id, 0.0)
+            if now_mono - last < _EXIT_ALERT_DEDUP_SEC:
+                continue
+            self._exit_alert_ts[trade_id] = now_mono
+            # == ALERT DELIVERY CONTRACT (Phase 0, 09-Aug-2026) ==============
+            # The bare `try/except Exception: pass` that stood here is gone as
+            # a SILENT swallow -- but the swallow itself is NOT removed: the
+            # helper never raises, so this loop still cannot be broken by a
+            # Telegram failure (INVARIANT 1, which is why it existed at all).
+            # What changes is that the failure now leaves a machine-readable
+            # record instead of vanishing (INVARIANT 2).
+            # The return value is deliberately IGNORED: there is no branch
+            # here that a failed notification is allowed to influence.
+            # NOTE: the dedup stamp above still fires BEFORE delivery is
+            # known -- one of the five stamp-before-send limiters, and that
+            # is PHASE 5's, not this card's.
+            send_alert_recorded(
+                self._notifier, self._log,
+                severity="CRITICAL",
+                title=f"[{self._mode}] HARD_KILL EXIT FAILED -- {symbol}",
+                body=(
+                    f"Could not exit {symbol} ({exit_side} x{qty}) within "
+                    f"{_HARD_KILL_MAX_RETRY_HOURS:.0f}h of HARD_KILL.\n"
+                    f"MANUAL INTERVENTION REQUIRED — verify/flatten at broker.\n"
+                    f"Trade: {trade_id}"
+                ),
+                source_module="kill_switch",
+            )
+
+    def _mark_trade_exiting(self, trade_id: str) -> None:
+        """FIX-190: mark a trade EXITING (best-effort; broker truth > DB). Marking
+        BEFORE/right-after placing the flatten keeps a concurrent flatten path
+        (the OPEN/PARTIAL/PENDING_FILL query) from re-selecting and double-selling.
+
+        M-C8: the write is CONDITIONAL on the trade still being live. The flatten
+        now runs on its own thread, so this UPDATE races the fill thread. An
+        unconditional write would clobber whatever the fill thread had already
+        advanced the trade to (e.g. CLOSED) and resurrect a finished trade as
+        EXITING. Conditioning on the live set makes the losing side of the race a
+        clean no-op instead. No lock is needed: broker truth stays authoritative
+        (every decision is re-derived from get_positions()), so a no-op here costs
+        nothing — the next retry re-reads the world anyway.
+        """
+        placeholders = ",".join("?" * len(_FLATTEN_LIVE_TRADE_STATUSES))
+        try:
+            with self._store.transaction() as cur:
+                cur.execute(
+                    f"UPDATE trades SET status = ?, updated_at = ? "
+                    f"WHERE trade_id = ? AND status IN ({placeholders})",
+                    ("EXITING", now_ist().isoformat(), trade_id,
+                     *_FLATTEN_LIVE_TRADE_STATUSES),
+                )
+                if cur.rowcount == 0:
+                    # Not an error: the trade left the live set under us (fill
+                    # thread got there first, or it is already EXITING). Log it —
+                    # a silent no-op here would hide a real concurrency story.
+                    self._log.info(
+                        "kill_switch: EXITING write for trade %s was a no-op — no "
+                        "longer in %s (concurrent fill-path update; broker truth "
+                        "still governs)", trade_id, list(_FLATTEN_LIVE_TRADE_STATUSES),
+                    )
+        except Exception as exc:
+            self._log.critical(
+                "kill_switch: DB write (EXITING) failed for trade %s: %s",
+                trade_id, exc,
+            )
+
+    def _fetch_co_entry(self, trade_id: str) -> tuple[str, str]:
+        """Ledger #2d / R-a: return (entry_broker_order_id, variety) for a trade
+        whose product reads CO. ("", "") if it cannot be read.
+
+        R-a ruled a TWO-STAGE test: GATE on `product == 'CO'` (already in hand
+        from the open-trades query, zero query change) and only then CONFIRM
+        `variety == 'co'` with this targeted lookup, for gated rows only. The
+        reason is what the ACTION needs: a bracket cancel is only valid if a
+        bracket EXISTS, and a bracket exists iff variety='co' -- not because the
+        product string says CO. The two are set from different inputs two lines
+        apart in order_placer, so they CAN diverge; CO is dormant, so this lookup
+        costs nothing in practice and everything in correctness.
+
+        `leg IN ('ENTRY','CO')` mirrors the open-trades subquery. Per the #2d
+        Step-1b measurement the entry writer actually persists leg='ENTRY' with
+        variety='co'; the 'CO' arm is a tolerated superset, not a live shape.
+        """
+        try:
+            row = self._store.fetch_one(
+                "SELECT o.order_id, o.variety FROM orders o "
+                "WHERE o.trade_id = ? AND o.leg IN ('ENTRY','CO') LIMIT 1",
+                (trade_id,),
+            )
+        except Exception as exc:
+            self._log.warning(
+                "kill_switch: could not read CO entry row for %s: %s",
+                trade_id, exc,
+            )
+            return ("", "")
+        if not row:
+            return ("", "")
+        try:
+            return (
+                str(row["order_id"] or ""),
+                str(row["variety"] or "").strip().lower(),
+            )
+        except (KeyError, IndexError, TypeError):
+            return ("", "")
+
+    def _cancel_trade_resting_exits(self, trade_id: str) -> None:
+        """FIX-190 (Bug E): cancel a trade's resting SL/TGT orders at the broker
+        BEFORE flattening, so they don't survive as orphans that later re-fire
+        into a naked position. Best-effort; broker truth > DB."""
+        # M-C8: same constant as the CANCELLED write-condition below — the SELECT's
+        # exclusion set and the write's guard must stay identical.
+        _term_placeholders = ",".join("?" * len(_FLATTEN_TERMINAL_ORDER_STATUSES))
+        try:
+            rows = self._store.fetch_all(
+                "SELECT order_id, leg FROM orders "
+                "WHERE trade_id = ? AND leg IN ('SL','TGT') "
+                f"AND status NOT IN ({_term_placeholders})",
+                (trade_id, *_FLATTEN_TERMINAL_ORDER_STATUSES),
+            )
+        except Exception as exc:
+            self._log.warning(
+                "kill_switch: could not query resting exits for %s: %s",
+                trade_id, exc,
+            )
+            return
+        cancelled = 0
+        for r in rows or []:
+            # Defensive: this runs inside the indestructible exit loop, so a row
+            # missing the column (e.g. a test mock or odd payload) must never
+            # crash the flatten — just skip it.
+            try:
+                oid = r["order_id"]
+            except (KeyError, IndexError, TypeError):
+                continue
+            if not oid:
+                continue
+            try:
+                # Wave-2 P1 (H-1 twin): order_id IS the broker-assigned id
+                # (schema.sql:271). The old dead column broker_order_id made this
+                # SELECT raise on every call, so the HARD_KILL flatten never
+                # cancelled its resting SL/TGT. Cancel + finalize by the real order_id.
+                self._adapter.cancel_order(oid)
+            except Exception as exc:
+                self._log.warning(
+                    "kill_switch: cancel resting %s order %s failed: %s",
+                    r["leg"], oid, exc,
+                )
+                continue
+            try:
+                # M-C8: CONDITIONAL — never overwrite a TERMINAL order status. The
+                # flatten is now off-thread, so between the SELECT above and this
+                # write the fill thread can mark this very order COMPLETE (the SL
+                # filled in the gap after the broker accepted our cancel). Writing
+                # CANCELLED over that would record a FILLED exit as cancelled and
+                # leave the reconciler thinking a closed position is still open.
+                # The condition mirrors the SELECT's exclusion set exactly.
+                with self._store.transaction() as cur:
+                    cur.execute(
+                        f"UPDATE orders SET status = 'CANCELLED', updated_at = ? "
+                        f"WHERE order_id = ? AND status NOT IN ({_term_placeholders})",
+                        (now_ist().isoformat(), oid, *_FLATTEN_TERMINAL_ORDER_STATUSES),
+                    )
+                    if cur.rowcount == 0:
+                        self._log.info(
+                            "kill_switch: CANCELLED write for order %s was a no-op — "
+                            "already terminal (concurrent fill-path update won the "
+                            "race; broker truth governs)", oid,
+                        )
+            except Exception:
+                pass  # broker cancel is what matters; reconciler finalizes DB
+            cancelled += 1
+        if cancelled:
+            self._log.critical(
+                "kill_switch: cancelled %d resting exit order(s) for trade %s "
+                "before flatten (FIX-190 Bug E)", cancelled, trade_id,
+            )
+
+    def _exit_all_trades_indestructible(self) -> CancellationReport:
+        """
+        FIX-087: Exit all open trades with per-trade exception isolation and retry.
+
+        Part 11 (FIX-180): the retry loop now (a) checks the broker position is
+        still open before each retry (skip-and-resolve if already flat, so we
+        never open a naked position re-firing on a closed one) and (b) stops
+        after _HARD_KILL_MAX_RETRY_HOURS, escalating via CRITICAL Telegram
+        instead of looping forever and freezing the thread.
+
+        Returns CancellationReport after all trades are flat (or the retry
+        deadline is hit, with the unexited trades reported as failed).
+        """
+        import time
+
+        # FIX-165b: corrected column names (qty_filled not quantity,
+        # direction not side) and status values (PENDING_FILL not PENDING,
+        # plus PARTIAL for partially-filled positions).
+        # Bug C (P0 2026-06-15): also fetch the position's `product` so the
+        # emergency exit can pass the required `intent` to place_order (and exit
+        # under the SAME product the position was opened with — MIS vs CNC
+        # matters). `product` lives on the orders table (ENTRY/CO leg), not on
+        # trades, so pull it via a correlated subquery.
+        # M-C8: the live-status set comes from _FLATTEN_LIVE_TRADE_STATUSES, the
+        # same constant the EXITING write-condition uses — they must never drift.
+        _live_placeholders = ",".join("?" * len(_FLATTEN_LIVE_TRADE_STATUSES))
+        try:
+            open_trades = self._store.fetch_all(
+                "SELECT t.trade_id, t.symbol, t.qty_filled, t.direction, "
+                "       (SELECT o.product FROM orders o "
+                "        WHERE o.trade_id = t.trade_id AND o.leg IN ('ENTRY','CO') "
+                "        LIMIT 1) AS product "
+                "FROM trades t "
+                f"WHERE t.status IN ({_live_placeholders})",
+                tuple(_FLATTEN_LIVE_TRADE_STATUSES),
+            )
+        except Exception as exc:
+            self._log.critical(
+                "kill_switch: failed to fetch open trades: %s", exc
+            )
+            return CancellationReport(attempted=0, succeeded=0, failed=["fetch_failed"])
+
+        # FIX-181 LAYER A: do NOT early-return on an empty local set — a broker
+        # position can exist with no local OPEN/PARTIAL/PENDING_FILL trade (entry
+        # filled after being force-marked CANCELLED, or filled post-kill). The
+        # broker-position sweep below must still run to flatten it.
+        open_trades = open_trades or []
+        attempted = len(open_trades)
+        failed_trades = []
+        # Ledger #2d: CO positions we REFUSED to act on (no bracket to cancel,
+        # or no entry order id). They are NOT retryable — a retry cannot conjure
+        # a bracket — but they are emphatically not successes either: the
+        # position may still be live. They are counted in `attempted` and
+        # reported in `failed` so `succeeded = attempted - len(failed)` cannot
+        # quietly count an unclosed CO position as closed.
+        co_refused: list[tuple[str, str]] = []
+        # FIX-181 LAYER A: symbols covered by a local trade exit, so the broker
+        # sweep below does not double-fire on a position we already handled.
+        handled_symbols: set[str] = set()
+
+        # First pass: try to exit each trade
+        for trade in open_trades:
+            trade_id = trade["trade_id"]
+            symbol = trade["symbol"]
+            local_qty = abs(trade["qty_filled"] or 0)
+            if local_qty == 0:
+                # (pre-existing semantics preserved) qty-0 trades were always
+                # marked handled so the sweep does not act on their symbol.
+                handled_symbols.add(symbol)
+                continue
+
+            # Q4 / ledger #2 — THE BUY-DAY PRODUCT FILTER (SITE 1, local pass).
+            # The Q4 invariant is "no live INTRADAY position": a delivery (CNC)
+            # trade SURVIVES a HARD_KILL. Anything neither CNC nor in the
+            # shared emergency set (NULL, NRML, unrecognised) is flattened
+            # LOUDLY (G2) — on this account NRML should not exist at all, so
+            # it is treated as an anomaly per the approved 2e ruling: flatten
+            # + CRITICAL, never a silent spare.
+            raw_product = str(trade["product"] or "").strip().upper()
+            if raw_product == "CNC":
+                attempted -= 1  # honestly not attempted: deliberately spared
+                self._log.critical(
+                    "kill_switch: SPARED delivery position %s (trade %s, "
+                    "product=CNC, qty=%d) — HARD_KILL flattens intraday only "
+                    "(Q4); site=local-pass", symbol, trade_id, local_qty,
+                )
+                # ⛔ Deliberately NOT added to handled_symbols: Kite positions()
+                # is per-product, so this symbol may ALSO hold a live MIS row
+                # the sweep below must still flatten. The sweep's own CNC
+                # exclusion spares this delivery position again there.
+                continue
+
+            # Q4 / ledger #2d — THE CO BRACKET BRANCH (SITE A, local pass).
+            # Audit 3.1: a CO position CANNOT be closed with a reverse order --
+            # Zerodha rejects it and auto-squares at 15:20 with a Rs50+GST
+            # penalty. The only correct gesture is cancelling the CO bracket,
+            # which makes the broker collapse it and close at market.
+            #
+            # ⭐ R-c: this branch sits ABOVE determine_close_direction on
+            # purpose. That call reads broker_net_qty, which is #2e's territory,
+            # so branching above it avoids #2e BY CONSTRUCTION rather than by
+            # discipline -- and discipline is the thing that fails at 2am.
+            if raw_product == "CO":
+                co_intent = _PRODUCT_TO_INTENT.get(raw_product, "INTRADAY")
+                co_side = "SELL" if trade["direction"] == "LONG" else "BUY"
+                entry_oid, entry_variety = self._fetch_co_entry(trade_id)
+                # R-a stage 2: the product gated us in; the VARIETY decides
+                # whether a bracket actually exists to cancel.
+                if entry_variety != "co":
+                    # ⛔ NEVER fall through to a reverse order (Audit 3.1).
+                    co_refused.append((trade_id, symbol))
+                    self._alert_co_refused(
+                        site="local-pass", symbol=symbol, qty=local_qty,
+                        trade_id=trade_id, sentinel="KS_CO_VARIETY_DIVERGENCE",
+                        detail=(
+                            f"product=CO but variety={entry_variety or '<missing>'}, "
+                            f"so there is NO bracket to cancel"
+                        ),
+                    )
+                    continue
+                if not entry_oid:
+                    co_refused.append((trade_id, symbol))
+                    self._alert_co_refused(
+                        site="local-pass", symbol=symbol, qty=local_qty,
+                        trade_id=trade_id, sentinel="KS_CO_NO_BROKER_ID",
+                        detail="CO bracket has no entry order id to cancel",
+                    )
+                    continue
+                # ⭐ REORDERED, NOT SKIPPED (R-c). The resting-exit cancel that
+                # non-CO trades get below is still WANTED here: a CO_PLUS_TGT
+                # trade carries a separate regular-variety TGT order. It runs
+                # FIRST so that when the bracket cancel closes the position no
+                # live TGT is left resting to fill into a naked reverse -- that
+                # is FIX-190 Bug E's invariant, preserved. ⛔ Do NOT read the
+                # call's absence further down this branch as a removal.
+                self._cancel_trade_resting_exits(trade_id)
+                try:
+                    co_ok, co_reason = cancel_co_bracket(self._adapter, entry_oid)
+                except Exception as exc:  # noqa: BLE001
+                    # The helper deliberately does not catch (see its docstring);
+                    # this loop must never crash the flatten, so the kill path
+                    # owns its own handling here.
+                    co_ok, co_reason = False, f"{type(exc).__name__}: {exc}"
+                if co_ok:
+                    self._mark_trade_exiting(trade_id)
+                    self._log.info(
+                        "kill_switch: CO bracket cancelled for trade %s (%s) "
+                        "order=%s -- broker closes the position",
+                        trade_id, symbol, entry_oid,
+                    )
+                else:
+                    self._log.critical(
+                        "kill_switch: KS_CO_CANCEL_REJECTED -- trade %s (%s) "
+                        "order=%s reason=%s; will retry as a CANCEL, never as "
+                        "a reverse order.",
+                        trade_id, symbol, entry_oid, co_reason,
+                    )
+                    failed_trades.append(
+                        (trade_id, symbol, co_side, local_qty, co_intent, entry_oid)
+                    )
+                # ⛔ R-b: deliberately NOT added to handled_symbols -- the same
+                # ruling, for the same reason, as the CNC spare above. Kite
+                # positions() is per-product, so this symbol may ALSO hold a live
+                # MIS row the sweep must still flatten. The cost is a DUPLICATE
+                # CRITICAL from the sweep (accepted risk AR8); the alternative
+                # cost is a live intraday position left unflattened during a
+                # HARD_KILL, which is a money-path failure. Take the noise.
+                continue
+            if raw_product not in _EMERGENCY_FLATTEN_PRODUCTS:
+                # NULL/unknown product: include in the flatten + CRITICAL (G2)
+                # — replaces the former SILENT ""->INTRADAY fallback.
+                self._alert_unknown_product(
+                    site="local-pass", symbol=symbol, raw_product=raw_product,
+                    qty=local_qty, trade_id=trade_id,
+                )
+            handled_symbols.add(symbol)
+            # Bug C (P0 2026-06-15): derive the product intent from the open
+            # position so place_order gets its required `intent` and exits under
+            # the same product. A KNOWN non-intraday product (NRML) exits under
+            # its own intent (H-5 correctness); only a truly-unknown/NULL
+            # product falls back to INTRADAY (the pre-filter default) — now
+            # loud instead of silent.
+            intent = _PRODUCT_TO_INTENT.get(raw_product, "INTRADAY")
+            fallback_side = "SELL" if trade["direction"] == "LONG" else "BUY"
+
+            # FIX-190 (Bug E): cancel this trade's resting SL/TGT BEFORE flattening
+            # so a late fill can't re-open a naked position and so we leave no
+            # orphan exit orders (the AEROENTER orphans of the 19-Jun incident).
+            self._cancel_trade_resting_exits(trade_id)
+
+            # FIX-190 (Bug A): reverse-aware close based on the ACTUAL broker
+            # position, not the local intended direction. A position already
+            # flattened by order_placer's emergency exit reads net 0 -> skip (no
+            # second SELL -> no naked short, the THELEELA oversell). A genuine
+            # short closes with BUY. On broker error we fall back to the intended
+            # exit (err toward flattening).
+            close_side, close_qty = determine_close_direction(
+                self._adapter, symbol, fallback_side, local_qty
+            )
+            if close_side is None or close_qty <= 0:
+                self._log.info(
+                    "kill_switch: trade %s (%s) already flat at broker; marking "
+                    "EXITING without re-firing (FIX-190 A)", trade_id, symbol,
+                )
+                self._mark_trade_exiting(trade_id)
+                continue
+
+            try:
+                # FIX-181: marketable LIMIT (LTP ± buffer) exit, MARKET fallback.
+                exit_order_type, exit_price = self._marketable_exit_params(
+                    symbol, close_side
+                )
+                order_result = self._adapter.place_order(
+                    symbol=symbol,
+                    side=close_side,
+                    qty=close_qty,
+                    order_type=exit_order_type,
+                    price=exit_price,
+                    intent=intent,
+                    tag="ks_hard_kill_exit",
+                )
+                # Bug C (P0 2026-06-15): place_order returns a PlacedOrder on
+                # success and RAISES on failure; PlacedOrder has no .success
+                # attribute. Treat an empty broker_order_id as the only
+                # non-exception failure.
+                if not order_result.broker_order_id:
+                    raise RuntimeError("Broker returned empty order id for exit")
+
+                self._mark_trade_exiting(trade_id)
+                self._log.info(
+                    "kill_switch: trade %s exited successfully (%s %d)",
+                    trade_id, close_side, close_qty,
+                )
+            except Exception as exc:
+                self._log.critical(
+                    "kill_switch: exit failed for trade %s: %s", trade_id, exc
+                )
+                failed_trades.append(
+                    (trade_id, symbol, close_side, close_qty, intent, None)
+                )
+
+        # FIX-181 LAYER A (GICRE incident): broker-position-driven sweep. A
+        # HARD_KILL must leave NO live broker position, even one with no matching
+        # local OPEN/PARTIAL/PENDING_FILL trade — e.g. an entry LIMIT that filled
+        # during/after the kill, or one force-marked CANCELLED while it actually
+        # filled. Flatten any non-zero broker position not already handled above.
+        try:
+            broker_positions = self._adapter.get_positions()
+            for pos in broker_positions:
+                psym = getattr(pos, "symbol", None)
+                pqty = int(getattr(pos, "qty", 0) or 0)
+                if psym is None or pqty == 0 or psym in handled_symbols:
+                    continue
+                # Q4 / ledger #2 — THE BUY-DAY PRODUCT FILTER (SITE 2, broker
+                # sweep). The predicate reads the RAW broker product string —
+                # validated INDEPENDENTLY of the local-DB vocabulary (G3);
+                # broker rows are per (symbol, product).
+                sweep_product = str(getattr(pos, "product", "") or "").strip().upper()
+                if sweep_product == "CNC":
+                    self._log.critical(
+                        "kill_switch: SPARED delivery position %s (broker "
+                        "product=CNC, qty=%d) — HARD_KILL flattens intraday "
+                        "only (Q4); site=broker-sweep", psym, pqty,
+                    )
+                    # No handled_symbols.add and no attempted+=1: this row is
+                    # deliberately untouched; a same-symbol MIS row (Kite is
+                    # per-product) must still be processed on its own turn.
+                    continue
+                if sweep_product == "CO":
+                    # D1 / ledger #2d — SITE B REFUSES AND ESCALATES.
+                    # This sweep exists precisely for the case where NO local
+                    # trade row exists (FIX-181 LAYER A), so there is nothing to
+                    # join to and no entry bracket order id to cancel. Without
+                    # that id the bracket cannot be cancelled, and a reverse
+                    # order is rejected by the broker (Audit 3.1) -- BOTH
+                    # available actions are wrong, so it refuses loudly instead
+                    # of guessing. ⛔ "Mirror eod_squareoff at all three sites"
+                    # was never achievable here; Step 1 refuted that premise by
+                    # measurement, and this is the different answer it needs.
+                    attempted += 1
+                    co_refused.append((psym, psym))
+                    self._alert_co_refused(
+                        site="broker-sweep", symbol=psym, qty=abs(pqty),
+                        trade_id=None, sentinel="KS_CO_SWEEP_REFUSED",
+                        detail=(
+                            "no local trade row, therefore no bracket order id "
+                            "to cancel. NOTE: if the local pass already handled "
+                            "this symbol, a bracket cancel may still be IN "
+                            "FLIGHT at the broker (a cancel is not "
+                            "instantaneous) -- in that case this is the EXPECTED "
+                            "duplicate alert (accepted risk AR8) and the "
+                            "position is already closing. Verify at the broker "
+                            "before acting"
+                        ),
+                    )
+                    # No handled_symbols.add, for the same per-product reason as
+                    # the CNC spare above: a same-symbol MIS row must still be
+                    # flattened on its own turn.
+                    continue
+                if sweep_product not in _EMERGENCY_FLATTEN_PRODUCTS:
+                    # Missing/unknown broker product: include + CRITICAL (G2).
+                    self._alert_unknown_product(
+                        site="broker-sweep", symbol=psym,
+                        raw_product=sweep_product, qty=abs(pqty), trade_id=None,
+                    )
+                handled_symbols.add(psym)
+                attempted += 1
+                exit_side = "SELL" if pqty > 0 else "BUY"
+                # H-5: exit under the SAME product the position is held in — mirror
+                # the first pass (Bug C). Kite nets per product, so an orphan CNC
+                # position swept with an MIS (intent=INTRADAY) exit does NOT offset
+                # it: the CNC position stays AND a fresh naked MIS short is created.
+                # Map the position's product to its intent; truly-unknown/absent
+                # product → INTRADAY (the pre-filter default, now loud above).
+                sweep_intent = _PRODUCT_TO_INTENT.get(sweep_product, "INTRADAY")
+                self._log.critical(
+                    "kill_switch: SWEEP orphan broker position %s qty=%d — no "
+                    "matching local trade; flattening (FIX-181)",
+                    psym, pqty,
+                )
+                try:
+                    exit_order_type, exit_price = self._marketable_exit_params(
+                        psym, exit_side
+                    )
+                    order_result = self._adapter.place_order(
+                        symbol=psym,
+                        side=exit_side,
+                        qty=abs(pqty),
+                        order_type=exit_order_type,
+                        price=exit_price,
+                        intent=sweep_intent,
+                        tag="ks_hard_kill_sweep",
+                    )
+                    if not order_result.broker_order_id:
+                        raise RuntimeError("Broker returned empty order id for sweep")
+                except Exception as sweep_exc:
+                    self._log.critical(
+                        "kill_switch: SWEEP exit failed for %s: %s", psym, sweep_exc
+                    )
+                    failed_trades.append(
+                        ("sweep", psym, exit_side, abs(pqty), sweep_intent, None)
+                    )
+        except Exception as exc:
+            self._log.error("kill_switch: broker position sweep failed: %s", exc)
+
+        # Retry loop: exponential backoff, bounded by a max wall-clock deadline
+        # (Part 11 / FIX-180) instead of looping forever.
+        retry_delays = [5, 15, 45]  # seconds
+        retry_attempt = 0
+        deadline = now_ist() + timedelta(hours=_HARD_KILL_MAX_RETRY_HOURS)
+        flat_resolved = 0  # trades found already flat at broker (no re-fire)
+
+        while failed_trades:
+            # Part 11: stop retrying after the deadline; escalate and report the
+            # remaining trades as failed rather than freezing the thread forever.
+            if now_ist() >= deadline:
+                self._log.critical(
+                    "kill_switch: max retry duration (%.1fh) exceeded; %d trades "
+                    "still unexited — escalating, MANUAL INTERVENTION REQUIRED",
+                    _HARD_KILL_MAX_RETRY_HOURS, len(failed_trades),
+                )
+                self._alert_exit_failed(failed_trades)
+                # Ledger #2d: refused CO positions join the failed list. They
+                # were never retryable, but they may still be LIVE, so they must
+                # not be subtracted into `succeeded`.
+                remaining = [t[0] for t in failed_trades] + [c[0] for c in co_refused]
+                return CancellationReport(
+                    attempted=attempted,
+                    succeeded=attempted - len(remaining),
+                    failed=remaining,
+                )
+
+            delay = retry_delays[min(retry_attempt, len(retry_delays) - 1)]
+            self._log.critical(
+                "kill_switch: retrying %d failed trades in %ds (attempt %d)",
+                len(failed_trades), delay, retry_attempt + 1,
+            )
+            time.sleep(delay)
+            retry_attempt += 1
+
+            still_failed = []
+            for trade_id, symbol, exit_side, qty, intent, co_oid in failed_trades:
+                # Ledger #2d — SITE C. A CO retry is a CANCEL retry, NEVER a
+                # reverse order (Audit 3.1): the thing that failed was the
+                # bracket cancel, and re-firing it is the only correct retry.
+                # ⭐ Branched above determine_close_direction for the same
+                # reason as Site A -- broker_net_qty is #2e's territory, so the
+                # placement avoids #2e by construction, not by discipline.
+                if co_oid:
+                    try:
+                        co_ok, co_reason = cancel_co_bracket(self._adapter, co_oid)
+                    except Exception as exc:  # noqa: BLE001
+                        co_ok, co_reason = False, f"{type(exc).__name__}: {exc}"
+                    if co_ok:
+                        self._mark_trade_exiting(trade_id)
+                        self._log.info(
+                            "kill_switch: CO bracket cancelled for trade %s "
+                            "(%s) on retry -- broker closes the position",
+                            trade_id, symbol,
+                        )
+                    else:
+                        self._log.critical(
+                            "kill_switch: KS_CO_CANCEL_REJECTED -- retry failed "
+                            "for trade %s (%s) order=%s reason=%s",
+                            trade_id, symbol, co_oid, co_reason,
+                        )
+                        still_failed.append(
+                            (trade_id, symbol, exit_side, qty, intent, co_oid)
+                        )
+                    continue
+
+                # H-4: re-derive (close_side, close_qty) from the CURRENT signed
+                # broker net on EVERY retry — mirror the first pass
+                # (determine_close_direction) — instead of re-firing the STALE
+                # first-pass qty. After an ambiguous first exit that partially
+                # filled (A-2 BrokerTimeoutError class), the residual is < the
+                # captured qty; re-firing the stale full qty oversells into a new
+                # naked reverse. determine_close_direction returns (None, 0) when
+                # the broker confirms flat (this SUBSUMES the old binary
+                # _is_position_flat gate — closed manually / a prior exit filled),
+                # and falls back to the captured (exit_side, qty) only on a broker
+                # read error (err toward flattening — unchanged from the old
+                # cannot-confirm-flat path). Fresh get_positions per retry is the
+                # same one call the flat pre-check already made.
+                close_side, close_qty = determine_close_direction(
+                    self._adapter, symbol, exit_side, qty
+                )
+                if close_side is None or close_qty <= 0:
+                    self._log.info(
+                        "kill_switch: trade %s (%s) already flat at broker; "
+                        "resolved without re-firing exit", trade_id, symbol,
+                    )
+                    flat_resolved += 1
+                    continue
+                try:
+                    # FIX-181: marketable LIMIT (LTP ± buffer), MARKET fallback.
+                    exit_order_type, exit_price = self._marketable_exit_params(
+                        symbol, close_side
+                    )
+                    order_result = self._adapter.place_order(
+                        symbol=symbol,
+                        side=close_side,
+                        qty=close_qty,
+                        order_type=exit_order_type,
+                        price=exit_price,
+                        intent=intent,
+                        tag="ks_hard_kill_exit",
+                    )
+                    if not order_result.broker_order_id:
+                        raise RuntimeError("Broker returned empty order id for exit")
+
+                    # Best-effort DB update. M-C8: route through the one
+                    # conditional helper instead of repeating the raw UPDATE —
+                    # this site and _mark_trade_exiting were the same write in two
+                    # places, and only one of them would have gotten the race
+                    # condition. Same semantics, swallow-and-continue preserved
+                    # (the helper never raises: broker truth > DB truth).
+                    self._mark_trade_exiting(trade_id)
+
+                    self._log.info(
+                        "kill_switch: trade %s exited successfully (retry)", trade_id
+                    )
+                except Exception as exc:
+                    self._log.critical(
+                        "kill_switch: retry failed for trade %s: %s", trade_id, exc
+                    )
+                    still_failed.append(
+                        (trade_id, symbol, close_side, close_qty, intent, co_oid)
+                    )
+
+            failed_trades = still_failed
+
+        # All RETRYABLE trades exited or confirmed flat at broker.
+        # Ledger #2d: a refused CO position is not retryable, so it never
+        # entered failed_trades and the loop above drained without it -- but it
+        # is emphatically not a success. Report it failed, or `succeeded` would
+        # claim a possibly-live CO position as closed.
+        co_refused_ids = [c[0] for c in co_refused]
+        succeeded = attempted - len(co_refused_ids)
+        return CancellationReport(
+            attempted=attempted, succeeded=succeeded, failed=co_refused_ids,
+        )

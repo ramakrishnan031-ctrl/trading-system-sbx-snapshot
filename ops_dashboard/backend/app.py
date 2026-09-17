@@ -1,0 +1,332 @@
+"""
+ops_dashboard/backend/app.py
+
+Flask application factory for the ops dashboard.
+  * binds 127.0.0.1:8500 ONLY (isolation rule I6) via Waitress
+  * login_required on ALL routes incl. static (enforced by a before_request guard;
+    only the login GET/POST are exempt — login.html is fully self-contained)
+  * hardened session cookie: HttpOnly + SameSite=Strict (+ Secure when TLS is
+    present in G2c; on the loopback-HTTP dev box Secure is config-gated so login
+    works — see server.session_cookie_secure)
+
+Run:  python -m backend.app
+"""
+from __future__ import annotations
+
+import os
+import secrets
+from datetime import timedelta
+from typing import Optional
+
+import yaml
+from flask import (
+    Flask, current_app, jsonify, redirect, render_template, request,
+    session, url_for,
+)
+
+from .api.analytics import analytics_api
+from .api.analytics2 import analytics2_api
+from .api.capacity import capacity_api
+from .api.dashboard import dashboard_api
+from .api.operations import operations_api
+from .api.pipeline import pipeline_api
+from .api.risk_capital import risk_capital_api
+from .api.strategies import strategies_api
+from .api.system import system_api
+from .api.trading import trading_api
+from .auth import LoginAttemptTracker, auth_bp
+
+_HERE = os.path.dirname(os.path.abspath(__file__))
+_FRONTEND = os.path.abspath(os.path.join(_HERE, "..", "frontend"))
+_DEFAULT_CONFIG = os.path.join(_HERE, "config", "gui_config.yaml")
+
+_LOGIN_EXEMPT = {"auth.login_get", "auth.login_post"}
+
+# Hosts that count as "this machine" for the local-development session bootstrap
+# below. ⛔ Deliberately a closed set — no CIDR parsing, no hostname resolution,
+# nothing that could be widened by a DNS answer.
+_LOOPBACK_HOSTS = {"127.0.0.1", "localhost", "::1"}
+
+# The environment variable that ARMS the local-development session bootstrap.
+# ⭐ It is the gate that a git push cannot carry: it lives in the developer's
+# shell, never in a tracked file and never in a config file, so no branch merge
+# and no `checkout -f` can turn the bootstrap on anywhere.
+_LOCAL_DEV_ENV = "OPS_DASHBOARD_LOCAL_DEV"
+
+
+def _is_loopback_client(addr: Optional[str]) -> bool:
+    """True only for a request that originated on this machine.
+
+    127.0.0.0/8 is matched by prefix (a client can legitimately arrive as
+    127.0.0.1 or 127.0.1.1); everything else must match the closed set exactly.
+    """
+    a = (addr or "").strip()
+    if not a:
+        return False
+    if a.startswith("::ffff:"):          # IPv4-mapped IPv6
+        a = a[7:]
+    return a in _LOOPBACK_HOSTS or a.startswith("127.")
+
+
+def _local_dev_armed(cfg: dict) -> bool:
+    """Whether the LOCAL-DEVELOPMENT session bootstrap may run at all.
+
+    ⛔⛔ THIS IS NOT AN AUTHENTICATION BYPASS FOR THE APPLICATION. It is a
+    development-only convenience so a screen URL can be opened directly during
+    visual verification, and it is armed only when ALL of these hold:
+
+      1. `local_dev.auto_login: true` in the merged config. The TRACKED
+         gui_config.yaml ships **false**; the value is meant to be set only in
+         gui_config.local.yaml, which is git-ignored.
+      2. The environment carries OPS_DASHBOARD_LOCAL_DEV=1. ⭐ THIS IS THE GATE
+         THAT CANNOT TRAVEL: it is not in any file, so it cannot ride a push, a
+         merge or the post-receive `checkout -f`, and the VM's systemd unit does
+         not set it.
+      3. The server is bound to a loopback host (isolation rule I6).
+      4. — checked per request — the client itself is on the loopback interface.
+
+    ⚠️ (1) and (3) alone would NOT protect the VM, whose GUI also binds
+    127.0.0.1 behind a TLS terminator; (2) is what makes the guard hold there.
+    """
+    if not bool((cfg.get("local_dev") or {}).get("auto_login", False)):
+        return False
+    if (os.environ.get(_LOCAL_DEV_ENV) or "").strip() != "1":
+        return False
+    bind = str((cfg.get("server") or {}).get("bind_host", "127.0.0.1"))
+    return bind in _LOOPBACK_HOSTS
+
+# The Flask session key is persisted here when `auth.secret_key` is not configured.
+# data_store/ is gitignored and survives the post-receive `checkout -f`, so the key
+# outlives both restarts and deploys.
+_SECRET_KEY_FILE = os.path.abspath(
+    os.path.join(_HERE, "..", "..", "data_store", "session", "gui_secret_key")
+)
+
+
+def _resolve_secret_key(configured: Optional[str], log=None) -> str:
+    """Return a STABLE Flask session key.
+
+    `auth.secret_key` wins if configured. Otherwise the key is generated once and
+    persisted (0600), because the old fallback minted a fresh key on every start: each
+    restart of gui-dashboard silently invalidated every session and bounced the operator
+    back to the login + TOTP screen. A session key is meant to be durable; an ephemeral
+    one is a logout on a timer.
+
+    FAIL-SAFE: any problem reading or writing the file degrades to the previous
+    behaviour (a fresh ephemeral key) rather than refusing to start. A read-only ops
+    dashboard that boots and logs you out beats one that will not boot.
+    """
+    if configured:
+        return configured
+    try:
+        if os.path.exists(_SECRET_KEY_FILE):
+            key = open(_SECRET_KEY_FILE, encoding="utf-8").read().strip()
+            if key:
+                return key
+        key = secrets.token_hex(32)
+        os.makedirs(os.path.dirname(_SECRET_KEY_FILE), exist_ok=True)
+        # 0600 before content: never widen, even briefly.
+        fd = os.open(_SECRET_KEY_FILE, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+        with os.fdopen(fd, "w", encoding="utf-8") as fh:
+            fh.write(key)
+        return key
+    except OSError as exc:  # noqa: BLE001 — never block startup on this
+        if log is not None:
+            log.warning(
+                "gui: could not persist the session key (%s); falling back to an "
+                "ephemeral key — sessions will not survive a restart", exc,
+            )
+        return secrets.token_hex(32)
+
+
+def _deep_merge(base: dict, overlay: dict) -> dict:
+    """Recursive dict merge — overlay wins on scalar/list conflicts."""
+    out = dict(base)
+    for key, val in overlay.items():
+        if isinstance(val, dict) and isinstance(out.get(key), dict):
+            out[key] = _deep_merge(out[key], val)
+        else:
+            out[key] = val
+    return out
+
+
+def load_gui_config(config_path: str = _DEFAULT_CONFIG) -> dict:
+    """Load gui_config.yaml, then deep-merge gui_config.local.yaml if present.
+
+    The LOCAL overlay (git-ignored, chmod 600 on the VM) carries deployment
+    values + auth secrets, so the bare-repo hook's `checkout -f` on future
+    pushes can never clobber them (G2c deployment survival requirement).
+    """
+    with open(config_path, "r", encoding="utf-8") as fh:
+        cfg = yaml.safe_load(fh) or {}
+    local_path = os.path.join(os.path.dirname(config_path), "gui_config.local.yaml")
+    if os.path.isfile(local_path):
+        with open(local_path, "r", encoding="utf-8") as fh:
+            overlay = yaml.safe_load(fh) or {}
+        if isinstance(overlay, dict):
+            cfg = _deep_merge(cfg, overlay)
+    return cfg
+
+
+def create_app(config_path: Optional[str] = None, gui_config: Optional[dict] = None) -> Flask:
+    cfg = gui_config if gui_config is not None else load_gui_config(config_path or _DEFAULT_CONFIG)
+
+    app = Flask(
+        __name__,
+        template_folder=os.path.join(_FRONTEND, "templates"),
+        static_folder=os.path.join(_FRONTEND, "static"),
+        static_url_path="/static",
+    )
+    app.config["GUI_CONFIG"] = cfg
+
+    auth_cfg = cfg.get("auth", {}) or {}
+    server_cfg = cfg.get("server", {}) or {}
+    app.secret_key = _resolve_secret_key(auth_cfg.get("secret_key"), log=app.logger)
+    app.permanent_session_lifetime = timedelta(
+        minutes=int(auth_cfg.get("session_lifetime_minutes", 60))
+    )
+    app.config.update(
+        SESSION_COOKIE_HTTPONLY=True,
+        SESSION_COOKIE_SAMESITE="Strict",
+        # Secure requires HTTPS; enabled in G2c behind TLS. Default off so
+        # loopback-HTTP dev login works (V3). Never affects SameSite/HttpOnly.
+        SESSION_COOKIE_SECURE=bool(server_cfg.get("session_cookie_secure", False)),
+    )
+    app.config["LOGIN_TRACKER"] = LoginAttemptTracker(
+        max_failures=int(auth_cfg.get("max_failures", 5)),
+        lockout_seconds=int(auth_cfg.get("lockout_minutes", 15)) * 60,
+    )
+
+    app.register_blueprint(auth_bp)
+    app.register_blueprint(dashboard_api)
+    app.register_blueprint(pipeline_api)
+    app.register_blueprint(capacity_api)
+    app.register_blueprint(strategies_api)
+    app.register_blueprint(trading_api)
+    app.register_blueprint(risk_capital_api)
+    app.register_blueprint(system_api)
+    app.register_blueprint(analytics_api)
+    app.register_blueprint(analytics2_api)   # G5c NEW analytics endpoints (additive)
+    app.register_blueprint(operations_api)   # G5d Operations endpoints (additive)
+
+    @app.context_processor
+    def _inject_gui_flags():
+        # G5a: expose read-only feature flags to every template (ExportButton, L7).
+        # Both default OFF; enabling table export is Rama's Q3 decision. Additive —
+        # no route/endpoint/schema touched.
+        return {"gui_flags": {
+            "table_export_enabled": bool(cfg.get("table_export_enabled", False)),
+            "reports_download_enabled": bool(cfg.get("reports_download_enabled", False)),
+        }}
+
+    # Resolved ONCE at start-up so the decision is visible in the log rather
+    # than re-derived silently on every request.
+    local_dev = _local_dev_armed(cfg)
+    app.config["LOCAL_DEV_AUTO_LOGIN"] = local_dev
+    if local_dev:
+        # ASCII ONLY in console/log output. The Windows console encodes with
+        # cp1252 and a non-ASCII character here raises UnicodeEncodeError at
+        # start-up — i.e. the warning would take the server down instead of
+        # warning anyone. Comments and templates stay UTF-8; console text does not.
+        app.logger.warning(
+            "gui: LOCAL-DEVELOPMENT session bootstrap is ARMED - loopback "
+            "clients are authenticated without the login form. This requires "
+            "local_dev.auto_login=true AND %s=1 AND a loopback bind, and it is "
+            "refused for any non-loopback client. Never enable it on a "
+            "deployed host.", _LOCAL_DEV_ENV,
+        )
+
+    @app.before_request
+    def _enforce_login():
+        if request.endpoint in _LOGIN_EXEMPT:
+            return None
+        if session.get("user"):
+            return None
+        # LOCAL-DEVELOPMENT ONLY — see _local_dev_armed for the four gates.
+        # The per-request gate is here because the other three are properties of
+        # the process, and this one is a property of the caller.
+        if (current_app.config.get("LOCAL_DEV_AUTO_LOGIN")
+                and _is_loopback_client(request.remote_addr)):
+            session["user"] = str(
+                (cfg.get("local_dev") or {}).get("username") or "local-dev")
+            session["local_dev"] = True          # marks the session's provenance
+            return None
+        if request.path.startswith("/api/"):
+            return jsonify({"error": "authentication required"}), 401
+        return redirect(url_for("auth.login_get"))
+
+    @app.after_request
+    def _no_store(resp):  # noqa: ANN001
+        # Live operator dashboard: never let the browser serve a stale page/asset
+        # after a redeploy (heuristic HTML caching had users seeing old screens).
+        # Loopback single-user, so caching buys nothing — always revalidate.
+        resp.headers["Cache-Control"] = "no-store, no-cache, must-revalidate, max-age=0"
+        resp.headers["Pragma"] = "no-cache"
+        return resp
+
+    @app.route("/", methods=["GET"])
+    def dashboard_page():
+        return render_template("dashboard.html")
+
+    # G2b-1 screens (Alpine-over-JSON; each fetches its own /api/* endpoint).
+    _PAGES = {
+        "strategies": "strategies.html", "signals": "signals.html",
+        "orders": "orders.html", "positions": "positions.html",
+        "holdings": "holdings.html", "capacity": "capacity.html",
+        "risk": "risk.html", "capital": "capital.html",
+        "exposure": "exposure.html", "pnl": "pnl.html",
+        "services": "services.html", "vm": "vm.html", "logs": "logs.html",
+        "audit": "audit.html", "alerts": "alerts.html",
+        "slippage": "slippage.html", "execution": "execution.html",
+        "statistics": "statistics.html", "reports": "reports.html",
+        "config": "config.html", "controls": "controls.html",
+        # G5b: consolidated Capital & Risk (composes /api/risk+capital+exposure+capacity).
+        # The old /risk /capital /exposure /capacity routes above are PRESERVED.
+        "capital-risk": "capital_risk.html",
+        # G5c NEW analytics screens (additive routes; nav placeholders → live).
+        "strategy-ranking": "strategy_ranking.html",
+        "strategy-health": "strategy_health.html",
+        "scanner-attribution": "scanner_attribution.html",
+        "trades": "trade_explorer.html",
+        "pnl-analytics": "pnl_analytics.html",
+        # G5d Operations/Investigation screens (additive routes).
+        "live-activity": "live_activity.html",
+        "trade-logs": "trade_logs.html",
+    }
+
+    @app.route("/<page>", methods=["GET"])
+    def module_page(page: str):
+        template = _PAGES.get(page)
+        if template is None:
+            return "Not found", 404
+        return render_template(template)
+
+    @app.errorhandler(500)
+    def _internal_error(exc):  # noqa: ANN001
+        if request.path.startswith("/api/"):
+            return jsonify({"error": "internal error"}), 500
+        return "Internal error", 500
+
+    return app
+
+
+def main() -> int:
+    from waitress import serve
+    app = create_app()
+    server = app.config["GUI_CONFIG"].get("server", {})
+    host = server.get("bind_host", "127.0.0.1")
+    port = int(server.get("bind_port", 8500))
+    threads = int(server.get("threads", 4))
+    if host not in _LOOPBACK_HOSTS:
+        raise RuntimeError(f"Refusing to bind non-loopback host {host!r} (isolation rule I6).")
+    print(f"ops_dashboard serving on http://{host}:{port} (loopback only)")
+    if app.config.get("LOCAL_DEV_AUTO_LOGIN"):
+        print("  LOCAL-DEV session bootstrap ARMED - loopback clients skip the "
+              "login form. Screens open directly, e.g. /trades. "
+              "Development only; never on a deployed host.")
+    serve(app, host=host, port=port, threads=threads)
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

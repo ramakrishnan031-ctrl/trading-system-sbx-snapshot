@@ -1,0 +1,783 @@
+# config/system_config.yaml — Trading System v2
+#
+# Master configuration. Every numeric and boolean limit here has a
+# corresponding runtime check, Telegram alert, and daily report row (P2).
+# All time values are "HH:MM" strings interpreted as IST (P1).
+#
+# Locked decisions: P1, P2, P4, P8, P11b, P13, P14, P15, Q1, G4, PR8
+# product_map embedded here per CL6 note (no separate broker_product_map.yaml).
+#
+# ─────────────────────────────────────────────────────────────────────────────
+# BUILD 1 TAGGING CONVENTION (24-Jun-2026) — feeds the BUILD 2 Config Auditor:
+#   [LAUNCH-PHASE]  = deliberately conservative for early live; review/relax as
+#                     the account scales (e.g. entry_start 10:00). Flagged for
+#                     periodic review.
+#   [PERMANENT]     = permanent architecture; capital-relative or structural, no
+#                     scaling review needed (e.g. daily_loss_limit_pct 3%,
+#                     max_position_value_pct 40%, max_concentration_pct 10%,
+#                     risk_per_trade_pct 1%).
+# ─────────────────────────────────────────────────────────────────────────────
+
+broker:                       # FIX-133 Item 28: multi-broker support
+  primary: "zerodha"
+  fallback: "angelone"
+  fallback_enabled: false     # enable when AngelOne credentials available
+  multi_account_mode: false   # FIX-133 Item 29: enable only when multi-account tested
+
+trading_hours:
+  # TESTING VM ONLY (17-Sep-2026, Rama): "10:00" -> "09:30". Production and the repo keep "10:00".
+  entry_start: "09:30"        # [LAUNCH-PHASE] Live Week 1: conservative start; avoid opening-hour volatility. Relax toward 09:20 as the account scales.
+  # This value is a FLOOR OVER the per-strategy windows, not a duplicate of them.
+  # market_windows.is_entry_allowed_for_strategy() requires BOTH: the global window
+  # here AND the strategy's own entry_start_time/entry_end_time (CFG-5). So while this
+  # says 10:00, the 16 strategies declaring entry_start_time "09:25" cannot trade at
+  # 09:25 — the floor binds and their value is inert TODAY.
+  # >>> They are NOT stale, and must NOT be "aligned" to 10:00. "09:25" is each
+  # strategy's INTENDED window; 10:00 is this temporary launch-phase floor. Rewriting
+  # the strategies to 10:00 would look tidy and then silently keep them out of the
+  # 09:20-10:00 window on the day this floor is relaxed — a behaviour change disguised
+  # as cleanup. Relaxing THIS line is the switch; the strategies already say what they
+  # want. (04-Jul audit "entry_start_time 09:25 vs entry_start 10:00 (cosmetic)".)
+  # #8 (BUILD 1) / T5 (29-Jun): entry_end and eod_entry_cutoff are read by
+  # DIFFERENT paths — entry_end gates the strategy entry window (signal eligibility),
+  # eod_entry_cutoff is FIX-073's absolute order-placement deadline (rate-limiter
+  # guard). T5 aligned entry_end 15:15->15:00 to match the per-strategy
+  # entry_end_time=15:00 (all 15 strategies already bind there) — kills the auditor
+  # entry_end-vs-squareoff finding + makes 15:00 the global backstop. eod_entry_cutoff
+  # stays 15:15 (separate mechanism, out of scope); they no longer coincide. Keep both.
+  entry_end: "15:00"          # T5 (29-Jun): aligned to per-strategy 15:00 (global backstop; was 15:15). Zero behaviour change (no entry ever after 14:57). <= eod_squareoff_time 15:17
+  eod_entry_cutoff: "15:15"   # FIX-073: absolute last moment to place order (prevents rate-limiter delays from opening positions after EOD)
+  eod_squareoff_time: "15:17" # EOD ACCOUNTING + EMERGENCY BACKSTOP -- NOT the primary MIS
+                              # square-off. It also does the WAL checkpoint and
+                              # fund_manager.reset_daily_pnl, so it must NOT be moved earlier:
+                              # any 15:07-15:17 realised P&L would be booked AFTER the day's
+                              # RESET_PNL row. Primary MIS safety is mis_squareoff_* below.
+                              # CORRECTED 2026-08-28: the previous comment claimed a "3-min
+                              # buffer before RMS auto-sq at 15:20". 15:20 matches NONE of
+                              # Zerodha's four published cutoffs (CAS 15:12 / non-CAS 15:25 /
+                              # F&O 15:26 / MCX close-10m) and was untraceable to any source.
+  # ── MIS AUTO-SQUAREOFF (28-Aug-2026) — PRIMARY MIS SAFETY ──────────────────
+  mis_squareoff_cutoff: "15:09"      # OUR protective deadline -- deliberately EARLIER than
+                                     # any published broker cutoff. Was 15:12 until 03-Sep-2026.
+                                     # source: Zerodha intraday auto-square-off timing page
+                                     # (support.zerodha.com) + Zerodha's 03-Aug-2026 post,
+                                     # checked_at: 2026-09-03.
+                                     # WHY IT MOVED: the two Zerodha sources DISAGREE for CAS
+                                     # stocks -- the support page says 15:12, the 03-Aug post
+                                     # says 15:10. RULE: never design to the LATER of two
+                                     # conflicting broker deadlines. 15:09 is safe under both,
+                                     # and leaves 1 minute before the earliest possible broker
+                                     # action (Rama's stated objective: two complete checks
+                                     # finishing 1 min before Zerodha's auto-squareoff).
+                                     # Published set: CAS 15:10-15:12 / non-CAS 15:25 /
+                                     # F&O 15:26 / MCX close-10m. CAS also accepts NO orders
+                                     # 15:15-15:20. Broker charge if it acts: Rs50 + 18% GST
+                                     # PER ORDER.
+                                     # KNOWN COST (on the ledger, not fixed here): 15:09 is
+                                     # universal, so it gives up ~16 min of holding time on
+                                     # non-CAS names (15:25). The correct end state is a
+                                     # per-symbol CAS/non-CAS deadline; that needs the F&O
+                                     # list and a lookup.
+                                     # rationale: earliest current EQUITY-STOCK cutoff (CAS =
+                                     # SEBI Closing Auction Session, i.e. F&O-listed equities).
+                                     # This is THIS SYSTEM'S configured protective cutoff for
+                                     # its equity-MIS unit -- NOT "Zerodha's universal cutoff".
+                                     # broker_adjustable: true (Zerodha states the risk team
+                                     # may change these), so this is CONFIG, never a constant.
+                                     # KNOWN LIMITATION: absolute IST time; NOT session-relative.
+                                     # special_sessions moves eod_squareoff_time per date but
+                                     # does NOT move this, and the ordering invariant will not
+                                     # detect the divergence (15:12 < 19:12 is valid).
+  mis_squareoff_first_offset: "6m"   # CHECK 1 = cutoff - 6m = 15:03 (price-seeking pass)
+  mis_squareoff_second_offset: "3m"  # CHECK 2 = cutoff - 3m = 15:06 (certainty pass)
+                                     # 03-Sep-2026: 5m/2m -> 6m/3m. Both passes AND the
+                                     # post-pass verify now complete before 15:09, i.e. before
+                                     # the earliest published broker action (15:10). The old
+                                     # 15:07/15:10 pair put PASS_2 exactly ON that boundary.
+  mis_squareoff_margin_sec: 20       # DERIVED, not picked:
+                                     #   poll_interval_sec 5  (PASS 2's instant is EVALUATED
+                                     #     anywhere in [15:10:00, 15:10:05] -- real lateness)
+                                     # + ~8.2s pessimistic PASS-2 execution bound
+                                     # + ~6.8s explicit buffer
+                                     # A margin below poll_interval_sec is incoherent and FAILS
+                                     # CLOSED: PASS 2 could not be evaluated inside it.
+  market_open: "09:15"        # NSE regular-session open
+  market_close: "15:30"       # NSE regular-session close; cutoff for EOD-window checks
+  # 25-Jul-2026: WHEN THE SERVICE SELF-EXITS FOR THE DAY (was a hardcoded 16:00 in
+  # main.py, against Foundation Rule 1.4). 17:35 because the PB-01 Chartink EOD scanner
+  # fires at 17:00 — all ten triggers since 13-Jul hit a refused connection because the
+  # service was already down, so 0 pb01_watchlist rows exist. 35 min covers a delayed
+  # alert; the capture itself drains in seconds. Bounded by the schema:
+  # market_close <= service_window_end < 18:15 (the forward-shadow recorder).
+  # Revert = set this back to "16:00"; it lands at the next boot.
+  service_window_end: "17:35"
+
+# FIX-094: Special sessions (Muhurat trading, etc.) — override market hours for specific dates
+# Format: date (YYYY-MM-DD) -> {market_open, market_close, eod_squareoff_time}
+# Uncomment and configure when special session is scheduled:
+special_sessions:
+  # Example: Muhurat Trading (Diwali special evening session)
+  # 2026-11-01:
+  #   market_open: "18:15"
+  #   market_close: "19:15"
+  #   eod_squareoff_time: "19:12"
+
+signal_queue:
+  capacity: 300               # Max signals in queue before HTTP 503 (P15)
+  backpressure_pct: 0.80      # 503 threshold = capacity * backpressure_pct (P15)
+  expiry_sec: 600             # WR6: 10 min - Chartink triggered_at is scan time, not delivery time
+  warning_pct: 0.60           # FIX-134 Item 35: X-Queue-Warning header above 60% fill
+
+# FIX-C: Symbol exclusion list (rejected at webhook edge with DEBUG log only)
+excluded_symbols:
+  - "E2E"                     # Exclude list from live observation
+  - "GVPIL"
+  - "BIRLACABLE"
+  - "SHANKARA"
+  - "MCLEODRUSS"
+
+# P0 2026-06-15: MIS-only safety. When true, EVERY strategy is forced to
+# intent=INTRADAY at load time, so the system can never place CNC/DELIVERY
+# orders (first-live-day incident: HARIOMPIPE/SETL went CNC). Set false only
+# when positional/DELIVERY trading is deliberately re-enabled and re-tested.
+force_intraday_only: false
+
+# Slice 2 (LAYER 1 — master product gate): which product type may trade today.
+# INTRADAY (default) = only intraday-intent strategies trade · DELIVERY = only
+# delivery · BOTH = either. Only GATES which strategies trade; it does NOT rewrite
+# intent or place CNC by itself (force_intraday_only above still forces MIS-only).
+# Delivery strategies need the Slice 2.5 delivery lifecycle before going live.
+trade_type: BOTH
+
+# SLICE2.5-P1: master CNC/delivery capability lock (default false). A REAL CNC order
+# or its OCO-GTT is placed ONLY when delivery_enabled=true AND force_intraday_only=false
+# AND trade_type in {DELIVERY,BOTH}. Stays false until the Slice 2.5 lifecycle + the
+# market-hours real-API proof (T2) pass. Enforced at the broker boundary.
+delivery_enabled: true
+
+product_map:                  # PR8: broker -> {INTENT -> broker_code}
+  zerodha:
+    INTRADAY: "MIS"           # Margin Intraday Squareoff (PR3)
+    DELIVERY: "CNC"           # Cash-and-Carry -- delivery / positional (PR3)
+    COVER_ORDER: "CO"         # Cover Order -- bracket with built-in SL (PR3)
+    BRACKET_ORDER: ""         # Zerodha discontinued BO; empty = not supported (PR3)
+
+# MIS Learned Blocklist (source-free; Step 0 30-Jun proved no clean MIS source exists).
+# Observes the broker's own "MIS orders are currently blocked" 400 and pre-drops future
+# MIS-intent signals for the symbol at the secondary screener (REJECTED_NOT_MIS_TRADABLE),
+# within a re-test TTL. See core/mis_blocklist.py. The 400 is ALWAYS recorded (so the list
+# warms up); only the screener DROP is gated by `enabled`. Rollout: false -> enabled+shadow
+# (validate vs real 400s) -> shadow:false (active).
+mis_filter:
+  # 27-Jul-2026: flipped false -> true in SHADOW ONLY. shadow: true below means the
+  # would-drop is LOGGED and the signal FALLS THROUGH (secondary_screener.py:144
+  # rejects only when shadow is false; :159 falls through) -- so behaviour is
+  # byte-identical and only the log changes. This buys the measurement that the
+  # 71/45 same-day-repeat figure is currently only an UPPER BOUND for.
+  # PROVEN TODAY, live: `mis_blocklist: recorded MIS-block for PYRAMID` appears
+  # TWICE -- learned at 10:06, identical order placed again at 10:11.
+  # ⛔ DO NOT set shadow: false without Rama. That is the enforcing change.
+  enabled: true               # SHADOW-ONLY (see shadow: true below); false = fully dormant
+  shadow: true                # when enabled: true = log would-drop only; false = actually reject
+  ttl_days: 1                 # re-test TTL in calendar days; blocked symbol re-allowed NEXT day (>= 1; default 1 = daily re-test)
+
+clock:
+  warn_skew_sec: 2.0          # G4 tier 1: log warning
+  alert_skew_sec: 5.0         # G4 tier 2: Telegram alert, continue trading
+  halt_skew_sec: 30.0         # G4 tier 3: fire on_critical_skew -> soft_kill
+  startup_max_skew_sec: 30.0  # G4: refuse to start if startup skew exceeds this
+  probe:                      # BL-21: periodic driver for record_broker_skew
+    enabled: true
+    probe_interval_sec: 60    # how often to call adapter.get_server_time()
+
+order_monitor:                # OM14
+  poll_interval_sec: 2        # poll broker every 2s for fill updates (>= 1)
+  fill_timeout_sec: 60        # cancel unfilled OPEN/SUBMITTED order after 60s (>= 5)
+
+capital:                      # FM16
+  intraday_bucket_pct: 0.70   # 70% of total capital for intraday (MIS/CO)
+  positional_bucket_pct: 0.30 # 30% of total capital for positional (CNC)
+  conditional_allocation_enabled: false  # SLICE2.5-PHASE-3 (B): false = fixed split above (default, zero change). true = split by ACTIVE trade types (only-intraday->100/0, only-delivery->0/100, both->the split above). No-borrow already enforced.
+  # BUILD 1 (#1, 24-Jun): absolute `daily_loss_limit` (was ₹300) DELETED.
+  # daily_loss_limit_pct (under risk:) is the SOLE daily-loss authority — the
+  # post-close realized breach derives ₹ = daily_loss_limit_pct × current capital.
+  slm_margin_buffer_pct: 0.05 # FIX-090: 5% buffer for SL-M margin (unknown fill price risk)
+  sl_limit_offset_pct: 0.005  # P0 2026-06-15: SL legs are SL (stop-limit); limit = trigger ± 0.5% so triggered stops fill (Zerodha rejects SL-M via API)
+  gtt_sl_limit_offset_pct: 0.03  # SLICE2.5-P1: DEEP protective limit offset for a CNC OCO-GTT SL leg (3%); separate from the 0.5% intraday offset so an overnight gap-down still fills within the floor
+  emergency_exit_buffer_pct: 0.01  # FIX-181: emergency/kill exits use marketable LIMIT (LTP ± 1%) so they fill but cap worst-case slippage
+  leverage_map:             # OPERATIONAL -- routine values
+    INTRADAY: 5.0             # MIS leverage
+    COVER_ORDER: 6.0          # CO leverage
+    DELIVERY: 1.0             # CNC, no leverage -- PINNED to exactly 1.0 (UNIT 3a)
+    BRACKET_ORDER: 5.0        # BO leverage
+  leverage_safety:            # GOVERNANCE -- deliberate, reviewed, rarely touched.
+    min_allowed: 1.0          # 1x IS "no leverage"; nothing below it is meaningful.
+    max_allowed: 10.0         # INTERNAL safety ceiling. NOT a SEBI or broker limit.
+                              # Reuses the threshold config_auditor G2 already used
+                              # (`if value > 10`), so no new number is introduced.
+                              # Hard-bounded in code by ABSOLUTE_MAX_LEVERAGE (20.0).
+
+position_sizing:              # PS9
+  enabled: true               # Diary #4 tier-multiplier switch.
+                              #   true  = ON  = score-tier × perf-weight sizing (existing, unchanged)
+                              #   false = OFF = flat Rs per order (flat_value_rs below, MUST be set)
+  # flat_value_rs: 5000       # Diary #4: Rs/order when enabled=false. ONE MORE ceiling on top of
+                              #   risk/capital/concentration (those still bind). Uncomment + set to flip OFF.
+  risk_per_trade_pct: 0.01    # 1% of total capital at risk per trade (PS2)
+  max_concentration_pct: 0.10 # max 10% of total capital in one symbol (PS2)
+  min_qty_threshold: 1        # reject signal if final qty below this (PS6)
+  lot_skew_rejection_threshold: 0.25  # FIX-021: reject if (tiered-final)/tiered > 25%; skipped if lot_size=1
+  min_tick_size: 0.05         # FIX-041: reject if sl_distance < min_tick (penny stock guard)
+  max_single_order_qty: 10000 # FIX-041: sanity cap on computed qty (prevents qty explosion)
+  # force_qty -- TESTING VM ONLY (17-Sep-2026, Rama: "only with 1 Qty; [Not more than 1qty]").
+  # OVERRIDE, not a clamp: every sized signal gets exactly this qty; the risk / capital /
+  # concentration rungs and the tier x perf multiplier are BYPASSED (the SL-distance guard,
+  # lot rounding, output qty guard, position-value cap and minimum still run).
+  # Production and the repo: key ABSENT (= null = OFF).
+  force_qty: 1
+  # BUILD 1 (#2, 24-Jun): capital-relative catastrophic-loss / bug-guard.
+  # cap = max_position_value_pct × current capital, REJECT if qty*price exceeds it.
+  # Was a fixed ₹2500 (₹10k-era, scaling cliff at ~₹25k). 40% is intentionally
+  # loose — routine sizing is governed by concentration (10%) + risk (1%); this
+  # only fires on an anomaly. PERMANENT (capital-relative).
+  # TESTING VM ONLY (17-Sep-2026, Rama): 0.40 -> 0.50 with force_qty. Production and the repo keep 0.40.
+  max_position_value_pct: 0.50   # hard cap on qty*price as fraction of capital
+  tier_multipliers:           # PS5: applied after min(risk, capital, conc)
+    HIGH: 1.0                 # full size
+    MEDIUM: 0.70              # 70% of computed size
+    LOW: 0.50                 # 50% of computed size (audit Bug 5 fix)
+  dynamic_by_winrate: true    # FIX-133 Item 21: PerformanceAllocator weights applied to sizing
+  min_multiplier: 0.5         # floor: worst-performing strategy gets at least 50% qty
+  max_multiplier: 2.0         # cap: best-performing strategy gets at most 200% qty
+  # DELIVERY-scoped sizing limits -- EXPLICIT AND REQUIRED (22-Aug-2026, fix item 1).
+  # NOT a scaffold and NOT inert: the delivery (CNC) path IS live and HAS traded.
+  # CONTRACT: each key is REQUIRED and must be a number. A missing or null value is
+  # REJECTED at config load -- the boot logs the key name at CRITICAL and exits 5.
+  # There is NO inheritance from the intraday keys above: a positional (delivery)
+  # entry reads ONLY these, an intraday entry reads ONLY the global ones, so changing
+  # one book's number cannot move the other book's limit.
+  # The values below are TODAY'S EFFECTIVE VALUES -- the same numbers delivery was
+  # already inheriting -- so this change is behaviour-neutral by construction.
+  delivery_risk_per_trade_pct: 0.01       # = global risk_per_trade_pct today
+  delivery_max_concentration_pct: 0.10    # = global max_concentration_pct today
+  # MEASURED UNREACHABLE, recorded rather than hidden: this cap is a fraction of TOTAL
+  # capital (40%) while the whole positional bucket is 30% of TOTAL, and concentration
+  # binds at 10% first -- so it cannot bind on a delivery entry while the 70/30 split
+  # holds. It is set because the no-fallback contract admits no absent key.
+  # TESTING VM ONLY (17-Sep-2026, Rama): 0.40 -> 0.50 with force_qty. Production and the repo keep 0.40.
+  delivery_max_position_value_pct: 0.50   # = global max_position_value_pct today
+
+risk:                         # RE13 — portfolio-level pre-trade gate limits
+  # BUILD 1 (#3, 24-Jun): these base caps are now the SOLE authority in BOTH
+  # paper and live. The FIX-190 live_test_mode / live_test_max_* override fields
+  # were DELETED — they had been set EQUAL to these base caps (5/10) for parity,
+  # so the main.py swap was a no-op that only LOOKED active (misleading dead
+  # config). Active bug-hunting on live continues via these caps directly.
+  # #7 (BUILD 1): max_open_positions is the PORTFOLIO-wide cap. It binds
+  # alongside each strategy's own max_concurrent_positions (default 2, in the
+  # strategy YAMLs) — different scopes (global vs per-strategy), both apply.
+  # Working as intended; no conflict.
+  max_open_positions: 5       # [PERMANENT-ish] portfolio-wide cap on concurrent open positions (>= 1)
+  max_daily_trades: 10        # hard cap on entries per day (>= 1)
+  # NI-3 (22-Aug-2026): both lines below used to carry a clause saying they did nothing
+  # while force_intraday_only was true. See the commit diff for its exact wording -- it is
+  # NOT repeated here, because a stale claim quoted in place still reads as current.
+  # THE FACT TODAY: force_intraday_only is FALSE (:89), delivery_enabled is TRUE (:102),
+  # trade_type is BOTH (:96), and delivery has traded. Both caps are read on every
+  # delivery (CNC) entry and they reject it. The old clause was a true conditional with a
+  # false antecedent, which reads as "ignore me" -- the same hazard the delivery sizing
+  # comments carried until fix item 1.
+  # Deliberately TIGHTER than the intraday twins above (5 / 10): these are the delivery
+  # book's own caps, NOT copies of the global ones.
+  max_open_delivery_positions: 3  # SLICE2.5-PHASE-3 (A): cap on concurrent open DELIVERY (CNC) positions. ENFORCED.
+  max_daily_delivery_trades: 5    # SLICE2.5-PHASE-3 (A): cap on DELIVERY (CNC) entries per day. ENFORCED.
+  # 27-Jul-2026: one COMPLETED trade per symbol+DIRECTION per trading day.
+  # false (DEFAULT) = OFF, byte-identical to the pre-27-Jul path. true = a second
+  # entry on the same symbol in the same direction is rejected for the rest of the
+  # day (REJECTED_SYMBOL_DIRECTION_DAILY_LIMIT). Opposite direction ALWAYS allowed:
+  # a long exit followed by a short entry is a reversal, not a re-entry.
+  # 27-Jul EVENING: TURNED ON by Rama. Earliest LIVE = MON 3-Aug 08:15 (config loads
+  # at boot; the calendar's 5 split moved this OFF the Thu 30-Jul slot and onto the
+  # FRI 31-Jul evening slot, so the Thursday boot never carried it). It is ON from
+  # that boot onward -- there is no end date and no re-arming.
+  # 31-Jul-2026: date corrected. The line above previously read "FRI 31-Jul 08:15 /
+  # ships on the Thu 30-Jul evening slot" -- true when written on 27-Jul, made wrong
+  # by the split. Left uncorrected it would date the rule's first rejections a
+  # trading day EARLY, which is exactly what Mon 3-Aug's observation is read against.
+  # Evidence, stated honestly: the whole book holds only TWO re-entries, so this is a
+  # JUDGEMENT, not a measured optimum -- which is also why it is a hard one-per-day
+  # rule rather than a tuned time window (15/20/30/40 min all give the identical
+  # answer on this data). See docs/audit/senco_double_entry_27jul2026.md
+  one_trade_per_symbol_direction_per_day: true
+  # -- DELIVERY-scoped pre-trade gate limits (22-Aug-2026, fix item 1) -------------
+  # Same contract as the position_sizing delivery keys: REQUIRED, non-null, and NO
+  # inheritance from the global twin. A delivery (CNC) entry reads ONLY the delivery
+  # key; an intraday entry reads ONLY the global one. Enforced on bucket=='positional',
+  # the same 1:1 proxy the delivery COUNT caps above already use. Values below are
+  # today's effective values, so this is behaviour-neutral.
+  # SCOPE, stated so it is never over-read: delivery_daily_loss_limit_pct scopes the
+  # PRE-TRADE gate ONLY. The post-close portfolio circuit breaker in fund_manager stays
+  # GLOBAL -- one account-wide realized P&L exists and there is no per-book attribution
+  # to split it with. CONSECUTIVE_LOSSES likewise stays deliberately shared (no twin).
+  max_sector_exposure_pct: 0.40  # max 40% of total capital in one sector (> 0, <= 1)
+  delivery_max_sector_exposure_pct: 0.40  # delivery twin; = the global above today
+  max_consecutive_losses: 4      # halt after N consecutive losses (both modes)
+  daily_loss_limit_pct: 0.03  # BUILD 1 (#1): SOLE daily-loss authority (3% of capital), PERMANENT
+  delivery_daily_loss_limit_pct: 0.03  # delivery twin, PRE-TRADE gate only; = global today
+  # F1 (16-Jul): sector concentration cap (gate-8) mode. observe (DEFAULT) = gate-8 LOGS a
+  # would-reject (WOULD_REJECT) but does NOT reject → deploy is behaviour-neutral (trades.sector
+  # now fills; the 40% cap only logs). Flip to `enforce` ONLY after an observe soak (>=1 session)
+  # + Rama's EXPLICIT approval — this activates the live sector cap. Rollback = set back to observe.
+  sector_cap_mode: observe
+  sector_unknown_alert_pct: 0.20  # one-shot data-quality alert if > this fraction of inserted trades resolve to UNKNOWN sector
+  daily_loss_include_unrealized: false  # B-1 (02-Jul): SHADOW default — reconciler populates unrealized MTM + gate LOGS would_reject, but ENFORCES realized-only. Flip true to enforce realized+unrealized (validate first).
+  price_drift_threshold: 0.005  # FIX-075: 0.5% - trigger margin top-up if price drifts beyond this before placement
+
+webhook:                      # WR14 — HTTP server settings
+  bind_host: "0.0.0.0"        # 2026-04-27: bind all interfaces so the VM
+                              # can accept Chartink webhooks routed via
+                              # ngrok/external. Loopback-only (127.0.0.1)
+                              # is the safer default; the all-interfaces
+                              # bind here relies on require_hmac=true plus
+                              # firewall/security-group restrictions to
+                              # constrain the actual reachable surface.
+  bind_port: 5000             # port to listen on
+  require_hmac: false         # Chartink cannot sign payloads; use ?token= auth (WEBHOOK_SECRET required in BOTH modes as of C-2 02-Jul)
+  dedup_window_seconds: 300   # FIX-131 Item 17: 5-min fingerprint bucket (was 60s/1-min)
+  # C-2 (02-Jul-2026): per-source-IP rate limit (token bucket). Burst-tolerant for
+  # Chartink's open-bell burst (~40 signals from one IP); caps sustained flooding -> 429.
+  per_ip_rate_limit_enabled: true
+  per_ip_burst: 60
+  per_ip_refill_per_sec: 5.0
+
+signal_processor:             # SP15 — worker pool settings
+  worker_count: 5             # ThreadPoolExecutor workers (1-50)
+  drain_poll_sec: 0.1         # queue poll interval when empty
+  pipeline_timeout_sec: 30    # hard per-signal processing deadline
+  tgt_min_pct: 0.003          # BL-16: reject signal if target distance < 0.3% of entry
+  # FIX-190 (Bug G): entry throttle — prevents the 19-Jun 5-entries-in-5s burst.
+  min_gap_between_entries_sec: 20   # >=20s between any two PLACED entries (global)
+  entry_burst_window_sec: 60        # rolling burst window (global)
+  entry_burst_max: 3                # max 3 placed entries per 60s (0 = off)
+  per_symbol_cooldown_sec: 300      # Bug G (full): no re-entry of same symbol within 5 min
+
+kill_switch:                  # KS7 — auto-trip settings
+  api_failure_threshold: 3    # consecutive API failures before auto soft_kill (>= 1)
+  enable_auto_trip: true      # if false, record_api_failure never triggers soft_kill
+
+eod_squareoff:                # EOD12 — EOD square-off settings
+  inter_order_delay_ms: 500   # ms delay between successive MARKET exit orders (>= 0, <= 5000)
+  poll_interval_sec: 5        # scheduler poll cadence; passed to start_polling() (>= 1)
+  auto_resume_kill_switch: true  # if true, resume SOFT_KILL after EOD fire completes
+  exit_protocol: "LIMIT_THEN_MARKET"  # Audit 3.3 — aggressive LIMIT, MARKET fallback
+  limit_aggressive_pct: 0.01  # LTP ± 1% for the initial exit limit
+  limit_grace_sec: 120        # seconds to wait before promoting unfilled LIMITs to MARKET
+  # ⚠️⚠️ UNITS: the two values below are PERCENTAGES. 1.5 means 1.5%.
+  # limit_aggressive_pct above is a FRACTION (0.01 == 1%). These are NOT -- hence
+  # "_percent", not "_pct". Config load REFUSES anything outside [0.1, 10.0], so a
+  # fraction-style 0.015 fails at BOOT rather than at 15:03.
+  # Rama 10-Sep-2026, from the measured Population B coverage table (n=289).
+  # ⚠️ Historical adverse-excursion coverage is NOT a guaranteed fill.
+  mis_pass_1_market_protection_percent: 1.5   # PASS_1 (15:03) band, PERCENT
+  mis_pass_2_market_protection_percent: 2.5   # PASS_2 (15:06) band, PERCENT
+
+alerts:                       # TG12/AW11 — alert subsystem settings
+  failed_alerts_log_path: "logs/failed_alerts.log"
+  sentinel_dir: "data_store"
+  watcher_max_attempts: 5
+  alert_digest_threshold: 3   # FIX-095: send digest email when pending flags > this count
+  watcher_lock_path: "data_store/alert_watcher.lock"
+  watcher_log_path: "logs/alert_watcher.log"
+  telegram:
+    enabled: true               # TASK-10: master ON/OFF switch. Set false to suppress ALL Telegram alerts (silent)
+    bot_token_env: "TELEGRAM_BOT_TOKEN"
+    telegram_alerts_in_paper_mode: true
+    max_retries: 3              # FIX-131 Item 18: retry attempts per channel
+    retry_backoff_seconds: 2.0  # FIX-131 Item 18: seconds between retries
+    rate_limit_per_minute: 20   # FIX-131 Item 18: max Telegram messages/minute
+    send_deadline_seconds: 8    # M-A2: hard wall-clock cap on ONE send(), shared across
+                                # channels. Alert sends are synchronous on live threads
+                                # (signal_processor emits before order placement), so a
+                                # hung endpoint must not hold them. null = unbounded.
+                                # *** 30 -> 8 on 25-Jul-2026. *** 30 sat ABOVE the measured
+                                # ~26 s ladder ((3+1)x5 + 3x2, one channel enabled), so on
+                                # the very case this bound exists for it barely bound - it
+                                # clipped ~4 s off a stall the ORDER PATH cannot afford
+                                # (the alert fires BEFORE placement, capital already
+                                # reserved, the FIX-067/M-S1 re-anchored price going stale).
+                                # 8 = one full HTTP attempt (timeout_sec 5) + one backoff
+                                # (2) + ~1 s margin => TWO delivery attempts on a hung
+                                # endpoint (5 s, then 1 s clamped to the remainder).
+                                # SAFE because TG5 writes the CRITICAL sentinel BEFORE any
+                                # HTTP: the deadline discards a delivery ATTEMPT, never a
+                                # warning. A healthy send is untouched (answers in ms).
+                                # WARNING: if TELEGRAM_CHANNEL_SECONDARY is ever enabled
+                                # the ladder doubles to ~52 s and this budget is SHARED
+                                # across channels, so channel 2 would get little or none -
+                                # decide the two together. TUNE HERE, no code change.
+                                # (ASCII only in this file: several tests read it with the
+                                # platform default encoding - see the encoding fix.)
+    channels:
+      - chat_id_env: "TELEGRAM_CHANNEL_PRIMARY"
+        label: "Primary Alert Channel"
+        enabled: true
+      - chat_id_env: "TELEGRAM_CHANNEL_SECONDARY"
+        label: "Secondary Alert Channel"
+        enabled: false
+    personal_chat_id_env: "TELEGRAM_PERSONAL_CHAT_ID"
+    whitelist_only: true
+  email_fallback:               # FIX-132 Item 10: email when Telegram fails for CRITICAL
+    # *** 25-Jul-2026 -- READ THIS BEFORE TRUSTING `enabled: true`. THIS PATH IS
+    # INERT IN PRODUCTION. *** The three env vars named below are ABSENT from the
+    # VM .env (absent, not empty), so _send_email_fallback() logs
+    # `email_fallback.missing_credentials` and returns False before any socket op.
+    # MEASURED: that WARNING has fired 7 times in production.
+    # *** THE OUT-OF-BAND PATH THAT ACTUALLY DELIVERS IS alert_watcher *** -- a
+    # separate mechanism, `alerts.smtp` below, using a DIFFERENT credential
+    # (ALERT_SMTP_PASSWORD, which IS set). It is a live systemd service and has
+    # delivered 82 CRITICALs; verified end-to-end 25-Jul.
+    # *** DELIBERATELY LEFT `true` rather than flipped to `false`: *** `true` is
+    # the honest statement of INTENT (this fallback is wanted), and flipping it
+    # would make _send_email_fallback return at the first check -- silencing the
+    # missing_credentials WARNING, i.e. removing the only runtime evidence that
+    # the path is dead. Silently-disabled is worse than loudly-inert.
+    # TO ACTIVATE: set ALERT_EMAIL_USER / _PASSWORD / _TO in the VM .env. No code
+    # change needed. See docs/audit/out_of_band_alert_path_verified_25jul2026.md.
+    enabled: true
+    smtp_host: "smtp.gmail.com"
+    smtp_port: 587
+    from_addr_env: "ALERT_EMAIL_USER"      # env var holding from address
+    password_env: "ALERT_EMAIL_PASSWORD"    # env var holding app password
+    to_addr_env: "ALERT_EMAIL_TO"           # env var holding recipient address
+    use_tls: true
+  smtp:
+    host: "smtp.gmail.com"
+    port: 587
+    use_tls: true
+    username: "sandboxpythonsystemalerts@gmail.com"
+    # G.3 (2026-04-25): password is read from the env var named here at
+    # alert_watcher boot. Plaintext `password:` field is no longer set in
+    # this committed config; if you need it for local-only testing, override
+    # it in a non-committed config_overrides file. Production: set
+    # ALERT_SMTP_PASSWORD on the alert_watcher host (systemd EnvironmentFile
+    # or the user shell rc).
+    password_env: "ALERT_SMTP_PASSWORD"
+    from_address: "sandboxpythonsystemalerts@gmail.com"
+    to_addresses:
+      - "sandboxpythonsystemalerts@gmail.com"
+    timeout_sec: 30
+
+logging:                      # FIX-099 — logging subsystem settings
+  min_free_disk_gb: 2.0       # Minimum free disk space (GB) required before startup
+
+order_reconciler:             # RC17 — reconciler tuning
+  poll_interval_sec: 15       # P14: 15-second periodic cadence
+  capital_drift_tolerance: 50.0  # Production threshold (out-of-session / overnight)
+  capital_drift_tolerance_pct: 0.10  # FIX-190 (Bug I): in-session tolerance = max(Rs, expected*10%) to silence normal deployed-capital drift during trading
+  human_order_margin_tolerance: 5000.0  # FIX-182: extra Rs allowance when human/untracked orders present
+  capital_drift_alert_interval_sec: 1800  # TASK-11: min seconds between repeat CAPITAL_DRIFT alerts (30 min)
+  stuck_exiting_timeout_minutes: 30  # Task 4: resolve trades stuck in EXITING (HARD_KILL died mid-exit) older than this — flat->CLOSED_MANUAL, still-held->OPEN
+  check1_mid_fill_defer_sec: 0.0  # Section D: SECONDS CHECK1 defers finalizing when the broker refuses our orphan-leg cancel with "being processed" (= one of OUR OWN legs is filling, so our fill callback owns the close). 0.0 = OFF = pre-Section-D behaviour exactly. On expiry it finalizes anyway and logs "DEFERRAL EXPIRED UNRESOLVED". Seconds, not cycles: a cycle count is a proxy that changes meaning if poll_interval_sec is retuned.
+
+eod_reconcile:                 # P1 (02-Jul) — broker-authoritative EOD reconcile (scripts/eod_broker_reconcile.py @15:58)
+  authoritative: false        # SHADOW default: P1 runs alongside eod_verify, writes its verdict + shadow comparison, alerts INFO, gates nothing. Flip true (after shadow observation) to make P1 authoritative + retire eod_verify.
+  pnl_tolerance: 100.0        # Rs band on broker-day-realized vs local realized before the P&L dimension is ISSUES
+
+eod_cleanup:                  # 15-Jul-2026 — EOD hygiene prune (scripts/eod_cleanup.py step 4 @15:50)
+  signal_retention_days: 90   # keep-window (days) for terminal NOISE fingerprints (EXPIRED/DUPLICATE/REJECTED_*);
+                              # older ones are DROPPED children-first (FK-safe, batched). Trade-linked signals are
+                              # NEVER pruned (capital-safety guard). Tunable — lower for a one-time backlog clear.
+
+tgt_retry:                    # Task (2026-06-19): standalone TGT retry — re-place a TGT left unplaced by FIX-190 Bug C (SL still protects)
+  enabled: true
+  poll_interval_sec: 30       # retry loop cadence
+  max_attempts: 5             # give up after 5 (position stays SL-protected)
+  backoff_base_sec: 30        # nth retry waits base*2**(n-1): 30/60/120/240/480s
+
+shadow_tracker:               # SH11 — multi-inning tracking (Concern 4)
+  # ⛔ DISABLED 25-Jul-2026 — CONFIG ONLY, the component is deliberately LEFT INTACT.
+  # It becomes correct the day the live tick→candle path is wired; this is a switch,
+  # not a removal. WHY: innings 2-3 are watched via live ticks (SH5/SH6), and nothing
+  # has ever subscribed to the WebSocket (docs/audit/tick_candle_dormancy_25jul2026.md
+  # — 32 connects, 0 tokens, 0 ticks ever). So it did not fail quietly, it FABRICATED:
+  # 141 simulated innings, exit_reason SL=0 / TGT=0 / EOD=130 / NULL=11, and
+  # exit_price == entry_price on 130/130 with pnl_pct exactly 0.0 (real innings:
+  # 1/181 and 180 non-zero), because the EOD close falls back to entry_price when
+  # _last_price was never tick-populated. Zero inning-3 rows ever: the cascade needs
+  # SL/TGT, which only ticks can produce.
+  # RE-ENABLE ONLY once ticks actually flow; nothing else is required.
+  enabled: false              # SH13: false = all handlers no-ops; table stays empty
+  max_innings: 3              # SH4: total innings (1 real + up to 2 simulated)
+  alert_per_inning: true      # SH7: send Telegram INFO on each inning close
+
+sr_detector:                  # SNR-DETECTOR-V1 — shadow support/resistance detector
+  enabled: true               # ★ SNR-V1 shadow ARMED — committed true 28-Jun (durability > the old repo-default-false/safe-revert). Master flag (paper+live); false = not constructed
+  timeframes: ["day", "60minute", "30minute"]  # structure TFs (one historical fetch each)
+  lookback_days: 180          # 6 months back (fits one request per interval)
+  cache_ttl_sec: 1800         # intra-session (symbol, interval) re-fetch suppression
+  default_pivot_n: 5          # swing-pivot N bars each side (per-TF override: pivot_n_by_tf)
+  cluster_pct: 0.5            # pivots within this % cluster into one zone band
+  merge_pct: 0.4              # zones within this % merge across timeframes
+  band_buffer_pct: 0.1        # proximity buffer when testing a level against a band
+  entry_proximity_pct: 1.0    # entry within this % of a HIGH zone → "into" it
+  volume_surge_mult: 1.5      # breakout volume must exceed this × avg for confirmation
+  # confluence weights + HIGH/MEDIUM thresholds (tuned during the visual-review phase)
+  w_swing: 1.0
+  w_volume: 1.0
+  w_multi_tf: 1.0
+  w_prior_day: 1.0
+  w_round: 0.5
+  w_recency: 0.5
+  t_high: 5.0                 # HIGH needs score≥t_high AND ≥2 method-types AND ≥2 TFs
+  t_med: 3.0
+  # ── SNR-V2 Phase A: WAIT_FOR_RETEST entry side — SYMMETRIC LONG+SHORT (DORMANT — master flag off) ──
+  wait_for_retest_enabled: false   # ★ Phase A master flag (paper+live). false = divert never fires; zero pipeline change
+  near_zone_buffer_pct: 0.3        # entry counts as "inside" a zone (resistance=LONG / support=SHORT) within this %
+  require_confidence: HIGH         # only HIGH-confidence zones divert (both sides)
+  retest_timeout_sec: 1800         # N — give up the wait (tune)
+  retest_max_away_pct: 1.0         # X — wrong-way reject: 1m close >this% past the band (LONG below band_low / SHORT above band_high)
+  confirm_strong_close_frac: 0.6   # confirm close must be in the strong 60% of the 1m candle (upper=LONG / lower=SHORT)
+  breakout_margin_pct: 0.0         # 1m close must clear the band by this % (0 = any close past); LONG above band_high / SHORT below band_low
+  onem_lookback_days: 2            # SHORT 1m fetch window (respects the Zerodha minute cap)
+  zone_cache_ttl_sec: 1800         # ZoneCache TTL (warm structure zones for the divert check)
+  zone_rewarm_margin_sec: 300      # re-warm a cached symbol this long before its TTL expiry
+  retest_poll_interval_sec: 20     # RetestMonitor 1m poll cadence
+  sl_buffer_pct: 0.2               # structure SL beyond the broken level by this % (LONG below band_low / SHORT above band_high)
+  # ── V3 03.01 Layer-A intraday anchors (VWAP + ORB) — DEFAULT-OFF (validate first) ──
+  intraday_anchors_enabled: false  # ★ master gate. false = no extra fine fetch, shadow row byte-identical. Flip true AFTER the sr_level_export manual-marking validation passes
+  anchor_intraday_interval: 5minute  # fine TF for VWAP/ORB (5minute/15minute/30minute)
+  anchor_lookback_days: 1          # today-only window for the fine fetch
+  orb_window_minutes: 15           # opening-range window (original scanner convention)
+
+regime:                       # V3 03.02 — index-level Market Regime engine (SHADOW, gates nothing)
+  enabled: false              # ★ master gate (paper+live). false = not constructed/run; zero pipeline change. Regime is a PREFERENCE; extreme_flag NOT wired to stop trading yet
+  index_symbol: "NIFTY 50"    # spot index (NOT in the instrument cache → fetched by index_token via the existing OHLC closure)
+  index_token: 256265         # NIFTY 50 Kite instrument_token (VERIFY live historical access on the VM before flipping enabled)
+  daily_lookback_days: 400    # enough for EMA200 + swing structure
+  intraday_interval: 5minute  # for day-type (5minute/15minute/30minute)
+  intraday_lookback_days: 1
+  ema_fast: 50
+  ema_slow: 200
+  adx_period: 14
+  adx_trend_threshold: 25.0
+  atr_period: 14
+  vol_high_ratio: 1.3         # cur ATR / baseline TR ≥ this → HIGH vol; ≤ vol_low_ratio → LOW
+  vol_low_ratio: 0.7
+  trend_day_range_atr_mult: 1.5
+  compute_interval_sec: 60.0  # shadow-runner cadence
+
+portfolio_allocator:         # V3 03.05 — ranked batch admission (default-OFF; FCFS byte-identical while off)
+  allocator_mode: "shadow"   # ★ master gate (paper+live): off | shadow | enforce. SHADOW 12-Jul: non-blocking regret observer alongside live FCFS (NEVER reserves/places → LIVE admission BYTE-IDENTICAL). enforce is gated on ≥5 shadow sessions + regret review + Rama + an off-market cutover
+  enforce_scope: "v3_only"   # v3_only | all — v3_only governs ONLY V3-playbook strategies (none exist yet → enforce governs nothing even if flipped); all = every scanner
+  candle_interval_seconds: 60.0  # wall-clock window alignment (NOT candle_store); short vs the 60s signal expiry
+  drain_tail_seconds: 2.0    # collect this long after each boundary before ranking
+  max_portfolio_deployment_pct: null  # A3 shared concentration cap (deployed-margin %). null = INERT (no-op). Composes with the per-sector 0.40 cap; does NOT touch risk_engine gate 8
+  long_short_skew_max: null  # A6 directional-skew cap (max fraction one side). null = INERT
+  regret_log_path: "data_store/allocator/regret.jsonl"  # shadow regret rows (JSONL, created on first write)
+
+v3_chain:                     # V3 Step 10 — decision-chain SHADOW enrichment (default-OFF; byte-identical while off)
+  v3_chain_mode: "shadow"        # ★ master gate (paper+live): off | shadow. off = V3ChainRunner NOT constructed → v3_chain=None → hot-path hook is a skipped flag check (BYTE-IDENTICAL). shadow = fire-and-forget background enrichment; the V3 verdict is LOG-ONLY (never rejects/delays/alters a live order). BINARY — no enforce in 10a
+  # gate knobs (spec §3) — ALL SEEDS to be calibrated from shadow data
+  atr30_period: 14            # ATR(30m) period for the G-RR SL buffer (distinct from regime.atr_period)
+  rr_floor: 2.0               # G-RR: R:R must be >= this
+  sl_buffer_atr_mult: 0.20    # G-RR SL buffer = this × ATR30
+  htf_ema_period: 20          # G-HTF + htf_alignment: 1h EMA period
+  htf_swing_pivot_n: 3        # G-HTF + htf_alignment: 1h swing-pivot N each side
+  # 10b PLAYBOOK gate knobs (spec §3; PB-01 G-CONFIRM/G-PULLBACK) — ALL SEEDS
+  confirm_min_body_frac: 0.50       # G-CONFIRM: |close-open|/(high-low) >= this (rejects dojis)
+  confirm_volume_mult: 1.20         # G-CONFIRM: 5m volume >= this × baseline_5m_volume
+  baseline_candles_per_session: 75  # baseline_5m_volume = SMA20(daily volume) / this
+  pullback_proximity_pct: 0.005     # G-PULLBACK TOUCHED: within max(this×LEVEL, atr_mult×ATR30)
+  pullback_proximity_atr_mult: 0.50
+  hold_buffer_atr_mult: 0.20        # G-PULLBACK HELD: 5m CLOSE below (LEVEL - this×ATR30) → INVALIDATED
+  retest_quality_atr_span: 0.75     # retest_quality = max(0, 1 - |dist|/this)
+  level_touches_cap: 5              # level_significance = min(touches, this) / this
+  # 3-layer score weights (spec §4) — Playbook 40, Context 40, Execution 20
+  w_retest_quality: 15.0
+  w_confirmation_strength: 15.0
+  w_level_significance: 10.0
+  w_regime_preference: 8.0
+  w_sr_target_quality: 8.0
+  w_htf_alignment: 8.0        # CONFLUENCE GROUP {1h-EMA-position, 1h-swing-structure}
+  w_sector_strength: 8.0
+  w_momentum_position: 8.0    # CONFLUENCE GROUP {rsi_range, vwap_position}
+  exec_budget: 20.0           # Execution layer budget; the 4 exec steps rescale by (20/35)
+  w_exec_volume_surge: 15.0
+  w_exec_atr: 10.0
+  w_exec_time_of_day: 5.0
+  w_exec_spread: 5.0
+  confluence_combine: "mean"  # mean | max — grouped correlated factors combine to ONE bounded value (anti-inflation)
+  sr_target_quality_high: 1.0
+  sr_target_quality_medium: 0.6
+  sr_target_quality_low: 0.3
+  # 3-layer thresholds (forward-compat; 10a records the score, does NOT gate on it) — SEEDS
+  min_pass_score: 60
+  medium_score_threshold: 65
+  high_score_threshold: 80
+  # async worker / fetch (reuses the sr_detector rate-limited closure; truncates to signal time)
+  structure_intervals: ["day", "60minute", "30minute"]
+  fetch_lookback_days: 180
+  fetch_cache_ttl_sec: 1800.0   # own OhlcFetcher cache TTL (distinct from sr_detector.cache_ttl_sec)
+  max_queue: 512
+  would_be_log_path: "data_store/v3/would_be.jsonl"
+
+watchlist:                    # V3 Step 10b — PB-01 overnight watchlist + next-morning entry stage (default-OFF; byte-identical while off)
+  enabled: true              # ★ master gate (paper+live): false = capture worker + entry-stage monitor NOT constructed → an EOD webhook is captured to nothing (BYTE-IDENTICAL). ANALYSIS ONLY — no position/capital/CNC/GTT; PB-01 stays enabled:false (fail-closed) regardless
+  playbook_scanner: "pb01_breakout_retest"   # the eod scanner this watchlist owns (→ the pb01_breakout_retest strategy)
+  # capture (EOD, day D) — ALL SEEDS
+  level_lookback_sessions: 20       # LEVEL = highest daily HIGH of the N sessions BEFORE the breakout day
+  capture_fetch_lookback_days: 60   # how far back to fetch daily candles to compute LEVEL (calendar days)
+  # next-morning entry stage (day D+1) — ALL SEEDS (calibrate: when do retests confirm?)
+  entry_start: "09:20"        # first 5-min candle must CLOSE before any confirmation (spec §7)
+  entry_end: "11:00"          # next-morning retest thesis expired by mid-morning
+  entry_tf: "5minute"         # retest timeframe (built via candle_math.resample)
+  gap_guard_pct: 0.03         # SKIPPED_GAP if open > LEVEL × (1 + this)
+  poll_interval_sec: 20.0     # entry-stage candle poll cadence (off the hot path)
+  would_be_log_path: "data_store/v3/pb01_would_be.jsonl"   # PB-01 SHADOW would-be records (LOG-ONLY, NO order; SEPARATE from the 10a would_be.jsonl)
+
+structure_exit:               # SNR-V2 Phase B — structure-aware exit (trail SL to structure + confirmed-break exit), MIS LIMIT_TRIPLE only
+  structure_exit_enabled: false    # ★ MASTER flag (paper+live). false = StructureExitManager not constructed; zero pipeline change. Single SL owner — do NOT co-enable strategy.trailing_sl_enabled
+  sl_buffer_pct: 0.2               # SL-to-structure buffer (LONG below support.band_low / SHORT above resistance.band_high) — match Phase A
+  break_buffer_pct: 0.0            # extra margin beyond the band for a confirmed break (0 = any close past)
+  require_strong_close: true       # decision (c) — a break requires a strong close (LONG strong-low / SHORT strong-high)
+  break_strong_close_frac: 0.6     # adverse-frac threshold for the break close (in [0,1])
+  min_zone_confidence: HIGH        # decision (b) — only HIGH-confidence zones drive trail/break
+
+smart_tgt:                    # BL-7b: SmartTgtManager deployment-wide defaults
+  enabled: true               # master switch; if false, OrderPlacer skips SmartTgt wiring
+  trigger_pct: 0.005          # arm trailing once price moves this fraction toward target (0.5%)
+  step_pct: 0.003             # trail step size once armed (0.3%)
+  volume_dependent_trails: false  # FIX-026: master kill-switch for volume/VWAP-based trail logic
+  max_modify_failures: 3         # FIX-142: CRITICAL alert after this many consecutive modify failures
+
+entry_gate:                   # FIX-025: gate release slippage protection
+  slippage_buffer: 2.0        # Rs buffer for limit price adjustment at gate release
+  # #5 (BUILD 1): max_entry_slippage_pct and slippage_control are TWO DIFFERENT,
+  # complementary guards — keep both. max_entry_slippage_pct is a coarse %-of-price
+  # abort (FIX-128); slippage_control (below) is the finer SL-fraction/tiered
+  # budget guard. slippage_control.also_apply_pct_check keeps this %-check live
+  # alongside it (belt + suspenders).
+  max_entry_slippage_pct: 1.0 # FIX-128: abort if current LTP deviates > 1% from signal trigger price
+  max_spread_pct: 0.5         # FIX-134 Item 38: max bid-ask spread % for liquidity check
+  min_depth_qty: 500          # FIX-134 Item 38: min depth quantity at best price
+  liquidity_check_enabled: true  # FIX-134 Item 38: enable/disable liquidity check
+  min_effective_rr: 1.0       # FIX-136 Item 54: abort if R:R < 1.0 after slippage
+  min_pending_rr: 1.0         # FIX-141: cancel pending entry if remaining R:R drops below this (0=disabled)
+  circuit_proximity_reject_enabled: true  # NOCIL fix (22-Jun): reject entries sitting at/beyond the circuit-band exit ceiling (no profitable TGT or valid SL fits the band). Fast-disable lever — set false to admit as before (the post-fill placeability gate is the always-on core safety net).
+  # Entry-slippage abort (pre-order guard). Aborts if |LTP - signal trigger| > tolerance.
+  # mode=sl_fraction (DEFAULT): tolerance = min(SL_distance x max_slippage_fraction, absolute_cap_rs)
+  #   -> auto-scales with price AND strategy SL%; caps how much of the risk budget slippage eats.
+  #   (SL is fixed/signal-based, TGT recalcs from fill (FIX-013), so slippage directly inflates risk.)
+  # Calibrate via max_slippage_fraction + absolute_cap_rs; check entry_slippage_observed logs
+  # (fraction_of_sl_used). Restart to apply. flat_tiers/pct modes kept for A/B.
+  slippage_control:
+    enabled: true
+    mode: sl_fraction              # sl_fraction | flat_tiers | pct
+    max_slippage_fraction: 0.22    # sl_fraction: slippage <= 22% of the SL distance
+    absolute_cap_rs: 5.00          # sl_fraction: hard backstop (smaller of the two wins)
+    hard_max_slippage_rs: 10.0     # absolute ceiling, ALWAYS applied (any mode)
+    also_apply_pct_check: true     # also keep the flat max_entry_slippage_pct (belt + suspenders)
+    # --- flat_tiers mode (today's build, kept for A/B) ---
+    default_max_slippage_rs: 2.00
+    tiers:
+      - { max_price: 100,    max_slippage_rs: 1.00 }   # < Rs 100
+      - { max_price: 200,    max_slippage_rs: 1.25 }   # Rs 100-200
+      - { max_price: 500,    max_slippage_rs: 2.00 }   # Rs 200-500
+      - { max_price: 999999, max_slippage_rs: 3.00 }   # > Rs 500
+    # --- Phase 3a: MANUAL tolerance override hierarchy (sl_fraction mode only) ---
+    # Effective fraction resolves MOST-SPECIFIC-WINS:
+    #   by_symbol > by_strategy > by_price_band > max_slippage_fraction (global 0.22).
+    # All maps OPTIONAL and start EMPTY (except the one example band) -> behave as the
+    # global 0.22 until you add an override. Fractions must be in (0, 1]; values that
+    # look extreme (<0.05 or >0.50) or by_symbol/by_strategy typos are WARNED at startup.
+    # Restart to apply. The chosen rule is logged per entry + recorded on the trade
+    # (tolerance_source) so you can SEE which override applied.
+    overrides:
+      enabled: true
+      # ALL maps start EMPTY -> pure global 0.22 baseline everywhere (clean data
+      # collection first; add overrides later from real evidence). Resolution is
+      # most-specific-wins: by_symbol > by_strategy > by_price_band > global.
+      # Price-band keys MUST match a label in `slippage_bands` (below). Lower % spreads
+      # are wider on cheap stocks -> a tighter fraction there is the typical first move.
+      by_price_band: {}
+        # "0-100": 0.18       # tighter for low-price (wide %-spread) names
+        # "100-200": 0.20
+      # Strategy keys MUST match a loaded strategy name (e.g. gap_fade, vwap_bounce).
+      by_strategy: {}
+        # gap_fade: 0.25      # looser — gap strategies enter into momentum
+        # vwap_bounce: 0.18   # tighter — mean-reversion needs a clean fill
+      # Symbol keys MUST match a tradable instrument (NSE symbol). Most specific — wins
+      # over everything. Use for known-volatile or known-liquid names.
+      by_symbol: {}
+        # IDEA: 0.15          # volatile low-price -> very tight
+        # RELIANCE: 0.30      # liquid large-cap -> can allow a little more
+
+# Price bands for the slippage-intelligence layer (trade_slippage_log.price_band, v31).
+# Grouping labels only; re-band freely (e.g. 0-50, 50-150, ...). "Nnn+" = open-ended top.
+slippage_bands:
+  - "0-100"
+  - "100-200"
+  - "200-300"
+  - "300-500"
+  - "500-1000"
+  - "1000+"
+
+paper:                        # H-20/ZA16a: paper-mode fill synthesis
+  auto_fill_delay_sec: 0.5    # daemon thread delay before OSM COMPLETE + OrderFilled (>= 0, <= 10)
+  ltp_gating_enabled: true    # Audit 6.2 — only fill paper LIMIT/SL when LTP crosses
+  ltp_gating_max_wait_sec: 21600 # 6h — covers full trading day (9:15-15:30); exit orders need hours
+  ltp_gating_poll_sec: 5.0    # 5s cadence keeps ~30 exit threads at ~6 LTP fetches/sec total
+
+drift_handler:                # BL-2: capital drift escalation
+  log_only_threshold_rs: 250.0      # Production threshold
+  soft_kill_threshold_rs: 1000.0    # Production threshold
+  hard_kill_threshold_rs: 2500.0    # Production threshold
+  consecutive_cycles_before_escalate: 3
+
+strategy_circuit_breaker:     # FIX-130 (Item 6): intraday strategy circuit breaker
+  enabled: true
+  loss_multiplier: 2.0       # pause if daily loss > 2x avg daily loss
+  cutoff_time: "12:00"       # don't pause after 12:00 IST
+  lookback_days: 10          # days of history to compute avg_daily_loss
+
+circuit_breaker:              # FIX-128 (Fix C): position-level circuit breaker
+  partial_fill_timeout_minutes: 5   # cancel stuck PARTIAL-fill entry orders after this many minutes
+  force_close_time: "15:15"         # force-cancel all pending entries + close all positions at this IST time
+  max_api_failures: 3               # consecutive broker API errors before HARD_KILL
+
+live_feed:                        # FIX-134 Item 37: WebSocket reconnect hardening
+  max_reconnect_attempts: 10      # after this many consecutive failures, trigger SOFT_KILL
+  reconnect_backoff_base_seconds: 1
+  reconnect_backoff_max_seconds: 30
+
+fno_ban:                          # FIX-136 Item 44 + 22-Jun endpoint fix: F&O ban list fetch
+  url: "https://nsearchives.nseindia.com/content/fo/fo_secban.csv"   # NSE Clearing daily secban CSV
+  fail_closed: false              # FAIL-OPEN: ban-fetch failure does NOT block NSE-EQ; WARN only
+
+# FIX-D: Scanner connectivity check settings
+scanner_check_delay_sec: 5.0  # Delay before scanner checks (network stabilization at startup)
+sr_shadow:                    # S&R SHADOW CONTRACT v1.3 — LOG-ONLY structural shadow (sr_shadow/). GATES NOTHING.
+  # Contract: docs/design/secondary_filteration/sr-gate/AUTHORITATIVE_SR_SHADOW_CONTRACT_v1.3.txt
+  # TESTING VM ONLY (v1.3 addendum R12, 15-Sep-2026). Writes data_store/sr_shadow/sr_shadow.db only.
+  enabled: true               # master flag (paper+live); false = not constructed, sr_shadow=None, zero pipeline change
+  # ── CALIBRATION register (v1.2 §11) — the contract's values; NOT tuned during the measurement period ──
+  pivot_window: 2
+  cluster_width_pct: 0.50       # PERCENT (0.50 == 0.50%)
+  cluster_total_cap_pct: 1.00   # PERCENT (1.00 == 1.00%)
+  rejection_ratio_min: 0.50
+  flip_closes_required: 1
+  history_coverage_diagnostic_split_years: 3
+  buffer_slabs:                 # §6.5 step function; NOT the entry-slippage allowance (no shared key/value/code)
+    - {upper: 100, pct: 1.00}
+    - {upper: 200, pct: 0.90}
+    - {upper: 300, pct: 0.80}
+    - {upper: 450, pct: 0.75}
+    - {upper: 600, pct: 0.70}
+    - {upper: 800, pct: 0.65}
+    - {upper: 1100, pct: 0.55}
+    - {upper: null, pct: 0.45}
+  # ── worker plumbing (not model parameters) ──
+  worker_poll_interval_sec: 2.0
+  worker_max_attempts: 5
+  worker_retry_backoff_sec: 60.0
+

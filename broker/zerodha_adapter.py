@@ -1,0 +1,2520 @@
+"""
+broker/zerodha_adapter.py -- Trading System v2
+
+Purpose:
+    Single point of contact with the Zerodha kiteconnect SDK.
+    No other module in the codebase imports kiteconnect directly.
+    Provides a typed, testable interface over the raw kite API.
+
+Locked Design Decisions:
+    ZA1  -- Wraps kiteconnect.KiteConnect (injected). No direct kiteconnect
+            import anywhere else in the codebase.
+    ZA2  -- Methods: place_order, cancel_order, modify_order,
+            get_order_history, get_positions, get_margins, get_quote.
+            All return frozen dataclasses defined in this module.
+    ZA3  -- rate_limiter.acquire(category) called AFTER validation,
+            BEFORE every kite API call. Category map locked in ZA3.
+    ZA4  -- product_resolver.resolve(intent, "zerodha") called in
+            place_order to obtain broker product code.
+    ZA5  -- Exception translation: kite exceptions -> system exceptions.
+    ZA6  -- OrderRejectedError context: symbol, side, qty, price, intent,
+            broker_code, rejection_reason, kite_status_code.
+    ZA7  -- place_order calls new_order_id() and registers with state_machine
+            in PENDING. Success -> SUBMITTED; exception -> FAILED.
+    ZA8  -- State machine transitions on place_order only (ZA7).
+            cancel_order does NOT auto-transition (caller's responsibility).
+    ZA9  -- Logging: method entry/exit at INFO; exceptions via log_exception.
+    ZA10 -- paper_mode=True: simulate all calls, never touch kite.
+    ZA11 -- Adapter does NOT retry. Single attempt, raise and exit.
+    ZA12 -- timeout passed to kiteconnect at construction as read_sec.
+    ZA13 -- Input validation before rate_limiter.acquire.
+    ZA14 -- Layer 3. Imports: kiteconnect, stdlib, core.*, broker layer 2.
+    ZA15 -- kiteconnect>=5.1.0 installed in venv.
+    ZA16 -- Adapter does NOT publish events (state machine does via OSM7).
+            [LIVE MODE ONLY -- see ZA16a for the paper-mode carve-out.]
+    ZA16a -- Paper-mode exception (H-20): in paper mode the adapter
+            synthesizes BOTH the OSM SUBMITTED->COMPLETE transition AND
+            the OrderFilled event publish, after a configurable delay.
+            This is the ONE place the adapter publishes to the event bus.
+
+            Rationale: paper mode mocks the entire broker + polling
+            surface. There is no kite broker to return fill history and
+            no order_monitor poll loop to drive OrderFilled. If the
+            adapter did not synthesize the fill, paper mode would sit
+            at SUBMITTED forever and the downstream pipeline
+            (commit_to_used, close_trade, release_used, PositionClosed,
+            shadow_tracker) would be silently untested. Pre-H-20 this
+            made paper trials a false-positive green: the first leg
+            placed and nothing downstream ever ran.
+
+            Mechanics: _paper_place_order spawns a daemon thread that
+            sleeps PaperConfig.auto_fill_delay_sec (default 0.5s),
+            transitions OSM SUBMITTED->COMPLETE, then publishes
+            OrderFilled with avg_fill_price = the limit price (slippage
+            0). Delay mimics real broker fill latency.
+
+            Live mode remains unchanged: order_monitor polls the real
+            broker, detects COMPLETE, transitions OSM, and publishes
+            OrderFilled as specified by OM1/OM6.
+
+            Guard: the synth path fires ONLY when self._paper is True
+            AND self._bus is not None. Live mode never takes this
+            branch; any future refactor that allows the live path to
+            publish is a regression against ZA16. A runtime assertion
+            inside _synth_fill logs CRITICAL and returns without
+            publishing if invoked with self._paper == False.
+    ZA17 -- place_order accepts optional trigger_price (required for SL/SL-M)
+            and optional variety (default "regular"; use "co" for Cover Orders).
+            Both are backward-compatible optional params.
+
+BL-6 (locked 2026-04-19, Phase D.1):
+    Adapter detects broker HTTP 429 via getattr(exc, "code", None) == 429 and
+    translates it to BrokerRateLimit429Error (distinct from client-side
+    BrokerRateLimitError). Before raising, the adapter calls
+    rate_limiter.penalize(category, delay) to freeze the bucket for an
+    exponential delay derived from a per-category attempt counter
+    (initial 0.2s, multiplier 2, max 5.0s, +/- 0.05s jitter). The counter
+    resets after any successful call in the same category. ZA11 stays
+    intact: the adapter does NOT retry, does NOT sleep -- it raises and
+    exits. The caller (OrderPlacer, BL-19) owns retry. On the next
+    attempt, rate_limiter.acquire() blocks until the bucket thaws, which
+    is the backoff pacing.
+
+    Detection branch: kiteconnect raises typed exceptions with a .code
+    attribute set from the HTTP status. 429 can surface via
+    kex.NetworkException, kex.GeneralException, or any other exception
+    carrying .code == 429. _is_429() inspects the attribute without
+    depending on the concrete exception class, so future SDK changes that
+    add a dedicated type stay correctly classified.
+
+What This Module Does NOT Do:
+    - Does not retry failed calls (ZA11 -- caller owns retry)
+    - Does not publish OrderFilled events in LIVE mode (order_monitor's job).
+      Paper mode is the ZA16a carve-out; see above.
+    - Does not read config files directly (all deps injected)
+    - Does not import kiteconnect in any other module
+"""
+from __future__ import annotations
+
+import email.utils
+import random
+import socket
+import threading
+import time
+import uuid
+from dataclasses import dataclass
+from datetime import datetime, timezone
+from typing import Any, Callable, Optional
+
+from kiteconnect import exceptions as kex
+
+from broker.cost_calculator import CostCalculator
+from broker.order_state_machine import OrderStateMachine
+from broker.product_resolver import ProductResolver
+from broker.rate_limiter import RateLimiter
+from broker.slippage_engine import (
+    SlippageEngine,
+    _round_down_to_tick,
+    _round_nearest_to_tick,
+    _round_up_to_tick,
+)
+from orders.price_math import DEFAULT_TICK
+from core.config_loader import RateLimitBackoffConfig
+from core.events import EventBus, OrderFilled, PositionClosed
+from core.exceptions import (
+    BrokerAuthError,
+    BrokerError,
+    BrokerRateLimit429Error,
+    BrokerTimeoutError,
+    InvalidTransitionError,
+    OrderRejectedError,
+)
+from core.ids import new_order_id, truncate_tag_for_broker
+from core.logger import log_exception
+from core.time_authority import now_ist
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Return-type dataclasses (ZA2) -- frozen=True
+# ─────────────────────────────────────────────────────────────────────────────
+
+@dataclass(frozen=True)
+class PlacedOrder:
+    internal_order_id: str    # ord_<hex32> from core.ids
+    broker_order_id: str      # kite order_id string
+    symbol: str
+    side: str                 # "BUY" | "SELL"
+    qty: int
+    price: float
+    order_type: str           # "MARKET" | "LIMIT" | "SL" | "SL-M"
+    product: str              # broker code e.g. "MIS"
+    status: str               # "SUBMITTED" | "PENDING" (paper)
+    ts: datetime
+    trigger_price: float = 0.0   # ZA17: > 0 for SL / SL-M orders
+    variety: str = "regular"     # ZA17: "regular" | "co"
+
+
+@dataclass(frozen=True)
+class CancelResult:
+    broker_order_id: str
+    success: bool
+    reason: str               # empty string on success
+
+
+@dataclass(frozen=True)
+class ModifyResult:
+    broker_order_id: str
+    success: bool
+    reason: str
+
+
+@dataclass(frozen=True)
+class OrderHistoryEntry:
+    broker_order_id: str
+    status: str
+    filled_qty: int
+    avg_price: float
+    rejection_reason: str     # empty string if none
+    ts: datetime
+
+
+@dataclass(frozen=True)
+class Position:
+    symbol: str
+    qty: int
+    avg_price: float
+    product: str              # broker code
+    side: str                 # "BUY" | "SELL" | "NONE"
+
+
+@dataclass(frozen=True)
+class Holding:
+    # SLICE2.5-P2: a carried (T+1+) CNC delivery holding from the broker, used by
+    # the overnight-GTT reconcile. qty is TOTAL owned (settled + t1), i.e. the full
+    # quantity the protective GTT must cover.
+    symbol: str
+    qty: int                  # quantity + t1_quantity (everything owned)
+    avg_price: float
+    product: str              # broker code, "CNC" for delivery
+
+
+@dataclass(frozen=True)
+class MarginInfo:
+    net: float
+    available: float
+    used: float
+    ts: datetime
+
+
+@dataclass(frozen=True)
+class Quote:
+    symbol: str
+    last_price: float
+    bid: float
+    ask: float
+    volume: int
+    ts: datetime
+    # v2.1 fields: OHLC, VWAP, circuit limits (optional for backward compat)
+    vwap: float | None = None
+    open_price: float | None = None
+    day_high: float | None = None
+    day_low: float | None = None
+    upper_circuit: float | None = None
+    lower_circuit: float | None = None
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Constants
+# ─────────────────────────────────────────────────────────────────────────────
+
+_VALID_SIDES: frozenset[str] = frozenset({"BUY", "SELL"})
+_VALID_ORDER_TYPES: frozenset[str] = frozenset({"MARKET", "LIMIT", "SL", "SL-M"})
+
+# ── market_protection bounds (10-Sep-2026) ───────────────────────────────────
+# MEASURED: kiteconnect 5.1.0 validates NOTHING. 999, -7, 2.5 and the string "-1"
+# all reach the wire unchanged; the only filter is `if params[k] is None: del`,
+# and because `0 is None` is False, a literal 0 IS SENT. So the bounds check has
+# to be ours. The band is a PERCENTAGE: 1.5 means 1.5%.
+#
+# ⚠️ THE LOWER BOUND IS NOT COSMETIC — IT IS THE UNITS TRAP.
+# The nearest existing config, eod_squareoff.limit_aggressive_pct, is a FRACTION
+# (0.01 == 1%). Writing 0.015 here "meaning 1.5%" yields 0.015%, a band ~100x too
+# tight that would essentially never fill while looking like a working fix. A
+# plain "> 0" check would happily accept it. 0.1% is below the MEASURED median
+# spread (0.067%) plus median 60s adverse excursion (0.080%) on this book, so any
+# band under it cannot even cross the touch — it is refused as incoherent.
+_MARKET_PROTECTION_MIN_PCT: float = 0.1
+_MARKET_PROTECTION_MAX_PCT: float = 10.0
+
+# SLICE2.5-P2: paper GTT ids must be NUMERIC because gtt_state.gtt_id is an INTEGER
+# PRIMARY KEY (live = Kite's integer trigger_id, returned as a numeric string). A
+# high base keeps a paper id clearly out of the range of any real trigger id.
+_PAPER_GTT_ID_BASE: int = 9_000_000_000_000
+
+# ZA3: method -> rate_limiter category
+_CATEGORY_MAP: dict[str, str] = {
+    "place_order":      "order",
+    "cancel_order":     "order",
+    "modify_order":     "order",
+    "get_order_history":"order",
+    "get_positions":    "margins",
+    "get_margins":      "margins",
+    "get_trades":       "margins",
+    "get_quote":        "quote",
+    # SLICE2.5-P2: GTT lifecycle + holdings. Reads ride the portfolio (margins)
+    # bucket; delete_gtt is a mutation -> the order bucket (like place/modify_gtt).
+    "get_holdings":     "margins",
+    "get_gtt":          "margins",
+    "get_gtts":         "margins",
+    "delete_gtt":       "order",
+}
+
+# kiteconnect order type strings
+_KITE_ORDER_TYPES: dict[str, str] = {
+    "MARKET": "MARKET",
+    "LIMIT":  "LIMIT",
+    "SL":     "SL",
+    "SL-M":   "SL-M",
+}
+
+# kiteconnect transaction type strings
+_KITE_TRANSACTION: dict[str, str] = {
+    "BUY":  "BUY",
+    "SELL": "SELL",
+}
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Exception translation (ZA5)
+# ─────────────────────────────────────────────────────────────────────────────
+
+def _translate_kite_exception(
+    exc: Exception,
+    context: dict[str, object],
+    logger: Any,
+) -> BrokerError:
+    """
+    Map a raw kiteconnect (or network) exception to a system BrokerError
+    subclass. Logs the original exception before returning the translated one.
+    """
+    log_exception(logger, exc)
+
+    if isinstance(exc, kex.TokenException):
+        return BrokerAuthError(
+            f"Zerodha token/auth failure: {exc}",
+            **context,
+            http_status=getattr(exc, "code", None),
+        )
+    if isinstance(exc, kex.NetworkException):
+        return BrokerTimeoutError(
+            f"Zerodha network error: {exc}",
+            **context,
+        )
+    if isinstance(exc, (kex.InputException, kex.OrderException)):
+        return OrderRejectedError(
+            f"Zerodha rejected order: {exc}",
+            rejection_reason=str(exc),
+            kite_status_code=getattr(exc, "code", None),
+            **context,
+        )
+    if isinstance(exc, kex.PermissionException):
+        return BrokerAuthError(
+            f"Zerodha permission denied: {exc}",
+            **context,
+            http_status=getattr(exc, "code", None),
+        )
+    if isinstance(exc, (TimeoutError, socket.timeout)):
+        return BrokerTimeoutError(
+            f"Network timeout calling Zerodha: {exc}",
+            **context,
+        )
+    if isinstance(exc, kex.GeneralException):
+        return BrokerError(
+            f"Zerodha general error: {exc}",
+            **context,
+        )
+    # Unknown -- wrap in BrokerError
+    return BrokerError(
+        f"Unexpected error from Zerodha: {type(exc).__name__}: {exc}",
+        **context,
+    )
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Adapter
+# ─────────────────────────────────────────────────────────────────────────────
+
+class ZerodhaAdapter:
+    """
+    Typed adapter over kiteconnect.KiteConnect. All broker I/O flows
+    through this class; no other module touches kiteconnect directly (ZA1).
+
+    Constructed once at startup and injected wherever broker calls are
+    needed. All dependencies are injected (ZA1), so the adapter is fully
+    testable with mocks.
+    """
+
+    def __init__(
+        self,
+        kite_client: Any,                          # KiteConnect or mock
+        rate_limiter: RateLimiter,
+        product_resolver: ProductResolver,
+        cost_calculator: CostCalculator,           # reserved for future cost tracking
+        state_machine: OrderStateMachine,
+        logger: Any,
+        paper_mode: bool = False,
+        paper_capital: float = 100_000.0,
+        quote_provider: Optional[Callable[[list[str]], dict[str, Quote]]] = None,
+        account_id: Optional[str] = None,          # IC9: reserved for v2.1 multi-account
+        bus: Optional[EventBus] = None,            # ZA16a: paper mode publishes OrderFilled
+        paper_auto_fill_delay_sec: float = 0.5,    # ZA16a: daemon-thread synth delay
+        rate_limit_backoff: Optional[RateLimitBackoffConfig] = None,  # BL-6
+        # Audit 6.2: paper LTP-gating (default OFF -- existing tests behave
+        # as before; production paper YAML enables it).
+        paper_ltp_gating_enabled: bool = False,
+        paper_ltp_gating_max_wait_sec: float = 60.0,
+        paper_ltp_gating_poll_sec: float = 0.5,
+        # CFG-6 (2026-04-26 audit): paper-mode slippage applicator (P12).
+        # None = no slippage (existing tests behave as before). main.py
+        # late-binds via set_slippage_engine() once instrument_cache is
+        # loaded. Live mode ignores this parameter -- broker fills are truth.
+        slippage_engine: Optional[SlippageEngine] = None,
+        # FIX-181 (GICRE incident): authoritative tick-snapping. When wired,
+        # place_order snaps every LIMIT/SL price + trigger to a valid tick
+        # multiple before it reaches Kite, so no caller can submit an
+        # off-tick price (Zerodha rejects those outright). None = no-op
+        # (existing tests behave as before). main.py late-binds via
+        # set_instrument_cache() once the cache is loaded.
+        instrument_cache: Optional[Any] = None,
+        # SLICE2.5-P1: master delivery lock (mirrors system.delivery_enabled). When
+        # False (default), the adapter refuses any CNC order or OCO-GTT — the breaker
+        # for the overnight-protection capability. MIS/CO are unaffected.
+        delivery_enabled: bool = False,
+        # Option A (10-Jul-2026): PRODUCT-COERCION guard (mirrors system.force_intraday_only).
+        # When True, place_order coerces any non-INTRADAY intent to INTRADAY (product MIS)
+        # — the P0 MIS-only guarantee now that the load-time intent rewrite is gone.
+        # Independent of, and composes with, delivery_enabled. Default False (existing
+        # tests behave as before).
+        force_intraday_only: bool = False,
+    ) -> None:
+        self._kite = kite_client
+        self._rl = rate_limiter
+        self._pr = product_resolver
+        self._cc = cost_calculator
+        self._osm = state_machine
+        self._log = logger
+        self._paper = paper_mode
+        self._paper_capital = paper_capital
+        self._quote_provider = quote_provider
+        self._account_id = account_id  # IC9: no-op for v2 single-account
+        self._bus = bus
+        self._paper_auto_fill_delay_sec = paper_auto_fill_delay_sec
+        # Audit 6.2: paper LTP-gating settings (no-op when paper_mode=False)
+        self._paper_ltp_gating_enabled = paper_ltp_gating_enabled
+        self._paper_ltp_gating_max_wait_sec = paper_ltp_gating_max_wait_sec
+        self._paper_ltp_gating_poll_sec = paper_ltp_gating_poll_sec
+        # CFG-6: paper-mode slippage engine. May be set later via setter.
+        self._slippage: Optional[SlippageEngine] = slippage_engine
+        # FIX-181: instrument cache for tick-snapping. May be set via setter.
+        self._instrument_cache: Optional[Any] = instrument_cache
+        # SLICE2.5-P1: master delivery lock (see __init__ param).
+        self._delivery_enabled: bool = delivery_enabled
+        # Option A (10-Jul-2026): product-coercion guard (see __init__ param).
+        self._force_intraday_only: bool = force_intraday_only
+        # 23-Jun tick fail-safe: warn-once-per-symbol throttle for a missing
+        # tick_size (the fallback to DEFAULT_TICK is silent otherwise; FIX-170).
+        self._missing_tick_warned: set[str] = set()
+        # BL-6: 429 backoff state. Per-category counter drives exponential delay;
+        # resets when any call in the category succeeds. Lock guards increments
+        # across threads (order_placer, order_monitor, reconciler can all race).
+        self._rl_backoff: RateLimitBackoffConfig = (
+            rate_limit_backoff or RateLimitBackoffConfig()
+        )
+        self._429_attempts: dict[str, int] = {}
+        self._429_lock: threading.Lock = threading.Lock()
+        # Paper order state tracker: broker_order_id -> {status, filled_qty, avg_price}.
+        # Updated by _paper_place_order (SUBMITTED), _synth_fill (COMPLETE),
+        # and cancel_order (CANCELLED). Read by get_order_history() so
+        # order_monitor sees real state instead of a static SUBMITTED stub.
+        self._paper_fills: dict[str, dict] = {}
+        self._paper_fills_lock: threading.Lock = threading.Lock()
+        self._paper_positions: dict[str, dict] = {}
+        # SLICE2.5-P2: paper-backed overnight-protection stores so the Phase-2
+        # reconcile + GTT_EXIT logic run end-to-end in paper (the ONLY live/paper
+        # difference stays the broker I/O boundary). _paper_gtts mirrors Kite's
+        # get_gtts() dict shape; _paper_holdings is seeded by seed_paper_holding().
+        self._paper_gtts: dict[str, dict] = {}
+        self._paper_gtts_lock: threading.Lock = threading.Lock()
+        self._paper_gtt_seq: int = 0  # monotonic -> numeric paper gtt_id (INTEGER PK)
+        self._paper_holdings: dict[str, dict] = {}
+        self._paper_holdings_lock: threading.Lock = threading.Lock()
+        # FIX-009: capture the HTTP Date header from the most recent Kite API
+        # response so get_server_time() can return the broker's actual clock
+        # instead of the local RTT midpoint.
+        self._last_response_date: Optional[datetime] = None
+        self._install_date_header_hook()
+        # FIX-072: TTL-cached margin requirements by (symbol, intent).
+        # Cache entry: (margin_pct, fetched_at). TTL = 5 minutes.
+        self._margin_cache: dict[tuple[str, str], tuple[float, datetime]] = {}
+        self._margin_cache_lock: threading.Lock = threading.Lock()
+        self._margin_cache_ttl_sec: float = 300.0  # 5 minutes
+
+        # ZA16a: paper needs bus to publish synthesized OrderFilled. If paper
+        # is on but bus is None we degrade safely (state reaches COMPLETE via
+        # synth thread; no event) and log a warning. main.py wires bus in
+        # non-degraded mode; tests can skip bus to exercise paper without
+        # event plumbing.
+        if self._paper and self._bus is None:
+            self._log.warning(
+                "zerodha_adapter paper_mode with bus=None -- OrderFilled "
+                "will NOT be published (ZA16a synth degrades to OSM-only)"
+            )
+
+        # FIX-157: subscribe to PositionClosed so _paper_capital reflects
+        # trades closed externally (e.g., reconciler CLOSED_MANUAL). Normal
+        # fills are already handled by _synth_fill; those arrive as
+        # source_module="order_placer" and are skipped to avoid double-count.
+        if self._paper and self._bus is not None:
+            self._bus.subscribe(PositionClosed, self._on_external_position_closed)
+
+    def _on_external_position_closed(self, event: PositionClosed) -> None:
+        if event.source_module == "order_placer":
+            return
+        with self._paper_fills_lock:
+            self._paper_capital += event.realized_pnl
+            self._paper_positions.pop(event.symbol, None)
+        self._log.info(
+            "paper_capital updated via external close",
+            extra={"symbol": event.symbol, "realized_pnl": event.realized_pnl,
+                   "source": event.source_module,
+                   "new_capital": self._paper_capital},
+        )
+
+    # ── public methods ────────────────────────────────────────────────────────
+
+    def place_order(
+        self,
+        symbol: str,
+        side: str,
+        qty: int,
+        price: float,
+        order_type: str,
+        intent: str,
+        tag: Optional[str] = None,
+        trigger_price: float = 0.0,
+        variety: str = "regular",
+        market_protection: Optional[float] = None,
+    ) -> PlacedOrder:
+        """
+        Place an order with Zerodha (or simulate in paper mode).
+
+        Validates inputs, acquires rate limit token, resolves product code,
+        registers with state machine, calls kite, transitions state.
+
+        Args:
+            symbol:        trading symbol e.g. "RELIANCE"
+            side:          "BUY" or "SELL"
+            qty:           number of shares (> 0)
+            price:         limit price (> 0 for LIMIT/SL; may be 0 for MARKET)
+            order_type:    "MARKET" | "LIMIT" | "SL" | "SL-M"
+            intent:        semantic product intent e.g. "INTRADAY"
+            tag:           optional order tag passed to kite
+            trigger_price: stop trigger price (ZA17; required > 0 for SL/SL-M)
+            variety:       kite variety string (ZA17; default "regular"; "co" for CO orders)
+            market_protection:
+                           Zerodha's protected-MARKET band, **AS A PERCENTAGE**.
+                           ⚠️ UNITS. 1.5 means 1.5%. It is NOT a fraction.
+                           The neighbouring config `limit_aggressive_pct` IS a
+                           fraction (0.01 == 1%), and copying that convention here
+                           sends 0.015 == 0.015% — a band ~100x too tight, which
+                           would almost never fill and would look like a working
+                           fix. Bounds-checked in _validate_place_order.
+                           None (the default) OMITS the field entirely, exactly as
+                           `price` does for MARKET orders, so every pre-existing
+                           caller — ENTRY, SL, TGT, EOD — is byte-identical on the
+                           wire. kiteconnect 5.1.0 strips None via `locals()`.
+
+        Returns:
+            PlacedOrder with internal_order_id and broker_order_id.
+
+        Raises:
+            ValueError:                invalid inputs (ZA13)
+            ProductNotSupportedError:  intent not supported by zerodha (ZA4)
+            BrokerAuthError:           token/auth failure (ZA5)
+            BrokerTimeoutError:        network/timeout (ZA5)
+            OrderRejectedError:        kite rejected the order (ZA5)
+            BrokerError:               any other kite error (ZA5)
+        """
+        t0 = time.monotonic()
+        self._log.info(
+            "place_order call_start",
+            extra={"method": "place_order", "symbol": symbol,
+                   "side": side, "qty": qty, "order_type": order_type,
+                   "intent": intent},
+        )
+
+        # ZA13: validate before burning rate-limit token.
+        # market_protection is validated HERE, i.e. BEFORE the `if self._paper`
+        # branch below — so an out-of-range band is rejected identically in paper
+        # and live. That is the parity that matters: the value has no meaning for a
+        # synthesized paper fill, but a bad value must fail the same way in both.
+        self._validate_place_order(
+            symbol, side, qty, price, order_type, trigger_price, market_protection
+        )
+
+        # FIX-181 (GICRE incident): authoritative tick-snap. Runs in BOTH paper
+        # and live (parity) so the synthesized paper fill and the live Kite order
+        # see the same tick-aligned price/trigger. No-op when no cache is wired.
+        price, trigger_price = self._snap_order_to_tick(
+            symbol, order_type, side, price, trigger_price
+        )
+
+        # Option A (10-Jul-2026): PRODUCT-COERCION CHOKEPOINT — the P0 MIS-only guard.
+        # The load-time intent rewrite was removed (strategies keep declared intent; the
+        # entry-gate resolver dormants DELIVERY under the breaker). This is the SECOND,
+        # independent MIS guarantee at the single broker-submission chokepoint: while
+        # force_intraday_only is on, coerce ANY non-INTRADAY intent to INTRADAY so the
+        # product resolves to MIS — no strategy can place CNC/NRML under the breaker even
+        # if it somehow reached here. Composes with (never replaces) the delivery_lock below.
+        resolve_intent = intent
+        if self._force_intraday_only and intent != "INTRADAY":
+            self._log.warning(
+                "place_order: force_intraday_only=true — coercing intent %r -> INTRADAY "
+                "(MIS-only product guard) for %s", intent, symbol,
+            )
+            resolve_intent = "INTRADAY"
+
+        # ZA4: resolve product intent -> broker code (may raise ProductNotSupportedError)
+        broker_code = self._pr.resolve(resolve_intent, "zerodha")
+
+        # SLICE2.5-P1: master delivery lock — refuse a REAL CNC order while delivery is
+        # disabled (belt-and-suspenders behind force_intraday_only). MIS/CO unaffected.
+        # Surfaces a WARNING so a blocked delivery intent is visible, then rejects so
+        # the entry fails cleanly rather than opening an unmanaged CNC position.
+        if broker_code == "CNC" and not self._delivery_enabled:
+            self._log.warning(
+                "place_order BLOCKED: CNC order for %s refused — delivery_enabled=false "
+                "(SLICE2.5-P1 master lock); enable delivery only after the Slice 2.5 "
+                "lifecycle + T2 real-API proof", symbol,
+            )
+            raise OrderRejectedError(
+                "CNC orders are disabled (delivery_enabled=false; SLICE2.5-P1 lock)",
+                symbol=symbol, side=side, qty=qty, price=price, intent=intent,
+            )
+
+        # ZA7: allocate internal ID and register with state machine in PENDING
+        internal_id = new_order_id()
+        self._osm.register(internal_id)
+
+        if self._paper:
+            result = self._paper_place_order(
+                internal_id, symbol, side, qty, price, order_type, broker_code,
+                trigger_price=trigger_price, variety=variety, tag=tag,
+            )
+            ms = int((time.monotonic() - t0) * 1000)
+            self._log.info(
+                "place_order call_end",
+                extra={"method": "place_order", "duration_ms": ms,
+                       "result_summary": f"PAPER broker_order_id={result.broker_order_id}"},
+            )
+            return result
+
+        # Live path: acquire rate limit, then call kite
+        self._rl.acquire(_CATEGORY_MAP["place_order"])
+
+        context: dict[str, object] = {
+            "symbol": symbol, "side": side, "qty": qty,
+            "price": price, "intent": intent, "broker_code": broker_code,
+        }
+        # DEFENSIVE BOUNDARY GUARD (01-Jul-2026): this is THE single order-submission
+        # chokepoint to Kite. Truncate an over-length tag HERE so no caller can EVER
+        # have an order rejected by Zerodha for tag length (>20 chars) — most critically
+        # a naked-position EMERGENCY flatten (order_reconciler _emergency_market_close
+        # previously passed the full 36-char trade_id → "Invalid tags: max allowed tag
+        # length is 20" → the last line of defense failed to place). Idempotent (an
+        # already-short tag is unchanged); None/"" passed through untouched; broker↔trade
+        # matching is by order_id, never the tag, so truncation loses no traceability.
+        if tag:
+            tag = truncate_tag_for_broker(tag)
+        try:
+            kite_order_id = self._kite.place_order(
+                variety=variety,
+                exchange="NSE",
+                tradingsymbol=symbol,
+                transaction_type=_KITE_TRANSACTION[side],
+                quantity=qty,
+                product=broker_code,
+                order_type=_KITE_ORDER_TYPES[order_type],
+                price=price if order_type in ("LIMIT", "SL") else None,
+                trigger_price=trigger_price if trigger_price > 0 else None,
+                tag=tag,
+                # None omits the field: kiteconnect 5.1.0's place_order does
+                # `params = locals()` then deletes every `is None` entry, so a
+                # None here reproduces today's wire body byte-for-byte.
+                market_protection=market_protection,
+            )
+        except Exception as exc:
+            # ZA7: transition to FAILED on any kite exception
+            try:
+                self._osm.transition(internal_id, "FAILED")
+            except InvalidTransitionError:
+                pass  # already failed; ignore double-fault
+            raise self._translate_broker_exception(exc, context, "place_order") from exc
+
+        # BL-6: success in "order" category -> reset its 429 attempt counter
+        self._reset_429_attempts(_CATEGORY_MAP["place_order"])
+
+        # ZA7: successful placement -> SUBMITTED
+        self._osm.transition(internal_id, "SUBMITTED")
+
+        result = PlacedOrder(
+            internal_order_id=internal_id,
+            broker_order_id=str(kite_order_id),
+            symbol=symbol,
+            side=side,
+            qty=qty,
+            price=price,
+            order_type=order_type,
+            product=broker_code,
+            status="SUBMITTED",
+            ts=now_ist(),
+            trigger_price=trigger_price,
+            variety=variety,
+        )
+        ms = int((time.monotonic() - t0) * 1000)
+        self._log.info(
+            "place_order call_end",
+            extra={"method": "place_order", "duration_ms": ms,
+                   "result_summary": f"broker_order_id={kite_order_id}"},
+        )
+        return result
+
+    # ── SLICE2.5-P1: OCO-GTT (overnight CNC protection) ──────────────────────────
+
+    def _gtt_legs(self, exit_side, qty, sl_limit, tgt_limit, product):
+        """The two SELL LIMIT legs of an OCO GTT (SL leg first, TGT leg second)."""
+        return [
+            {"transaction_type": exit_side, "quantity": int(qty), "order_type": "LIMIT",
+             "product": product, "price": float(sl_limit)},
+            {"transaction_type": exit_side, "quantity": int(qty), "order_type": "LIMIT",
+             "product": product, "price": float(tgt_limit)},
+        ]
+
+    def place_gtt(
+        self,
+        *,
+        symbol: str,
+        exit_side: str,                 # both OCO legs use this side (SELL exits a long)
+        qty: int,
+        sl_trigger: float,
+        sl_limit: float,
+        tgt_trigger: float,
+        tgt_limit: float,
+        last_price: float,
+        product: str = "CNC",
+        tag: str = "",
+    ) -> str:
+        """Place ONE two-leg OCO GTT — the persistent overnight protection for a CNC
+        position. Both legs are ``exit_side`` LIMIT, product=CNC, quantity=qty;
+        trigger_values=[sl_trigger, tgt_trigger] (ascending: SL below, TGT above).
+        Returns the GTT id (str). LIVE → kite.place_gtt; PAPER → a mock id + the
+        identical recorded params (parity).
+
+        SLICE2.5-P2 (R2 guard split): GTT ops are NOT gated on delivery_enabled —
+        protection MUST survive disablement. With delivery off there are no new CNC
+        entries (place_order blocks them), so a GTT op only ever touches a
+        PRE-EXISTING holding (strand-prevention); the entry lock lives on place_order."""
+        legs = self._gtt_legs(exit_side, qty, sl_limit, tgt_limit, product)
+        trigger_values = [float(sl_trigger), float(tgt_trigger)]
+        if self._paper:
+            with self._paper_gtts_lock:
+                self._paper_gtt_seq += 1
+                gid = str(_PAPER_GTT_ID_BASE + self._paper_gtt_seq)  # numeric (INTEGER PK)
+                self._paper_gtts[gid] = self._paper_gtt_record(
+                    gid, symbol, trigger_values, last_price, legs, status="active")
+            self._log.info("place_gtt call_end", extra={
+                "method": "place_gtt", "mode": "PAPER", "symbol": symbol, "gtt_id": gid,
+                "trigger_values": trigger_values, "qty": qty, "exit_side": exit_side,
+                "legs": legs, "last_price": last_price})
+            return gid
+        self._rl.acquire(_CATEGORY_MAP["place_order"])
+        gtt_type = getattr(self._kite, "GTT_TYPE_OCO", "two-leg")
+        try:
+            resp = self._kite.place_gtt(
+                trigger_type=gtt_type, tradingsymbol=symbol, exchange="NSE",
+                trigger_values=trigger_values, last_price=float(last_price), orders=legs)
+        except Exception as exc:
+            raise self._translate_broker_exception(
+                exc, {"symbol": symbol, "trigger_values": trigger_values}, "place_order"
+            ) from exc
+        self._reset_429_attempts(_CATEGORY_MAP["place_order"])
+        gid = str(resp.get("trigger_id") if isinstance(resp, dict) else resp)
+        self._log.info("place_gtt call_end", extra={
+            "method": "place_gtt", "mode": "LIVE", "symbol": symbol, "gtt_id": gid,
+            "trigger_values": trigger_values, "qty": qty})
+        return gid
+
+    def modify_gtt(
+        self,
+        *,
+        gtt_id: str,
+        symbol: str,
+        exit_side: str,
+        qty: int,
+        sl_trigger: float,
+        sl_limit: float,
+        tgt_trigger: float,
+        tgt_limit: float,
+        last_price: float,
+        product: str = "CNC",
+    ) -> str:
+        """Modify an existing OCO GTT (e.g. a later partial fill grew the qty) — keeps
+        ONE GTT per trade. Returns the (unchanged) GTT id. PAPER updates the store.
+
+        SLICE2.5-P2 (R2 guard split): not gated on delivery_enabled (see place_gtt)."""
+        legs = self._gtt_legs(exit_side, qty, sl_limit, tgt_limit, product)
+        trigger_values = [float(sl_trigger), float(tgt_trigger)]
+        if self._paper:
+            with self._paper_gtts_lock:
+                rec = self._paper_gtts.get(str(gtt_id))
+                if rec is not None:
+                    rec["condition"]["trigger_values"] = trigger_values
+                    rec["condition"]["last_price"] = float(last_price)
+                    rec["orders"] = legs
+            self._log.info("modify_gtt call_end", extra={
+                "method": "modify_gtt", "mode": "PAPER", "symbol": symbol,
+                "gtt_id": str(gtt_id), "qty": qty, "trigger_values": trigger_values})
+            return str(gtt_id)
+        self._rl.acquire(_CATEGORY_MAP["place_order"])
+        gtt_type = getattr(self._kite, "GTT_TYPE_OCO", "two-leg")
+        try:
+            self._kite.modify_gtt(
+                trigger_id=int(gtt_id), trigger_type=gtt_type, tradingsymbol=symbol,
+                exchange="NSE", trigger_values=trigger_values,
+                last_price=float(last_price), orders=legs)
+        except Exception as exc:
+            raise self._translate_broker_exception(
+                exc, {"symbol": symbol, "gtt_id": gtt_id}, "place_order") from exc
+        self._reset_429_attempts(_CATEGORY_MAP["place_order"])
+        self._log.info("modify_gtt call_end", extra={
+            "method": "modify_gtt", "mode": "LIVE", "symbol": symbol,
+            "gtt_id": str(gtt_id), "qty": qty})
+        return str(gtt_id)
+
+    # ── SLICE2.5-P2: GTT lifecycle reads/delete + holdings ──────────────────────
+    # live → Kite, paper → in-memory store (identical dict shape). NOT gated on
+    # delivery_enabled (R2 guard split): protection must survive disablement.
+
+    @staticmethod
+    def _paper_gtt_record(gid, symbol, trigger_values, last_price, legs, *, status):
+        """Build a paper GTT entry mirroring Kite's get_gtts() dict shape so the
+        Phase-2 reconcile parses live + paper identically."""
+        return {
+            "id": gid,
+            "status": status,                 # active|triggered|cancelled|expired|rejected|deleted
+            "condition": {
+                "exchange": "NSE",
+                "tradingsymbol": symbol,
+                "trigger_values": list(trigger_values),
+                "last_price": float(last_price),
+            },
+            "orders": list(legs),
+        }
+
+    @staticmethod
+    def _gtt_triggered_leg(trigger_values, ltp: float) -> Optional[int]:
+        """Which OCO leg a Zerodha GTT would fire at this LTP: 0 = SL, 1 = TGT, None.
+
+        PURE, and separated from every I/O concern on purpose -- the trigger RULE is
+        the part that has to be right, and a pure predicate can be driven to any price
+        without a quote provider, a clock, or a thread.
+
+        trigger_values is [sl_trigger, tgt_trigger] ASCENDING (place_gtt's contract:
+        SL below, TGT above). Zerodha fires on LTP crossing either bound, inclusive.
+        SL is checked FIRST: if a single observation is outside both bounds -- which a
+        poll can see and a tick stream would not -- the protective leg must win.
+        """
+        try:
+            sl_trigger, tgt_trigger = float(trigger_values[0]), float(trigger_values[1])
+        except (TypeError, ValueError, IndexError):
+            return None
+        if ltp <= sl_trigger:
+            return 0
+        if ltp >= tgt_trigger:
+            return 1
+        return None
+
+    def _paper_settle_gtt_triggers(self) -> None:
+        """PAPER ONLY: flip any active GTT whose trigger the current LTP has crossed.
+
+        ⭐ WHY THIS EXISTS. Nothing ever wrote a paper GTT status other than "active",
+        so a GTT could NEVER FIRE in paper -- which made CncGttMonitor's primary path
+        (triggered + flat -> GTT_EXIT) and its F6 re-protect branch unreachable by a
+        running paper session. Every CNC exit runs through a GTT, so "paper-proven"
+        could not cover the CNC exit path at all. The 25 tests that appeared to cover
+        it reach past the public API and write `_paper_gtts[gid]["status"]` by hand --
+        a test that must cheat is the gap announcing itself.
+
+        ⚠️⚠️ WHAT THIS DOES **NOT** MODEL -- read before trusting a paper GTT result:
+          1. **OVERNIGHT / WHILE-DOWN TRIGGERING, WHICH IS THE WHOLE POINT OF A GTT.**
+             Zerodha evaluates server-side on every tick even when we are stopped.
+             This evaluates only when our own code asks, so a paper GTT cannot fire
+             while the paper service is down. The Mon->Tue carry stays irreducible.
+          2. **TICK-LEVEL PATH.** We poll a quote; price can cross and come back
+             between polls. Paper therefore UNDER-triggers relative to the broker --
+             the safe direction, but it means paper cannot prove a GTT *would* fire.
+          3. **TRIGGER != FILL.** Zerodha places a LIMIT leg on trigger, which may not
+             fill. This flips the status and places NOTHING, so the holding is left
+             intact -- which is exactly the F6 shape ("triggered but holding > 0").
+             It is not the fill path, and must not be read as one.
+
+        Status flip ONLY, deliberately: placing the leg from inside a read path would
+        take `_paper_fills_lock` while holding `_paper_gtts_lock` and spawn a thread
+        from a getter. Not worth the re-entrancy for a state the monitor derives from
+        holdings anyway.
+
+        LTP is fetched OUTSIDE the lock -- `_fetch_ltp` calls the injected
+        quote_provider, i.e. the network -- so the store is snapshotted, quoted, then
+        re-locked to write. `_fetch_ltp` returns None (never 0.0) on no-data, which is
+        what stops a missing quote from reading as a crashed price and firing every SL
+        (FIX-001).
+        """
+        if not self._paper:
+            return
+        with self._paper_gtts_lock:
+            pending = [
+                (gid, rec["condition"]["tradingsymbol"],
+                 list(rec["condition"].get("trigger_values") or []))
+                for gid, rec in self._paper_gtts.items()
+                if rec.get("status") == "active"
+            ]
+        if not pending:
+            return
+        ltps: dict[str, Optional[float]] = {}
+        for _gid, symbol, _tv in pending:
+            if symbol not in ltps:
+                ltps[symbol] = self._fetch_ltp(symbol)
+        for gid, symbol, trigger_values in pending:
+            ltp = ltps.get(symbol)
+            if ltp is None:
+                continue
+            leg = self._gtt_triggered_leg(trigger_values, ltp)
+            if leg is None:
+                continue
+            with self._paper_gtts_lock:
+                rec = self._paper_gtts.get(gid)
+                # re-check under the lock: a concurrent delete/modify may have
+                # landed while we were quoting.
+                if rec is None or rec.get("status") != "active":
+                    continue
+                rec["status"] = "triggered"
+                rec["condition"]["last_price"] = float(ltp)
+            self._log.info("paper_gtt_triggered", extra={
+                "gtt_id": gid, "symbol": symbol, "ltp": ltp,
+                "leg": "SL" if leg == 0 else "TGT",
+                "trigger_values": trigger_values})
+
+    def get_gtt(self, gtt_id) -> Optional[dict]:
+        """Fetch ONE GTT by trigger id. PAPER returns a copy of the stored record
+        (None if absent). LIVE calls kite.get_gtt (broker errors translated)."""
+        if self._paper:
+            self._paper_settle_gtt_triggers()
+            with self._paper_gtts_lock:
+                rec = self._paper_gtts.get(str(gtt_id))
+                return dict(rec) if rec is not None else None
+        self._rl.acquire(_CATEGORY_MAP["get_gtt"])
+        try:
+            res = self._kite.get_gtt(trigger_id=int(gtt_id))
+        except Exception as exc:
+            raise self._translate_broker_exception(exc, {"gtt_id": gtt_id}, "get_gtt") from exc
+        self._reset_429_attempts(_CATEGORY_MAP["get_gtt"])
+        return res
+
+    def get_gtts(self) -> list[dict]:
+        """All GTTs at the broker (active + triggered + …). PAPER returns the
+        in-memory store. Used by the Phase-2 reconcile (missing/orphan/triggered)."""
+        if self._paper:
+            self._paper_settle_gtt_triggers()
+            with self._paper_gtts_lock:
+                return [dict(r) for r in self._paper_gtts.values()]
+        self._rl.acquire(_CATEGORY_MAP["get_gtts"])
+        try:
+            res = self._kite.get_gtts()
+        except Exception as exc:
+            raise self._translate_broker_exception(exc, {}, "get_gtts") from exc
+        self._reset_429_attempts(_CATEGORY_MAP["get_gtts"])
+        return list(res or [])
+
+    def delete_gtt(self, gtt_id) -> str:
+        """Delete (cancel) a GTT at the broker; returns the deleted trigger id (str).
+        Used ONLY for deliberate trade-close, >1-GTT dedupe, or confirmed-orphan
+        cleanup (Step 5/8b: NEVER a stale-order sweep). PAPER removes it from the store."""
+        if self._paper:
+            with self._paper_gtts_lock:
+                self._paper_gtts.pop(str(gtt_id), None)
+            self._log.info("delete_gtt call_end", extra={
+                "method": "delete_gtt", "mode": "PAPER", "gtt_id": str(gtt_id)})
+            return str(gtt_id)
+        self._rl.acquire(_CATEGORY_MAP["delete_gtt"])
+        try:
+            self._kite.delete_gtt(trigger_id=int(gtt_id))
+        except Exception as exc:
+            raise self._translate_broker_exception(exc, {"gtt_id": gtt_id}, "delete_gtt") from exc
+        self._reset_429_attempts(_CATEGORY_MAP["delete_gtt"])
+        self._log.info("delete_gtt call_end", extra={
+            "method": "delete_gtt", "mode": "LIVE", "gtt_id": str(gtt_id)})
+        return str(gtt_id)
+
+    def get_holdings(self) -> list[Holding]:
+        """Carried (T+1+) CNC delivery holdings. qty = settled + t1 (everything
+        owned). The Phase-2 reconcile uses this (plus same-day CNC positions from
+        get_positions) to re-verify overnight GTT protection. PAPER returns the
+        seeded _paper_holdings store."""
+        t0 = time.monotonic()
+        self._log.info("get_holdings call_start", extra={"method": "get_holdings"})
+        if self._paper:
+            with self._paper_holdings_lock:
+                holdings = [
+                    Holding(symbol=s, qty=int(h["qty"]),
+                            avg_price=float(h.get("avg_price", 0.0)),
+                            product=str(h.get("product", "CNC")))
+                    for s, h in self._paper_holdings.items() if int(h["qty"]) != 0
+                ]
+            self._log.info("get_holdings call_end", extra={
+                "method": "get_holdings", "duration_ms": int((time.monotonic() - t0) * 1000),
+                "result_summary": f"PAPER {len(holdings)} holdings"})
+            return holdings
+        self._rl.acquire(_CATEGORY_MAP["get_holdings"])
+        try:
+            raw = self._kite.holdings()
+        except Exception as exc:
+            raise self._translate_broker_exception(exc, {}, "get_holdings") from exc
+        self._reset_429_attempts(_CATEGORY_MAP["get_holdings"])
+        holdings = []
+        for row in (raw or []):
+            total = int(row.get("quantity", 0)) + int(row.get("t1_quantity", 0))
+            if total == 0:
+                continue
+            holdings.append(Holding(
+                symbol=str(row.get("tradingsymbol", "")),
+                qty=total,
+                avg_price=float(row.get("average_price", 0.0)),
+                product=str(row.get("product", "CNC")),
+            ))
+        self._log.info("get_holdings call_end", extra={
+            "method": "get_holdings", "duration_ms": int((time.monotonic() - t0) * 1000),
+            "result_summary": f"{len(holdings)} holdings"})
+        return holdings
+
+    def seed_paper_holding(self, symbol: str, qty: int, avg_price: float = 0.0,
+                           product: str = "CNC") -> None:
+        """Test/paper helper: inject (or clear, qty=0) a carried delivery holding so
+        the Phase-2 reconcile + GTT_EXIT logic run end-to-end in paper. No-op in live."""
+        if not self._paper:
+            return
+        with self._paper_holdings_lock:
+            if int(qty) == 0:
+                self._paper_holdings.pop(symbol, None)
+            else:
+                self._paper_holdings[symbol] = {
+                    "qty": int(qty), "avg_price": float(avg_price), "product": product}
+
+    def cancel_order(
+        self,
+        broker_order_id: str,
+        variety: str = "regular",
+    ) -> CancelResult:
+        """
+        Cancel an open order. Returns CancelResult; does not raise on
+        kite-level rejection (returns success=False instead). State machine
+        transition is the CALLER's responsibility after inspecting the result.
+
+        Audit #5: accepts `variety` so callers can cancel CO bracket orders
+        (variety="co") in addition to regular orders. Default stays "regular"
+        for existing callers.
+        """
+        t0 = time.monotonic()
+        self._log.info(
+            "cancel_order call_start",
+            extra={"method": "cancel_order",
+                   "broker_order_id": broker_order_id,
+                   "variety": variety},
+        )
+
+        if self._paper:
+            with self._paper_fills_lock:
+                if broker_order_id in self._paper_fills:
+                    self._paper_fills[broker_order_id]["status"] = "CANCELLED"
+            result = CancelResult(
+                broker_order_id=broker_order_id, success=True, reason=""
+            )
+            ms = int((time.monotonic() - t0) * 1000)
+            self._log.info(
+                "cancel_order call_end",
+                extra={"method": "cancel_order", "duration_ms": ms,
+                       "result_summary": "PAPER success=True"},
+            )
+            return result
+
+        self._rl.acquire(_CATEGORY_MAP["cancel_order"])
+
+        try:
+            self._kite.cancel_order(
+                variety=variety,
+                order_id=broker_order_id,
+            )
+            result = CancelResult(
+                broker_order_id=broker_order_id, success=True, reason=""
+            )
+        except Exception as exc:
+            log_exception(self._log, exc)
+            result = CancelResult(
+                broker_order_id=broker_order_id,
+                success=False,
+                reason=str(exc),
+            )
+
+        ms = int((time.monotonic() - t0) * 1000)
+        self._log.info(
+            "cancel_order call_end",
+            extra={"method": "cancel_order", "duration_ms": ms,
+                   "result_summary": f"success={result.success}"},
+        )
+        return result
+
+    def modify_order(
+        self,
+        broker_order_id: str,
+        price: Optional[float] = None,
+        qty: Optional[int] = None,
+        trigger_price: Optional[float] = None,
+        symbol: Optional[str] = None,
+    ) -> ModifyResult:
+        """Modify price/qty of a pending order. Returns ModifyResult.
+
+        `symbol` (when given) lets the adapter snap price + trigger_price to the
+        instrument tick BEFORE the paper/live branch — so Paper and Live both submit
+        tick-aligned values (parity) and no modify can reach Zerodha off-tick.
+        """
+        t0 = time.monotonic()
+        self._log.info(
+            "modify_order call_start",
+            extra={"method": "modify_order",
+                   "broker_order_id": broker_order_id},
+        )
+
+        # 23-Jun: snap price + trigger to the instrument tick BEFORE the paper/live
+        # branch (parity) so no modify reaches Zerodha off-tick. Nearest-tick —
+        # modify carries no order_type/side, and place_order also rounds the SL
+        # trigger to nearest. _resolve_tick is fail-safe (DEFAULT_TICK fallback).
+        if symbol is not None and (price or trigger_price):
+            _mtick = self._resolve_tick(symbol)
+            if price is not None and price > 0:
+                price = _round_nearest_to_tick(price, _mtick)
+            if trigger_price is not None and trigger_price > 0:
+                trigger_price = _round_nearest_to_tick(trigger_price, _mtick)
+
+        if self._paper:
+            result = ModifyResult(
+                broker_order_id=broker_order_id, success=True, reason=""
+            )
+            ms = int((time.monotonic() - t0) * 1000)
+            self._log.info(
+                "modify_order call_end",
+                extra={"method": "modify_order", "duration_ms": ms,
+                       "result_summary": "PAPER success=True"},
+            )
+            return result
+
+        self._rl.acquire(_CATEGORY_MAP["modify_order"])
+
+        try:
+            self._kite.modify_order(
+                variety="regular",
+                order_id=broker_order_id,
+                price=price,
+                quantity=qty,
+                trigger_price=trigger_price,
+            )
+            result = ModifyResult(
+                broker_order_id=broker_order_id, success=True, reason=""
+            )
+        except Exception as exc:
+            log_exception(self._log, exc)
+            result = ModifyResult(
+                broker_order_id=broker_order_id,
+                success=False,
+                reason=str(exc),
+            )
+
+        ms = int((time.monotonic() - t0) * 1000)
+        self._log.info(
+            "modify_order call_end",
+            extra={"method": "modify_order", "duration_ms": ms,
+                   "result_summary": f"success={result.success}"},
+        )
+        return result
+
+    def get_order_history(self, broker_order_id: str) -> list[OrderHistoryEntry]:
+        """Return the full history of a kite order as a list of entries."""
+        t0 = time.monotonic()
+        self._log.info(
+            "get_order_history call_start",
+            extra={"method": "get_order_history",
+                   "broker_order_id": broker_order_id},
+        )
+
+        if self._paper:
+            with self._paper_fills_lock:
+                state = self._paper_fills.get(broker_order_id, {})
+            status = state.get("status", "SUBMITTED")
+            filled_qty = state.get("filled_qty", 0)
+            avg_price = state.get("avg_price", 0.0)
+            entries = [
+                OrderHistoryEntry(
+                    broker_order_id=broker_order_id,
+                    status=status,
+                    filled_qty=filled_qty,
+                    avg_price=avg_price,
+                    rejection_reason="",
+                    ts=now_ist(),
+                )
+            ]
+            ms = int((time.monotonic() - t0) * 1000)
+            self._log.info(
+                "get_order_history call_end",
+                extra={"method": "get_order_history", "duration_ms": ms,
+                       "result_summary": f"PAPER 1 entry status={status}"},
+            )
+            return entries
+
+        self._rl.acquire(_CATEGORY_MAP["get_order_history"])
+
+        try:
+            raw = self._kite.order_history(order_id=broker_order_id)
+        except Exception as exc:
+            raise self._translate_broker_exception(
+                exc, {"broker_order_id": broker_order_id}, "get_order_history"
+            ) from exc
+
+        # BL-6: success in category -> reset its 429 attempt counter
+        self._reset_429_attempts(_CATEGORY_MAP["get_order_history"])
+
+        entries = [
+            OrderHistoryEntry(
+                broker_order_id=broker_order_id,
+                status=str(row.get("status", "")),
+                filled_qty=int(row.get("filled_quantity", 0)),
+                avg_price=float(row.get("average_price", 0.0)),
+                rejection_reason=str(row.get("status_message", "") or ""),
+                ts=now_ist(),
+            )
+            for row in (raw or [])
+        ]
+        ms = int((time.monotonic() - t0) * 1000)
+        self._log.info(
+            "get_order_history call_end",
+            extra={"method": "get_order_history", "duration_ms": ms,
+                   "result_summary": f"{len(entries)} entries"},
+        )
+        return entries
+
+    def get_positions(self) -> list[Position]:
+        """Return current open positions from kite."""
+        t0 = time.monotonic()
+        self._log.info(
+            "get_positions call_start",
+            extra={"method": "get_positions"},
+        )
+
+        if self._paper:
+            with self._paper_fills_lock:
+                positions = [
+                    Position(
+                        # H-12 (Wave-3 parity): return the SIGNED net qty the paper
+                        # book already tracks (info["qty"] = long > 0, short < 0;
+                        # written at the fill site) — NOT abs(). Mirrors the live
+                        # branch (kite "net" quantity is signed), so reverse-aware
+                        # consumers (determine_close_direction, the HARD_KILL /
+                        # emergency-exit / EOD flatten sweeps) pick the correct
+                        # flatten direction in paper exactly as they do in live.
+                        symbol=sym,
+                        qty=info["qty"],
+                        avg_price=info["avg_price"],
+                        # S-2 parity (28-Aug-2026): default to "" like the LIVE
+                        # branch below (:1234 str(row.get("product", ""))), NOT
+                        # to "MIS". A product-scoped safety filter treats an
+                        # unknown product as INELIGIBLE, so defaulting to "MIS"
+                        # made PAPER strictly MORE PERMISSIVE than LIVE on a
+                        # safety boundary -- a position with no product would be
+                        # squared off in paper and silently skipped in live, and
+                        # paper would have shown a green result. Paper must match
+                        # live; never the reverse.
+                        product=info.get("product", ""),
+                        side=info["side"],
+                    )
+                    for sym, info in self._paper_positions.items()
+                    if info["qty"] != 0
+                ]
+            ms = int((time.monotonic() - t0) * 1000)
+            self._log.info(
+                "get_positions call_end",
+                extra={"method": "get_positions", "duration_ms": ms,
+                       "result_summary": f"PAPER {len(positions)} positions"},
+            )
+            return positions
+
+        self._rl.acquire(_CATEGORY_MAP["get_positions"])
+
+        try:
+            raw = self._kite.positions()
+        except Exception as exc:
+            raise self._translate_broker_exception(exc, {}, "get_positions") from exc
+
+        # BL-6: success in category -> reset its 429 attempt counter
+        self._reset_429_attempts(_CATEGORY_MAP["get_positions"])
+
+        # kite returns {"day": [...], "net": [...]} — use "net" for open positions
+        net = raw.get("net", []) if isinstance(raw, dict) else []
+        positions = [
+            Position(
+                symbol=str(row.get("tradingsymbol", "")),
+                qty=int(row.get("quantity", 0)),
+                avg_price=float(row.get("average_price", 0.0)),
+                product=str(row.get("product", "")),
+                side="BUY" if int(row.get("quantity", 0)) > 0 else "SELL",
+            )
+            for row in net
+            if int(row.get("quantity", 0)) != 0
+        ]
+        ms = int((time.monotonic() - t0) * 1000)
+        self._log.info(
+            "get_positions call_end",
+            extra={"method": "get_positions", "duration_ms": ms,
+                   "result_summary": f"{len(positions)} positions"},
+        )
+        return positions
+
+    def set_paper_capital(self, value: float) -> None:
+        """
+        EF-4: late-bind paper_capital once AccountRegistry has resolved the
+        selected account.
+
+        Must be called in paper mode before any code path that reads
+        get_margins() (fund_manager.initialize, reconciler G3 check, banner
+        display). No-op in live mode (live reads real broker margins).
+
+        Replaces the pre-SU19 getattr(app_config.system, "paper_capital", ...)
+        pattern at main.py that read a ghost config key absent from YAML and
+        always defaulted to 500_000 while AccountRow.paper_capital (from
+        accounts.csv, typically 5_000_000) was the authoritative value. This
+        setter binds the adapter's paper_capital to AccountRow.paper_capital
+        after account selection completes -- single source of truth.
+        """
+        if not self._paper:
+            return
+        if value <= 0:
+            raise ValueError(
+                f"paper_capital must be > 0, got {value!r}"
+            )
+        self._paper_capital = value
+        self._log.info(
+            "adapter.set_paper_capital bound",
+            extra={"method": "set_paper_capital", "value": value},
+        )
+
+    def _install_date_header_hook(self) -> None:
+        """
+        FIX-009: attach a requests response hook to kite.reqsession to
+        capture the HTTP Date header from each Kite API response.
+
+        The kiteconnect SDK exposes its internal requests.Session as
+        `kite.reqsession`.  If the attribute is absent (mocks, paper mode)
+        the hook is silently skipped.
+        """
+        session = getattr(self._kite, "reqsession", None)
+        if session is None:
+            return
+        hooks = getattr(session, "hooks", None)
+        if hooks is None:
+            return
+
+        def _capture_date(response, *args, **kwargs):
+            date_str = response.headers.get("Date", "")
+            if date_str:
+                try:
+                    # email.utils.parsedate_to_datetime handles RFC 2822
+                    parsed = email.utils.parsedate_to_datetime(date_str)
+                    from core.time_authority import ist_timezone
+                    self._last_response_date = parsed.astimezone(ist_timezone())
+                except Exception:
+                    pass
+
+        hooks.setdefault("response", []).append(_capture_date)
+
+    def set_slippage_engine(self, engine: SlippageEngine) -> None:
+        """
+        CFG-6 (2026-04-26 audit): late-bind paper-mode slippage engine after
+        InstrumentCache is loaded. No-op in live mode (broker fills are
+        truth). Main.py constructs adapter with slippage_engine=None
+        because instrument_cache is loaded later in startup; this setter
+        wires it once available.
+        """
+        if not self._paper:
+            return
+        self._slippage = engine
+        self._log.info(
+            "adapter.set_slippage_engine bound",
+            extra={"method": "set_slippage_engine"},
+        )
+
+    def set_instrument_cache(self, cache: Any) -> None:
+        """
+        FIX-181: late-bind the InstrumentCache so place_order can snap prices
+        to a valid tick. Wired in BOTH paper and live (parity) — a non-tick
+        price is a calculation bug regardless of mode. main.py constructs the
+        adapter before the cache is loaded, so this is bound during startup.
+        """
+        self._instrument_cache = cache
+        self._log.info(
+            "adapter.set_instrument_cache bound",
+            extra={"method": "set_instrument_cache"},
+        )
+
+    def _resolve_tick(self, symbol: str) -> float:
+        """Tick for `symbol`, FAIL-SAFE. Falls back to DEFAULT_TICK (0.05) when the
+        cache is unwired / the symbol is unknown (InstrumentNotFoundError) / the
+        tick is non-positive — and emits a throttled WARN (FIX-170 visibility).
+        NEVER signals "do not round": a 0.05-multiple is also a valid 0.01-multiple,
+        so the fallback keeps the silver/ETF names PLACEABLE instead of an off-tick
+        Zerodha rejection. Residual edge (unknown symbol whose true tick > 0.05) is
+        now ALERTED, not silent."""
+        tick = None
+        if self._instrument_cache is not None:
+            try:
+                tick = self._instrument_cache.tick_size(symbol)
+            except Exception:
+                tick = None
+        if tick is None or tick <= 0:
+            if symbol not in self._missing_tick_warned:
+                self._missing_tick_warned.add(symbol)
+                self._log.warning(
+                    "snap_to_tick.missing_tick_size",
+                    extra={"symbol": symbol, "fallback_tick": DEFAULT_TICK,
+                           "note": "instrument absent / non-positive tick — "
+                                   "using DEFAULT_TICK (FIX-170)"},
+                )
+            return DEFAULT_TICK
+        return tick
+
+    def _snap_order_to_tick(
+        self,
+        symbol: str,
+        order_type: str,
+        side: str,
+        price: float,
+        trigger_price: float,
+    ) -> tuple[float, float]:
+        """
+        FIX-181 (GICRE incident): snap (price, trigger_price) to a valid tick
+        multiple for `symbol`. Zerodha rejects any price/trigger that is not a
+        tick multiple, and SL limit = trigger * (1 ± offset) almost never lands
+        on one. Authoritative net for ALL placements (entry, SL, TGT, emergency
+        and kill exits) — no caller can submit an off-tick price.
+
+        Rules:
+          - order_type "SL" (stop-limit): the limit must stay PAST the trigger
+            so a triggered stop fills like a market. SELL stop (exits LONG) ->
+            round limit DOWN; BUY stop (exits SHORT) -> round limit UP. Trigger
+            rounds to nearest (offset >> tick, so limit stays past trigger).
+          - LIMIT (entry/TGT): round to nearest tick.
+          - MARKET / SL-M: price is 0; nothing to snap.
+
+        FAIL-SAFE: the tick is resolved via _resolve_tick (DEFAULT_TICK fallback +
+        a throttled WARN on a missing/zero tick), so this NEVER returns an
+        un-rounded price — an off-tick price/trigger is exactly what Zerodha rejects.
+        """
+        tick = self._resolve_tick(symbol)
+        new_price, new_trigger = price, trigger_price
+        if order_type == "SL":
+            if price and price > 0:
+                # SELL stop (exits LONG): limit below trigger -> round DOWN.
+                # BUY stop (exits SHORT): limit above trigger -> round UP.
+                if side == "SELL":
+                    new_price = _round_down_to_tick(price, tick)
+                else:
+                    new_price = _round_up_to_tick(price, tick)
+            if trigger_price and trigger_price > 0:
+                new_trigger = _round_nearest_to_tick(trigger_price, tick)
+        else:
+            if price and price > 0:
+                new_price = _round_nearest_to_tick(price, tick)
+            if trigger_price and trigger_price > 0:
+                new_trigger = _round_nearest_to_tick(trigger_price, tick)
+
+        if new_price != price or new_trigger != trigger_price:
+            self._log.debug(
+                "adapter.snap_to_tick",
+                extra={
+                    "symbol": symbol, "order_type": order_type, "tick": tick,
+                    "price_in": price, "price_out": new_price,
+                    "trigger_in": trigger_price, "trigger_out": new_trigger,
+                },
+            )
+        return new_price, new_trigger
+
+    @property
+    def produces_broker_equivalent_margins(self) -> bool:
+        """Does get_margins() report REAL broker cash and REAL blocked margin?
+
+        Pure and stateless — a capability answer about this adapter's margin
+        data, deliberately NOT a "are we in paper mode?" question. Consumers
+        that reconcile against `net`/`used` ask THIS; they must not branch on
+        a mode label (order_reconciler RC15: paper behaviour is owned by the
+        adapter, not special-cased in the reconciler).
+
+        False in paper: the branch below returns `net = self._paper_capital`
+        (the paper ledger, which moves only with realised PnL) and `used = 0.0`
+        HARDCODED — margin blocking is not simulated at all. So a paper `net`
+        cannot be compared against any expectation that deducts deployed
+        capital, and a paper `used` cannot be reconciled against held margin.
+        Paper simulation of blocked margin is designed-and-owed work; until it
+        lands, both comparisons are unexercisable in paper by construction.
+        """
+        return not self._paper
+
+    def get_margins(self) -> MarginInfo:
+        """Return equity margin info from kite."""
+        t0 = time.monotonic()
+        self._log.info(
+            "get_margins call_start",
+            extra={"method": "get_margins"},
+        )
+
+        if self._paper:
+            info = MarginInfo(
+                net=self._paper_capital,
+                available=self._paper_capital,
+                used=0.0,
+                ts=now_ist(),
+            )
+            ms = int((time.monotonic() - t0) * 1000)
+            self._log.info(
+                "get_margins call_end",
+                extra={"method": "get_margins", "duration_ms": ms,
+                       "result_summary": f"PAPER net={self._paper_capital}"},
+            )
+            return info
+
+        self._rl.acquire(_CATEGORY_MAP["get_margins"])
+
+        try:
+            raw = self._kite.margins(segment="equity")
+        except Exception as exc:
+            raise self._translate_broker_exception(exc, {}, "get_margins") from exc
+
+        # BL-6: success in category -> reset its 429 attempt counter
+        self._reset_429_attempts(_CATEGORY_MAP["get_margins"])
+
+        equity = raw if isinstance(raw, dict) else {}
+        info = MarginInfo(
+            net=float(equity.get("net", 0.0)),
+            available=float(equity.get("available", {}).get("cash", 0.0)),
+            used=float(equity.get("utilised", {}).get("debits", 0.0)),
+            ts=now_ist(),
+        )
+        ms = int((time.monotonic() - t0) * 1000)
+        self._log.info(
+            "get_margins call_end",
+            extra={"method": "get_margins", "duration_ms": ms,
+                   "result_summary": f"net={info.net}"},
+        )
+        return info
+
+    def get_live_margin_pct(self, symbol: str, intent: str) -> float:
+        """
+        FIX-072: Fetch live margin requirement percentage from broker API.
+
+        Uses kite.order_margins() to query the exact margin required for
+        placing 1 share of the given symbol with the specified intent (product).
+        Returns margin_required / price as a percentage (e.g., 0.20 = 20% margin).
+
+        Results are cached with a 5-minute TTL to avoid repeated API calls
+        for the same (symbol, intent) pair. Use invalidate_margin_cache()
+        to force a fresh fetch (e.g., after 16388 margin rejection).
+
+        Paper mode: returns static leverage from _leverage_map (no broker call).
+        Live mode: calls broker API with TTL caching.
+
+        Args:
+            symbol: Trading symbol (e.g., "RELIANCE").
+            intent: Semantic product intent (e.g., "INTRADAY", "DELIVERY").
+
+        Returns:
+            Margin percentage as a decimal (0.20 = 20% margin, leverage = 5x).
+            On API failure: raises BrokerError (caller should catch and fallback).
+
+        Raises:
+            BrokerError: if live API call fails.
+            ValueError: if intent is invalid or broker_code not resolved.
+        """
+        # Paper mode: no broker API; raise error so caller falls back to static
+        if self._paper:
+            raise BrokerError(
+                "get_live_margin_pct not available in paper mode; use static leverage"
+            )
+
+        cache_key = (symbol, intent)
+
+        # Check cache first (thread-safe)
+        with self._margin_cache_lock:
+            if cache_key in self._margin_cache:
+                margin_pct, fetched_at = self._margin_cache[cache_key]
+                age_sec = (now_ist() - fetched_at).total_seconds()
+                if age_sec < self._margin_cache_ttl_sec:
+                    # Cache hit within TTL
+                    return margin_pct
+
+        # Cache miss or expired: fetch from broker
+        t0 = time.monotonic()
+        self._log.info(
+            "get_live_margin_pct call_start",
+            extra={"method": "get_live_margin_pct", "symbol": symbol, "intent": intent},
+        )
+
+        # Resolve intent -> broker product code
+        try:
+            broker_code = self._pr.resolve(intent, "zerodha")
+        except Exception as exc:
+            raise ValueError(
+                f"Failed to resolve intent {intent!r} to broker code: {exc}"
+            ) from exc
+
+        # Acquire rate limit token (use "order" category as this is order-related)
+        self._rl.acquire(_CATEGORY_MAP["place_order"])
+
+        try:
+            # Query broker for margin required for 1 share at market price
+            # kite.order_margins() expects a list of order params
+            raw = self._kite.order_margins([{
+                "exchange": "NSE",
+                "tradingsymbol": symbol,
+                "transaction_type": "BUY",  # Use BUY; margin is symmetric
+                "variety": "regular",
+                "product": broker_code,
+                "order_type": "MARKET",
+                "quantity": 1,
+            }])
+        except Exception as exc:
+            # Translate kite exception to system exception
+            raise self._translate_broker_exception(
+                exc, {"symbol": symbol, "intent": intent}, "order_margins"
+            ) from exc
+
+        # BL-6: success -> reset 429 attempt counter for this category
+        self._reset_429_attempts(_CATEGORY_MAP["place_order"])
+
+        # Parse response: raw is a list of margin objects
+        # Each object has: {"total": <float>, "pnl": {...}, "span": {...}, ...}
+        if not raw or not isinstance(raw, list) or len(raw) == 0:
+            raise BrokerError(
+                f"order_margins returned empty or invalid response for {symbol}/{intent}"
+            )
+
+        margin_obj = raw[0]
+        margin_required = float(margin_obj.get("total", 0.0))
+
+        # Get current LTP to compute margin percentage
+        # We need price to calculate margin_pct = margin_required / (qty * price)
+        # Since qty=1, margin_pct = margin_required / price
+        try:
+            quotes_dict = self.get_quote([symbol])  # get_quote takes a list
+            # get_quote returns dict[symbol, Quote] (stripped of "NSE:" prefix)
+            if symbol not in quotes_dict:
+                raise BrokerError(f"Quote for {symbol} not in response")
+            quote = quotes_dict[symbol]
+            price = quote.last_price
+        except Exception:
+            # If quote fetch fails, cannot compute margin_pct reliably
+            # Raise error so caller can fallback to static
+            raise BrokerError(
+                f"Failed to fetch quote for {symbol} (needed for margin_pct calc)"
+            )
+
+        if price <= 0:
+            raise BrokerError(
+                f"Invalid price {price} for {symbol} (cannot compute margin_pct)"
+            )
+
+        margin_pct = margin_required / price
+
+        # Cache the result
+        with self._margin_cache_lock:
+            self._margin_cache[cache_key] = (margin_pct, now_ist())
+
+        ms = int((time.monotonic() - t0) * 1000)
+        self._log.info(
+            "get_live_margin_pct call_end",
+            extra={
+                "method": "get_live_margin_pct",
+                "symbol": symbol,
+                "intent": intent,
+                "margin_pct": margin_pct,
+                "duration_ms": ms,
+            },
+        )
+
+        return margin_pct
+
+    def invalidate_margin_cache(self, symbol: str, intent: str) -> None:
+        """
+        FIX-072: Invalidate cached margin for (symbol, intent).
+
+        Called by order_placer when a 16388 margin rejection occurs, forcing
+        a fresh fetch on the next get_live_margin_pct() call.
+
+        Args:
+            symbol: Trading symbol.
+            intent: Product intent.
+        """
+        cache_key = (symbol, intent)
+        with self._margin_cache_lock:
+            if cache_key in self._margin_cache:
+                del self._margin_cache[cache_key]
+                self._log.info(
+                    "margin_cache invalidated",
+                    extra={"symbol": symbol, "intent": intent},
+                )
+
+    def get_server_time(self) -> datetime:
+        """
+        Return an approximate broker server timestamp for clock-skew checks (G4).
+
+        Paper mode: returns now_ist() directly (local clock is the reference).
+        Live mode:  makes a lightweight quote API call to verify connectivity,
+                    then returns now_ist() after the round-trip.  This gives an
+                    approximation of the broker server time (within one RTT).
+                    A future improvement would parse response headers or use NTP.
+
+        D.3 (2026-04-25): switched from kite.margins() (consumes the
+        "margins" rate-limit bucket alongside reconciler at 15s and
+        order_monitor at 2s) to kite.quote(["NSE:NIFTY 50"]) which uses
+        the "quote" bucket. Frees margins capacity (burst=1, 1/sec) for
+        the reconciler/order_monitor hot paths and avoids starvation
+        when the probe runs every 60s.
+
+        Raises a broker exception if the live API call fails, so the caller
+        (check_clock_skew) can return passed=False instead of swallowing the
+        connectivity error.
+        """
+        if self._paper:
+            return now_ist()
+        # Live: ping broker to validate connectivity; raises on failure.
+        # FIX-009: the response hook (_install_date_header_hook) captures the
+        # HTTP Date header from this call. After the quote returns we use that
+        # header as the broker clock, falling back to now_ist() if absent.
+        self._last_response_date = None  # reset before call
+        try:
+            self._rl.acquire(_CATEGORY_MAP["get_quote"])
+            # NIFTY 50 is the canonical liquid index quote, always available
+            # during market hours and a tiny payload. Errors propagate.
+            self._kite.quote(["NSE:NIFTY 50"])
+        except Exception as exc:
+            raise self._translate_broker_exception(exc, {}, "get_quote") from exc
+        # BL-6: success in category -> reset its 429 attempt counter
+        self._reset_429_attempts(_CATEGORY_MAP["get_quote"])
+        # FIX-009: prefer broker Date header; fall back to local clock on miss
+        if self._last_response_date is not None:
+            return self._last_response_date
+        return now_ist()
+
+    def get_quote(self, symbols: list[str]) -> dict[str, Quote]:
+        """
+        Return quotes for a list of symbols.
+        In paper mode, delegates to an injected quote_provider callable.
+        Raises NotImplementedError if paper mode and no provider injected.
+        """
+        t0 = time.monotonic()
+        self._log.info(
+            "get_quote call_start",
+            extra={"method": "get_quote", "symbol_count": len(symbols)},
+        )
+
+        if self._paper:
+            if self._quote_provider is None:
+                raise NotImplementedError(
+                    "get_quote in paper mode requires a quote_provider "
+                    "injected at construction"
+                )
+            result = self._quote_provider(symbols)
+            ms = int((time.monotonic() - t0) * 1000)
+            self._log.info(
+                "get_quote call_end",
+                extra={"method": "get_quote", "duration_ms": ms,
+                       "result_summary": f"PAPER {len(result)} quotes"},
+            )
+            return result
+
+        self._rl.acquire(_CATEGORY_MAP["get_quote"])
+
+        # kite quote() takes positional instrument keys: "NSE:RELIANCE", ...
+        instrument_keys = [f"NSE:{s}" for s in symbols]
+        try:
+            raw = self._kite.quote(*instrument_keys)
+        except Exception as exc:
+            raise self._translate_broker_exception(
+                exc, {"symbols": symbols}, "get_quote"
+            ) from exc
+
+        # BL-6: success in category -> reset its 429 attempt counter
+        self._reset_429_attempts(_CATEGORY_MAP["get_quote"])
+
+        ts = now_ist()
+        quotes: dict[str, Quote] = {}
+        for key, data in (raw or {}).items():
+            symbol = key.split(":", 1)[-1]   # "NSE:RELIANCE" -> "RELIANCE"
+            depth = data.get("depth", {})
+            bid = 0.0
+            ask = 0.0
+            if depth:
+                bids = depth.get("buy", [])
+                asks = depth.get("sell", [])
+                bid = float(bids[0]["price"]) if bids else 0.0
+                ask = float(asks[0]["price"]) if asks else 0.0
+            # v2.1: extract OHLC, VWAP, circuit limits from Kite response
+            ohlc = data.get("ohlc", {})
+            quotes[symbol] = Quote(
+                symbol=symbol,
+                last_price=float(data.get("last_price", 0.0)),
+                bid=bid,
+                ask=ask,
+                volume=int(data.get("volume", 0)),
+                ts=ts,
+                vwap=float(data["average_price"]) if data.get("average_price") else None,
+                open_price=float(ohlc["open"]) if ohlc.get("open") else None,
+                day_high=float(ohlc["high"]) if ohlc.get("high") else None,
+                day_low=float(ohlc["low"]) if ohlc.get("low") else None,
+                upper_circuit=float(data["upper_circuit_limit"]) if data.get("upper_circuit_limit") else None,
+                lower_circuit=float(data["lower_circuit_limit"]) if data.get("lower_circuit_limit") else None,
+            )
+
+        ms = int((time.monotonic() - t0) * 1000)
+        self._log.info(
+            "get_quote call_end",
+            extra={"method": "get_quote", "duration_ms": ms,
+                   "result_summary": f"{len(quotes)} quotes"},
+        )
+        return quotes
+
+    def get_quote_raw(self, instrument_keys: list[str]) -> dict:
+        """Rate-limited raw kite quote including depth data (FIX-166 F08).
+
+        Unlike ``get_quote`` which returns typed ``Quote`` objects, this
+        returns the raw dict from ``kite.quote()`` so callers that need
+        full depth (bid/ask quantities) can access it while still going
+        through the rate limiter.  Returns ``{}`` in paper mode.
+        """
+        if self._paper:
+            return {}
+        self._rl.acquire(_CATEGORY_MAP["get_quote"])
+        try:
+            raw = self._kite.quote(*instrument_keys)
+        except Exception as exc:
+            raise self._translate_broker_exception(
+                exc, {"keys": instrument_keys}, "get_quote_raw"
+            ) from exc
+        self._reset_429_attempts(_CATEGORY_MAP["get_quote"])
+        return raw or {}
+
+    def get_trades(self) -> list[dict]:
+        """
+        FIX-148: Return today's executed trades from Kite trades() API.
+
+        Used by order_reconciler CHECK 1 to find the actual exit price when a
+        position was closed externally (RMS squareoff, manual close via terminal).
+
+        In paper mode returns an empty list (paper adapter tracks fills internally).
+
+        Returns:
+            List of dicts with keys: trade_id, order_id, tradingsymbol,
+            transaction_type, quantity, average_price, fill_timestamp.
+        """
+        if self._paper:
+            return []
+        try:
+            self._rl.acquire(_CATEGORY_MAP["get_trades"])
+            raw = self._kite.trades()
+        except Exception as exc:
+            raise self._translate_broker_exception(exc, {}, "get_trades") from exc
+
+        self._reset_429_attempts(_CATEGORY_MAP["get_trades"])
+
+        return [
+            {
+                "trade_id": t.get("trade_id", ""),
+                "order_id": t.get("order_id", ""),
+                "tradingsymbol": t.get("tradingsymbol", ""),
+                "transaction_type": t.get("transaction_type", ""),
+                "quantity": int(t.get("quantity", 0)),
+                "average_price": float(t.get("average_price", 0.0)),
+                "fill_timestamp": t.get("fill_timestamp", ""),
+            }
+            for t in (raw or [])
+        ]
+
+    def get_open_orders(self) -> list[dict]:
+        """
+        Return all broker-side orders that are OPEN or TRIGGER PENDING.
+
+        Used by:
+            - order_reconciler CHECK 6 (ORPHAN_ORDER): detect orders that
+              exist at the broker but have no corresponding local trade row.
+            - order_reconciler CHECK 8 (CO_SL_DRIFT, M-2): compare broker-side
+              CO trigger_price against SmartTgtManager-tracked current_sl.
+            - order_monitor orphan second-source check (H-15): verify tracked
+              broker_order_ids still exist before firing orphan callbacks.
+
+        In paper mode returns synthetic open-order entries from _paper_fills
+        so the reconciler can distinguish pending from filled/cancelled orders.
+
+        Returns:
+            List of dicts with keys: ``order_id``, ``symbol``, ``status``,
+            ``transaction_type``, ``quantity``, ``price``, ``trigger_price``.
+        """
+        if self._paper:
+            with self._paper_fills_lock:
+                return [
+                    {
+                        "order_id": bid,
+                        "symbol": info.get("symbol", ""),
+                        "status": "OPEN",
+                        "transaction_type": info.get("side", ""),
+                        "quantity": info.get("qty", 0),
+                        "price": info.get("price", 0.0),
+                        "trigger_price": info.get("trigger_price", 0.0),
+                    }
+                    for bid, info in self._paper_fills.items()
+                    if info.get("status") == "SUBMITTED"
+                ]
+        try:
+            self._rl.acquire(_CATEGORY_MAP["get_margins"])  # reuse quota bucket
+            all_orders = self._kite.orders()
+        except Exception as exc:
+            # BL-6: tag operation as get_margins (the reused quota category)
+            raise self._translate_broker_exception(exc, {}, "get_margins") from exc
+
+        # BL-6: success in category -> reset its 429 attempt counter
+        self._reset_429_attempts(_CATEGORY_MAP["get_margins"])
+
+        open_statuses = {"OPEN", "TRIGGER PENDING"}
+        return [
+            {
+                "order_id": o.get("order_id", ""),
+                "symbol": o.get("tradingsymbol", ""),
+                "status": o.get("status", ""),
+                "transaction_type": o.get("transaction_type", ""),
+                "quantity": o.get("quantity", 0),
+                "price": o.get("price", 0.0),
+                # M-2: trigger_price included so order_reconciler CHECK 8
+                # can compare broker-side CO SL trigger against local current_sl.
+                "trigger_price": o.get("trigger_price", 0.0),
+            }
+            for o in (all_orders or [])
+            if o.get("status", "").upper() in open_statuses
+        ]
+
+    def get_all_orders(self) -> list[dict]:
+        """A-1/E-1: ALL of today's broker orders (ANY status) WITH the broker ``tag``.
+
+        The tag-correlation recovery (order_reconciler) matches a timed-out/crashed
+        ENTRY back to its local trade by ``truncate_tag_for_broker(trade_id)``. That
+        needs (a) every state, not just OPEN — a filled entry is COMPLETE, not in
+        get_open_orders(); and (b) the ``tag``, which get_open_orders() drops.
+
+        Live: ``kite.orders()`` unfiltered (the day's orderbook persists across our
+        restarts, same session). Paper: every ``_paper_fills`` entry (the paper
+        oracle) with its retained tag. Returns dicts: ``order_id``, ``tag``,
+        ``status``, ``transaction_type``, ``symbol``, ``quantity``,
+        ``filled_quantity``, ``average_price``, ``trigger_price``, ``product``.
+        ``product`` lets the recovery backfill the missing ENTRY orders row.
+        """
+        if self._paper:
+            with self._paper_fills_lock:
+                return [
+                    {
+                        "order_id": bid,
+                        "tag": info.get("tag", "") or "",
+                        "status": info.get("status", ""),
+                        "transaction_type": info.get("side", ""),
+                        "symbol": info.get("symbol", ""),
+                        "quantity": info.get("qty", 0),
+                        "filled_quantity": info.get("filled_qty", 0),
+                        "average_price": info.get("avg_price", 0.0),
+                        "trigger_price": info.get("trigger_price", 0.0),
+                        "product": info.get("product", "") or "",
+                    }
+                    for bid, info in self._paper_fills.items()
+                ]
+        try:
+            self._rl.acquire(_CATEGORY_MAP["get_margins"])  # reuse quota bucket
+            all_orders = self._kite.orders()
+        except Exception as exc:
+            raise self._translate_broker_exception(exc, {}, "get_margins") from exc
+        self._reset_429_attempts(_CATEGORY_MAP["get_margins"])
+
+        def _tag_of(o: dict) -> str:
+            # Kite returns the sent tag as ``tag`` (and, newer API, ``tags`` list).
+            t = o.get("tag") or ""
+            if not t:
+                tags = o.get("tags")
+                if isinstance(tags, list) and tags:
+                    t = str(tags[0])
+            return t or ""
+
+        return [
+            {
+                "order_id": o.get("order_id", ""),
+                "tag": _tag_of(o),
+                "status": o.get("status", ""),
+                "transaction_type": o.get("transaction_type", ""),
+                "symbol": o.get("tradingsymbol", ""),
+                "quantity": o.get("quantity", 0),
+                "filled_quantity": o.get("filled_quantity", 0),
+                "average_price": o.get("average_price", 0.0),
+                "trigger_price": o.get("trigger_price", 0.0),
+                "product": o.get("product", "") or "",
+            }
+            for o in (all_orders or [])
+        ]
+
+    # ── private helpers ───────────────────────────────────────────────────────
+
+    # ── BL-6: 429 handling ────────────────────────────────────────────────────
+    #
+    # kiteconnect surfaces HTTP 429 on its exception classes via .code (see
+    # kex.KiteException.code -- set from the upstream HTTP response). Empirically
+    # the SDK wraps 429 into either kex.NetworkException (transport-shaped) or
+    # kex.GeneralException (API-shaped), so we inspect .code regardless of the
+    # concrete type. If the SDK starts exposing a more specific type in a
+    # future release, add it to the detection branch below.
+    #
+    # ZA11 (adapter does not retry) stays intact: _translate_broker_exception
+    # computes the backoff delay, calls rate_limiter.penalize() to freeze the
+    # bucket, and RAISES BrokerRateLimit429Error. It does NOT sleep and does
+    # NOT loop. The caller (OrderPlacer, per BL-19) owns retry -- its next
+    # acquire() call blocks until the bucket thaws, which is the backoff pacing.
+
+    def _is_429(self, exc: Exception) -> bool:
+        """BL-6: classify a kiteconnect exception as a broker-side HTTP 429."""
+        return getattr(exc, "code", None) == 429
+
+    def _compute_429_backoff_delay(self, category: str) -> tuple[float, int]:
+        """
+        BL-6: compute next penalize() duration for this category and increment
+        the per-category 429 attempt counter.
+
+        Returns (delay_sec, attempt_number_1_indexed).
+        """
+        cfg = self._rl_backoff
+        with self._429_lock:
+            prior = self._429_attempts.get(category, 0)
+            self._429_attempts[category] = prior + 1
+        base = cfg.initial_delay_sec * (cfg.multiplier ** prior)
+        capped = min(base, cfg.max_delay_sec)
+        jitter = (
+            random.uniform(-cfg.jitter_sec, cfg.jitter_sec)
+            if cfg.jitter_sec > 0 else 0.0
+        )
+        delay = max(0.0, capped + jitter)
+        return delay, prior + 1
+
+    def _reset_429_attempts(self, category: str) -> None:
+        """BL-6: reset per-category 429 counter after a successful call."""
+        with self._429_lock:
+            self._429_attempts.pop(category, None)
+
+    def _translate_broker_exception(
+        self,
+        exc: Exception,
+        context: dict[str, object],
+        operation: str,
+    ) -> BrokerError:
+        """
+        BL-6: instance-aware wrapper over _translate_kite_exception.
+
+        If the exception carries HTTP status 429, call rate_limiter.penalize()
+        to freeze the bucket and return a typed BrokerRateLimit429Error.
+        Otherwise fall through to the module-level generic translator
+        (TokenException -> BrokerAuthError, NetworkException -> BrokerTimeout,
+        etc. -- ZA5 taxonomy unchanged).
+
+        ZA11 intact: this method does NOT retry, does NOT sleep.
+        """
+        if self._is_429(exc):
+            category = _CATEGORY_MAP.get(operation, "order")
+            delay, attempt = self._compute_429_backoff_delay(category)
+            try:
+                self._rl.penalize(category, delay)
+            except ValueError as pz_exc:
+                # unknown category from the operation map -- log and raise
+                # without penalize; caller still sees BrokerRateLimit429Error
+                self._log.error(
+                    "zerodha_adapter.penalize_unknown_category",
+                    extra={"operation": operation, "category": category,
+                           "error": str(pz_exc)},
+                )
+            self._log.warning(
+                "zerodha_adapter.broker_429",
+                extra={"operation": operation, "category": category,
+                       "attempt": attempt, "delay_sec": delay,
+                       **context},
+            )
+            return BrokerRateLimit429Error(
+                f"broker 429 on {operation}",
+                operation=operation,
+                category=category,
+                delay_sec=delay,
+                attempt=attempt,
+            )
+        return _translate_kite_exception(exc, context, self._log)
+
+    def _validate_place_order(
+        self,
+        symbol: str,
+        side: str,
+        qty: int,
+        price: float,
+        order_type: str,
+        trigger_price: float = 0.0,
+        market_protection: Optional[float] = None,
+    ) -> None:
+        """ZA13: raise ValueError before touching rate limiter or state machine."""
+        if not symbol or not isinstance(symbol, str):
+            raise ValueError("symbol must be a non-empty string")
+        if side not in _VALID_SIDES:
+            raise ValueError(
+                f"side must be 'BUY' or 'SELL', got {side!r}"
+            )
+        if not isinstance(qty, int) or qty <= 0:
+            raise ValueError(
+                f"qty must be a positive integer, got {qty!r}"
+            )
+        if order_type not in _VALID_ORDER_TYPES:
+            raise ValueError(
+                f"order_type must be one of {sorted(_VALID_ORDER_TYPES)}, "
+                f"got {order_type!r}"
+            )
+        if order_type in ("LIMIT", "SL") and price <= 0:
+            raise ValueError(
+                f"price must be > 0 for {order_type} orders, got {price!r}"
+            )
+        # ZA17: SL and SL-M orders require trigger_price > 0
+        if order_type in ("SL", "SL-M") and trigger_price <= 0:
+            raise ValueError(
+                f"trigger_price must be > 0 for {order_type} orders, "
+                f"got {trigger_price!r}"
+            )
+        # market_protection: None means "omit", which is the pre-existing wire
+        # shape for every caller that does not opt in. Any non-None value is
+        # bounds-checked HERE because the SDK checks nothing (see the constants).
+        if market_protection is not None:
+            if isinstance(market_protection, bool) or not isinstance(
+                market_protection, (int, float)
+            ):
+                raise ValueError(
+                    f"market_protection must be a number (percent), got "
+                    f"{market_protection!r}"
+                )
+            if not (
+                _MARKET_PROTECTION_MIN_PCT
+                <= float(market_protection)
+                <= _MARKET_PROTECTION_MAX_PCT
+            ):
+                raise ValueError(
+                    f"market_protection must be a PERCENT in "
+                    f"[{_MARKET_PROTECTION_MIN_PCT}, {_MARKET_PROTECTION_MAX_PCT}] "
+                    f"(1.5 means 1.5%, NOT a fraction — 0.015 would be 0.015%); "
+                    f"got {market_protection!r}"
+                )
+
+    def _paper_place_order(
+        self,
+        internal_id: str,
+        symbol: str,
+        side: str,
+        qty: int,
+        price: float,
+        order_type: str,
+        broker_code: str,
+        trigger_price: float = 0.0,
+        variety: str = "regular",
+        tag: str = "",
+    ) -> PlacedOrder:
+        """
+        Simulate order placement in paper mode (ZA10 + ZA16a).
+
+        Returns SUBMITTED immediately; spawns a daemon thread that
+        transitions to COMPLETE and publishes OrderFilled after
+        paper_auto_fill_delay_sec. See ZA16a rationale in module docstring.
+        """
+        fake_broker_id = "PAPER_" + uuid.uuid4().hex[:12].upper()
+        self._osm.transition(internal_id, "SUBMITTED")
+
+        with self._paper_fills_lock:
+            self._paper_fills[fake_broker_id] = {
+                "status": "SUBMITTED", "filled_qty": 0, "avg_price": 0.0,
+                "symbol": symbol, "side": side, "qty": qty,
+                "price": price, "trigger_price": trigger_price,
+                # A-1/E-1: retain the broker tag so get_all_orders() can
+                # tag-correlate this paper order (parity with the live path);
+                # product lets the recovery backfill the ENTRY orders row.
+                "tag": truncate_tag_for_broker(tag) if tag else "",
+                "product": broker_code or "",
+            }
+
+        # ZA16a: paper mode synthesizes the broker fill that live mode
+        # receives from order_monitor. Fire the synth off the thread so
+        # place_order returns immediately like the live path does.
+        thread = threading.Thread(
+            target=self._synth_fill,
+            name=f"paper_synth_{internal_id}",
+            args=(internal_id, fake_broker_id, symbol, side, qty, price,
+                  order_type, trigger_price),
+            daemon=True,
+        )
+        thread.start()
+
+        return PlacedOrder(
+            internal_order_id=internal_id,
+            broker_order_id=fake_broker_id,
+            symbol=symbol,
+            side=side,
+            qty=qty,
+            price=price,
+            order_type=order_type,
+            product=broker_code,
+            status="SUBMITTED",
+            ts=now_ist(),
+            trigger_price=trigger_price,
+            variety=variety,
+        )
+
+    def _synth_fill(
+        self,
+        internal_id: str,
+        broker_order_id: str,
+        symbol: str,
+        side: str,
+        qty: int,
+        price: float,
+        order_type: str = "LIMIT",
+        trigger_price: float = 0.0,
+    ) -> None:
+        """
+        ZA16a: paper-mode fill synthesizer.
+
+        Sleeps paper_auto_fill_delay_sec, transitions OSM SUBMITTED->COMPLETE,
+        publishes OrderFilled. Runs on a daemon thread. Must NEVER fire in
+        live mode -- runtime guard logs CRITICAL and returns if self._paper
+        is False (belt-and-braces against a future refactor accidentally
+        invoking this from live code; ZA16 regression guard).
+
+        Audit 6.2 (LTP-gating): when paper_ltp_gating_enabled=True the
+        synthesizer no longer fills LIMIT/SL/SL-M orders unconditionally.
+        It polls quote_provider() up to ltp_gating_max_wait_sec and only
+        fires OrderFilled when LTP has crossed the order condition:
+          - LIMIT BUY  : LTP <= price          fill at min(LTP, price)
+          - LIMIT SELL : LTP >= price          fill at max(LTP, price)
+          - SL-M BUY   : LTP >= trigger_price  fill at LTP
+          - SL-M SELL  : LTP <= trigger_price  fill at LTP
+          - SL  BUY    : LTP >= trigger_price  fill at min(LTP, price)
+          - SL  SELL   : LTP <= trigger_price  fill at max(LTP, price)
+          - MARKET     : fill at LTP after delay (or `price` if LTP unavail)
+        If max_wait elapses without a crossing, OSM stays SUBMITTED and
+        no OrderFilled is published -- equivalent to a real broker leaving
+        the order pending. order_timeout / EOD cleanup deals with stragglers.
+
+        When ltp_gating_enabled=False (default for tests) behaviour is
+        identical to pre-fix: sleep + always fill at `price`.
+        """
+        # ZA16a guard: live mode must never take this path.
+        if not self._paper:
+            self._log.critical(
+                "zerodha_adapter._synth_fill invoked in live mode -- "
+                "ZA16a violation, aborting without publish",
+                extra={"internal_order_id": internal_id,
+                       "broker_order_id": broker_order_id, "symbol": symbol},
+            )
+            return
+
+        try:
+            delay = max(0.0, self._paper_auto_fill_delay_sec)
+            if delay > 0:
+                time.sleep(delay)
+
+            # Audit 6.2: LTP-gated fill computation.
+            if self._paper_ltp_gating_enabled:
+                fill_price = self._compute_ltp_gated_fill_price(
+                    symbol=symbol,
+                    side=side,
+                    order_type=order_type,
+                    price=price,
+                    trigger_price=trigger_price,
+                )
+                if fill_price is None:
+                    # No LTP crossing within the bounded poll horizon. Leave
+                    # OSM at SUBMITTED so order_timeout/EOD handles cleanup.
+                    self._log.info(
+                        "paper_synth: LTP-gating timeout, no fill",
+                        extra={"internal_order_id": internal_id,
+                               "broker_order_id": broker_order_id,
+                               "symbol": symbol, "order_type": order_type,
+                               "price": price, "trigger_price": trigger_price},
+                    )
+                    return
+
+                # Sanity guard: reject fills that deviate >50% from the
+                # reference price. Catches stale/stub LTP leaking in.
+                ref = trigger_price if trigger_price > 0 else price
+                if ref > 0 and fill_price > 0:
+                    deviation = abs(fill_price - ref) / ref
+                    if deviation > 0.50:
+                        self._log.warning(
+                            "paper_synth: fill_price deviates >50%% from "
+                            "reference, rejecting fill (likely stale LTP)",
+                            extra={
+                                "internal_order_id": internal_id,
+                                "symbol": symbol,
+                                "fill_price": fill_price,
+                                "reference_price": ref,
+                                "deviation_pct": round(deviation * 100, 1),
+                            },
+                        )
+                        return
+            else:
+                # Legacy behaviour: always fill at the requested price.
+                fill_price = price
+
+            # CFG-6 (2026-04-26 audit): apply per-tier slippage to the synth
+            # fill so paper P&L does not over-state vs live (P12). Engine is
+            # injected; absent => zero slippage (back-compat for tests that
+            # don't wire it). MARKET with no LTP can land here as price=0.0;
+            # SlippageEngine.apply() short-circuits non-positive prices.
+            if self._slippage is not None:
+                fill_price = self._slippage.apply(symbol, side, fill_price)
+
+            # OSM transition: SUBMITTED -> COMPLETE (legal per OSM2).
+            try:
+                self._osm.transition(internal_id, "COMPLETE")
+            except InvalidTransitionError:
+                # Already terminal (e.g., cancelled between place and synth).
+                # Idempotent: do not publish a spurious fill.
+                self._log.info(
+                    "paper_synth: OSM already terminal, skip publish",
+                    extra={"internal_order_id": internal_id,
+                           "broker_order_id": broker_order_id},
+                )
+                return
+
+            with self._paper_fills_lock:
+                # A-1/E-1: MERGE (do not replace) so symbol/side/tag from the
+                # SUBMITTED record survive onto the COMPLETE record — get_all_orders()
+                # needs them to tag-correlate a filled paper order.
+                _rec = self._paper_fills.get(broker_order_id, {})
+                _rec.update(
+                    {"status": "COMPLETE", "filled_qty": qty, "avg_price": fill_price}
+                )
+                self._paper_fills[broker_order_id] = _rec
+                pos = self._paper_positions.get(symbol, {"qty": 0, "avg_price": 0.0})
+                old_qty = pos["qty"]
+                old_avg = pos["avg_price"]
+                if side == "BUY":
+                    new_qty = old_qty + qty
+                else:
+                    new_qty = old_qty - qty
+
+                # Track realized PnL so get_margins() reflects trade outcomes
+                # (paper/live parity: real broker margins update after fills).
+                if old_qty != 0 and abs(new_qty) < abs(old_qty):
+                    closed_qty = abs(old_qty) - abs(new_qty)
+                    realized_pnl = (fill_price - old_avg) * (
+                        closed_qty if old_qty > 0 else -closed_qty
+                    )
+                    self._paper_capital += realized_pnl
+
+                if new_qty == 0:
+                    self._paper_positions.pop(symbol, None)
+                else:
+                    # SK-A (26-Jul-2026): REFLECT the order's product, do not assert a
+                    # constant. `_rec` is the SUBMITTED record this fill merged into,
+                    # and _paper_place_order already put the resolved broker code on it
+                    # (":1985 'product': broker_code or ''"). The value was in hand
+                    # three lines up and was being discarded.
+                    #
+                    # WHY IT MATTERED: two safety mechanisms read a POSITION's product,
+                    # and a constant "MIS" blinded both in paper (live was always
+                    # correct — the live branch reads kite's own per-position product):
+                    #   * EOD6/FIX-015 — eod_squareoff.py:1069-1073 filters to
+                    #     ("MIS","CO") and SKIPS anything absent, so a delivery position
+                    #     is exempt from the 15:17 square-off. In paper it reported MIS
+                    #     and got squared ⇒ "paper-proven", the stated gate for delivery
+                    #     going live, could not prove the one thing it had to.
+                    #   * H-5 — kill_switch.py:1588 derives the HARD_KILL orphan-sweep
+                    #     intent from pos.product; an orphan CNC swept as INTRADAY does
+                    #     not offset it and opens a fresh naked MIS short.
+                    #
+                    # FALLBACK DIRECTION IS DELIBERATE: `or "MIS"` only where nothing is
+                    # known. An empty product would fall OUT of the ("MIS","CO") filter
+                    # and be silently CARRIED — the unsafe direction — and
+                    # get_positions()'s own `info.get("product", "MIS")` (:1109) does not
+                    # catch it, because that default fires only on a MISSING KEY, not an
+                    # empty value. Normalising here means an unknown product degrades to
+                    # squared, which is recoverable, never to a carry, which is not.
+                    self._paper_positions[symbol] = {
+                        "qty": new_qty,
+                        "avg_price": fill_price,
+                        "side": "BUY" if new_qty > 0 else "SELL",
+                        "product": _rec.get("product") or "MIS",
+                    }
+
+            if self._bus is None:
+                # Degraded mode warned at ctor time. State reached COMPLETE;
+                # downstream will not see OrderFilled. Tests hit this path.
+                return
+
+            filled_at = now_ist()
+            # expected_price is the order condition (limit/trigger), not LTP,
+            # so slippage analytics measure (fill - expected) like live mode.
+            expected_for_slippage = price if price > 0 else trigger_price
+            slippage_pct = 0.0
+            if expected_for_slippage > 0 and fill_price != expected_for_slippage:
+                slippage_pct = (
+                    (fill_price - expected_for_slippage) / expected_for_slippage
+                )
+            self._bus.publish(
+                OrderFilled(
+                    source_module="zerodha_adapter_paper",
+                    internal_order_id=internal_id,
+                    broker_order_id=broker_order_id,
+                    symbol=symbol,
+                    side=side,
+                    filled_qty=qty,
+                    avg_fill_price=fill_price,
+                    expected_price=expected_for_slippage or fill_price,
+                    slippage_pct=slippage_pct,
+                    filled_at=filled_at.isoformat(),
+                )
+            )
+            self._log.info(
+                "paper_synth: OrderFilled published",
+                extra={"internal_order_id": internal_id,
+                       "broker_order_id": broker_order_id,
+                       "symbol": symbol, "qty": qty, "fill_price": fill_price,
+                       "order_type": order_type,
+                       "ltp_gated": self._paper_ltp_gating_enabled},
+            )
+        except Exception as exc:  # noqa: BLE001 -- thread must not propagate
+            log_exception(self._log, exc)
+            self._log.error(
+                "paper_synth: unhandled exception",
+                extra={"internal_order_id": internal_id,
+                       "broker_order_id": broker_order_id,
+                       "error": str(exc)},
+            )
+
+    def _compute_ltp_gated_fill_price(
+        self,
+        symbol: str,
+        side: str,
+        order_type: str,
+        price: float,
+        trigger_price: float,
+    ) -> Optional[float]:
+        """
+        Audit 6.2: poll LTP and return the synth fill price when the order
+        condition is satisfied, or None if max_wait elapses with no crossing.
+
+        MARKET fills immediately at LTP (or `price` if LTP unavailable).
+        LIMIT/SL/SL-M poll quote_provider every ltp_gating_poll_sec for up
+        to ltp_gating_max_wait_sec.
+
+        Returns:
+            fill price >= 0.0 on a synthesizable fill, or None to skip.
+        """
+        # MARKET: one-shot. Fall back to `price` if no LTP (test fixtures
+        # without quote_provider; deviation from spec but safer than 0.0).
+        if order_type == "MARKET":
+            ltp = self._fetch_ltp(symbol)
+            # FIX-001: _fetch_ltp returns None on failure; use price as fallback
+            return ltp if ltp is not None else price
+
+        deadline = time.monotonic() + max(0.0, self._paper_ltp_gating_max_wait_sec)
+        poll = max(0.01, self._paper_ltp_gating_poll_sec)
+
+        while True:
+            ltp = self._fetch_ltp(symbol)
+            # FIX-001: only evaluate condition when LTP is a valid positive float
+            if ltp is not None:
+                fill = self._ltp_satisfies_condition(
+                    side=side, order_type=order_type,
+                    price=price, trigger_price=trigger_price, ltp=ltp,
+                )
+                if fill is not None:
+                    return fill
+            if time.monotonic() >= deadline:
+                return None
+            time.sleep(poll)
+
+    @staticmethod
+    def _ltp_satisfies_condition(
+        side: str,
+        order_type: str,
+        price: float,
+        trigger_price: float,
+        ltp: float,
+    ) -> Optional[float]:
+        """
+        Audit 6.2 helper: if LTP satisfies the order condition, return the
+        synth fill price; else None. Pure function -- ltp passed in.
+        """
+        if order_type == "LIMIT":
+            if side == "BUY" and ltp <= price:
+                return min(ltp, price)
+            if side == "SELL" and ltp >= price:
+                return max(ltp, price)
+            return None
+        if order_type == "SL-M":
+            if side == "BUY" and ltp >= trigger_price:
+                return ltp
+            if side == "SELL" and ltp <= trigger_price:
+                return ltp
+            return None
+        if order_type == "SL":
+            if side == "BUY" and ltp >= trigger_price:
+                return min(ltp, price) if price > 0 else ltp
+            if side == "SELL" and ltp <= trigger_price:
+                return max(ltp, price) if price > 0 else ltp
+            return None
+        # Unknown order_type -- do not gate; behave like legacy auto-fill.
+        return price
+
+    def _fetch_ltp(self, symbol: str) -> Optional[float]:
+        """
+        Audit 6.2 helper: return latest LTP for symbol, or None on failure.
+        Returns None (not 0.0) so callers can distinguish "no data" from a
+        genuine zero price, preventing false SL triggers (FIX-001).
+        """
+        if self._quote_provider is None:
+            return None
+        try:
+            quotes = self._quote_provider([symbol])
+        except Exception as exc:  # noqa: BLE001 -- best-effort LTP probe
+            self._log.debug(
+                "paper_synth.ltp_fetch_failed",
+                extra={"symbol": symbol, "error": str(exc)},
+            )
+            return None
+        quote = (quotes or {}).get(symbol)
+        if quote is None:
+            return None
+        ltp = float(getattr(quote, "last_price", 0.0) or 0.0)
+        return ltp if ltp > 0.0 else None

@@ -1,0 +1,756 @@
+# F6 / Delivery-Exit Predicate — DESIGN
+
+**06-Aug-2026 · Opus 5 · ⛔ DESIGN ONLY — NO CODE WRITTEN**
+
+> ## Gate status
+> ✅ **Gate (1) — evidence CONFIRMED.** Predicate cited, md5-verified against the deployed
+> file, mechanism traced end to end, both symptoms explained by one line, negative control
+> (05-Aug) and positive control (06-Aug 10:47:46) bracket the defect from both sides.
+> ⛔ **Gate (2) — Rama's approval to BUILD — HAS NOT ARRIVED.** He is away until ~17:00.
+> **This document is the design step only. Nothing here is implemented.**
+
+> ## 📌 DATED NOTE — 07-Aug-2026 · **RULING 2 WAS TAKEN, IN TIGHTENED FORM**
+> Rama ruled ledger row 2 on **07-Aug-2026**: *"One symbol may have only ONE SIMULTANEOUS OPEN
+> position across the entire account… when that position is completely closed… the symbol
+> immediately becomes eligible again for every pipeline. The next entry is evaluated from the
+> current account state, not from historical ownership."* Verbatim text and the three consequences:
+> `docs/MASTER_PENDING_01-Aug-2026.md` §R.2.
+>
+> ⛔ **THE RETIREMENT CHECKLIST BELOW IS DELIBERATELY NOT EDITED.** Whether the tightened wording
+> retires **any** F6 cost was **under verification (H5)** when this note was written. Editing the
+> checklist first would have been recording a conclusion ahead of its evidence.
+>
+> **H5 has since returned, and the answer is the opposite of the claim that accompanied option (b):**
+> 🔴 **Ruling 2 retires NO F6 cost. It ADDS a dependency in the other direction** — the ruling's
+> predicate is *"is a position open right now"*, the only product-blind source of that is
+> `trades.status`, and **F6 is precisely what stops a delivery trade ever leaving `OPEN`**
+> (`held == 0` is the sole door to `_finalize_gtt_exit`, `cnc_gtt_monitor.py:487`/`:501`/`:510`).
+> ⇒ 🔒 **F6 IS A PREREQUISITE OF IMPLEMENTING RULING 2, not a beneficiary of it.**
+> ⭐ **Nothing here changes the F6 design.** Full trace and the per-cost verdicts:
+> `docs/audit/rulings_1_2_verification_07aug2026.md` §H5.
+
+---
+
+## 1 · The defect, as measured
+
+**File identity — established by md5, because the VM is not a git checkout:**
+
+| source | md5 | lines |
+|---|---|---|
+| VM, deployed | `025498f4ae05776915da2c242fdcc86e` | 735 |
+| `0197923` | `025498f4ae05776915da2c242fdcc86e` | 735 |
+| `HEAD` (`ea9dd28`) | `025498f4ae05776915da2c242fdcc86e` | 735 |
+
+Identical at all three, so the line numbers below hold at the deployed file (M3).
+
+```python
+# orders/cnc_gtt_monitor.py:457-464   — the same-day CNC positions leg
+for p in positions:
+    if str(product).upper() != "CNC": continue
+    ...
+    held[sym] = held.get(sym, 0) + abs(int(qty))     # :464  THE DEFECT
+
+# orders/cnc_gtt_monitor.py:486-489   — the branch point
+if triggered:
+    if held == 0:
+        return self._finalize_gtt_exit(r, reason="GTT_EXIT")   # closes trade + releases capital
+    return self._reprotect(r, held, why="F6: GTT triggered but holding still > 0")
+```
+
+Docstring `:9` states the intent: *"the held qty (**holdings + same-day CNC positions**)"*.
+
+**Measured on 06-Aug:** `get_holdings → 0 holdings` at **09:31:55.600**; ATULAUTO CNC
+`positions()` row at **−1**; `abs(−1) = +1` ⇒ `held = 1`, which F6 printed **810 ms later**
+at 09:31:56.410.
+
+### 1.1 · Two symptoms, one line
+
+`held == 0` is the **only** door to `_finalize_gtt_exit`. Force it false and both follow:
+
+1. **The trade never closes.** ATULAUTO `trd_e66ee17b…` remains `status=OPEN` with
+   `margin_reserved=587.4228`, hours after the position genuinely closed at 09:23:45.
+2. **A new GTT spawns every cycle.** Three placed on 06-Aug (`330638484`, `330648138`,
+   `330657774`) on a ~15-minute cadence.
+
+### 1.2 · Two branches, one poisoned value
+
+⭐ **The re-protect is not the only consumer.** GTT #4 (`330657774`, 10:02:13) came from the
+**auto-recreate** branch — `why: "GTT missing; holding intact"` — not from F6. Both read the
+same `held`. ⇒ **A fix that corrects F6 and leaves auto-recreate reading the same value
+fixes half a loop.**
+
+### 1.3 · Reachability — why this is the first sighting, not the first noticed
+
+| case | `holdings()` | CNC `positions()` | true `held` | current `abs()` | naive `abs()` removal |
+|---|---|---|---|---|---|
+| carried, unsold | 1 | — | **1** | 1 ✅ | 1 ✅ |
+| **carried, sold today (T+1)** | **0** | **−1** | **0** | **1** 🔴 | **−1** 🔴 |
+| same-day buy, unsettled | 0 | +1 | **1** | 1 ✅ | 1 ✅ |
+| same-day round trip | 0 | 0 | **0** | 0 ✅ | 0 ✅ |
+
+Only the **T+1 exit** row fails. A same-day round trip nets `+1 −1 = 0` ⇒ `abs(0) = 0` ⇒ the
+clean door. That is why ASKAUTOLTD exited cleanly on 05-Aug (negative control, `grep -c F6`
+= **0** across the whole 05-Aug log) and again on 06-Aug (positive control, §4).
+
+---
+
+## 2 · Root cause — three structural failures, not one sign error
+
+⛔ **A design that only corrects the predicate MUST be rejected by this document.** The sign
+is the *instance*; the three items below are the *cause*.
+
+**RC-1 · Two overlapping sources are added as though disjoint.**
+`holdings()` and `positions()` describe the same shares at different points of the settlement
+lifecycle. A negative CNC `positions()` row means *"sold today from holdings"* — an event
+`holdings()` has **already** reflected. Adding it **double-counts the sale**. `abs()` errs
+`+1`; the signed sum errs `−1`. Both are wrong because the addition itself is wrong.
+
+**RC-2 · A single release path, gated on a live quantity, with no memory.**
+`held == 0` is the sole door to release. Any predicate error — of any cause, transient or
+permanent — strands capital **permanently**, because nothing re-examines the decision and
+nothing records that this exit was already handled.
+
+**RC-3 · The release is untraceable to its reservation.**
+Measured across the whole `fm_ledger`:
+
+| entry_type | rows | with `reservation_id` | with `trade_id` |
+|---|---|---|---|
+| `RESERVE` | 1422 | **1422** | 0 |
+| `RELEASE` | 1189 | **1189** | 0 |
+| `COMMIT` | 223 | 223 | — |
+| **`RELEASE_USED`** | **220** | **0** | **61** |
+
+⇒ **The keys are perfectly disjoint.** A reservation-keyed query finds 100 % of `RELEASE`
+rows and **0 %** of `RELEASE_USED` rows — and `RELEASE_USED` is what a clean delivery exit
+writes. Reservation↔release cannot be reconciled by any single key.
+
+> ⚠️ **Known and previously documented, and it still caught us.**
+> `docs/audit/e4_investigation_17jul2026.md:227` · `integrity_audit_2026.md:2030,2130` ·
+> `04_db_schema_reference.md:202` · `ledger3b_separability_step1_04aug2026.md:14`
+> ("⛔ different keys"). The July E4 work added `trade_id` to `RELEASE_USED` (hence 61 of 220);
+> **`reservation_id` was never added.**
+
+---
+
+## 3 · The unsampled window — ⚠️ an UNVERIFIED bound that strengthens Invariant B
+
+`holdings()` was sampled at **09:15:07 → `1 holdings`** and **09:31:55 → `0 holdings`**, with
+the sale at **09:23:45**. **The 8-minute interval between those samples was never sampled.**
+
+⇒ 🔴 **We have NOT ruled out a transient window in which `holdings()` still reports 1 while
+`positions()` already reports −1.** During such a window `held` is wrong under *any* purely
+additive rule, including the corrected one.
+
+⭐⭐ **This is the strongest argument in this document for why the sign fix is insufficient.**
+A quantity-only predicate acts wrongly during any window in which the quantity is wrong. An
+identity-keyed guard does not — it never re-asks a question it has already answered.
+🏷️ **UNVERIFIED — stated as a bound, not a claim.** Closing it requires sampling `holdings()`
+and `positions()` together at high frequency across a T+1 sale.
+
+---
+
+## 4 · The golden reference trace — ⛔ this must still work afterwards
+
+**ASKAUTOLTD, 06-Aug 10:47:46 — four views, all inside 2 ms:**
+
+| view | evidence |
+|---|---|
+| trade | `CLOSED` · `exit_reason=GTT_EXIT` · `qty_filled=1` · `margin_reserved=656.5842` |
+| `gtt_state` | `330660310` → `CLEANED`, updated **10:47:46.145101** |
+| `fm_ledger` | `10222 · 10:47:46.143253 · RELEASE_USED · −656.6 · positional · 1112.44 → 1786.92` |
+| log | `10:47:46.145 cnc_gtt_monitor.gtt_exit` + Telegram 10:47:46.798 |
+
+`1112.44 + 656.60 + 17.88 = 1786.92` — reservation **and** realised P&L return in one row.
+
+⭐ **Adopted as the GOLDEN REFERENCE for every future delivery change** — a fixture, not a
+one-off record. 📌 Recorded, not chased: `closure_source` and `exit_mechanism` are **empty**
+on a `GTT_EXIT` close.
+
+---
+
+## 5 · Constraints (7) — what any candidate must satisfy
+
+| # | constraint |
+|---|---|
+| 1 | a same-day CNC **BUY (+1)** must still count as held — the case `abs()` was written for |
+| 2 | a same-day CNC **SELL (−1)** must **not** count as held |
+| 3 | ⛔ **deleting `abs()` does not work** — the signed sum gives `held = −1`, still `!= 0`, still re-protects, and hands `_reprotect` a negative quantity |
+| 4 | 🔴 **the auto-recreate branch is in scope** — a second, independent consumer of the same `held` (§1.2) |
+| 5 | regression must include a test that goes **RED on current code**, reproducing a T+1 exit — ⛔ not one that merely asserts the new behaviour |
+| 6 | ⭐ **the same-day round-trip path worked in production (§4) and must still work** — a regression here breaks the *common* case to fix the *rare* one |
+| 7 | 🔴 **the release must be traceable to its reservation** (RC-3) — ⭐ promoted to an architecture rule: **`docs/foundation_engineering_rules.md` §1.11 Traceable Reservation Lifecycle**, so it binds every future ledger change, not just this fix |
+
+## 6 · Invariants (3) — the structural level, which outranks the expression
+
+- **A · One release path is not enough.** Every reservation must have **exactly one matching
+  release path**, and a predicate error must not be able to strand capital permanently. A
+  second, independent release path is a structural answer; a correct `held` is only a local one.
+- **B · Exit identity, not exit quantity.** A GTT whose exit has been processed must never be
+  re-evaluated from live quantities. ⭐ §3 shows why: quantity can be transiently wrong;
+  identity cannot.
+- **C · A release must be traceable.** Every reservation must produce exactly one
+  `RELEASE_USED`, **regardless of exit timing** — same-day, T+1, restart, monitor replay —
+  **and that release must be keyed to its reservation.** ⛔ An untraceable release is half a
+  release: it frees the money and destroys the audit path.
+
+---
+
+## 7 · Design directions — shape only, ⛔ no implementation
+
+**D-1 (addresses RC-1, constraints 1–3, 6).** Stop treating `holdings()` and `positions()` as
+disjoint. The settled book is authoritative; a same-day CNC position is a *delta* against it,
+and only a **long** delta represents shares not yet in the settled book. A short delta is an
+event the settled book has already applied. ⛔ The expression is deliberately not written here.
+
+**D-2 (addresses RC-2, invariants A and B).** Make a processed exit a **recorded, one-way
+fact** rather than a state re-derived each cycle from live quantities. Both consumers (F6 and
+auto-recreate) must consult it. ⭐ This is the part that survives §3's unsampled window.
+
+> ### 🔴 D-2's BINDING PROPERTY — **the marker must not become another replay source**
+> ⭐⭐ **This is today's defect one level up.** A state consulted to decide whether to act, which
+> is itself re-derived or re-written on each pass, **is the exact shape that produced both the
+> loop and the phantom.**
+> **The marker must be WRITE-ONCE, and provably EXACTLY-ONCE across: RESTART · REPLAY ·
+> DUPLICATE MONITOR CYCLES.** ⛔ **Trace every writer before the first line is written** — the
+> §14 map exists for precisely this.
+>
+> ⭐⭐ **STATED AS A CHECKABLE PROPERTY, NOT AN INTENT — IDEMPOTENCE:** every successful write must
+> be **idempotent**, and **duplicate cycles, retries and restarts must all converge to the
+> IDENTICAL persisted state with no additional side effects.**
+> ⛔ *"Write-once"* describes intent and cannot be tested. **Convergence describes a test, and
+> regression cases 4, 5, 7 and 8 are that test.**
+>
+> 🔴 **"NO SIDE EFFECTS" INCLUDES NOTIFICATIONS, NOT ONLY LEDGER ROWS.** Today produced duplicate
+> **GTTs** *and* duplicate **CRITICAL alerts** — ⭐ **and the second is the one an operator actually
+> experiences.** A fix that stops the duplicate ledger effect while still emitting a CRITICAL every
+> cycle has not converged. **Assert on the alert count as well as on the state.**
+>
+> **⛔ THE ANTI-PATTERN, NAMED SO IT CANNOT BE REINTRODUCED:** *a marker that can be un-set,
+> recomputed, or written by more than one path is not an identity — it is another quantity
+> wearing an identity's name.*
+> ⭐ `gtt_state.status` fails this test on its face (§12.3.1): three writers, and its value
+> records the response rather than the observation.
+
+**D-3 (addresses RC-3, invariant C, constraint 7).** Carry `reservation_id` onto
+`RELEASE_USED`, and add a reconciliation path that can detect and release an `OPEN` trade whose
+broker position **and** holding are both absent across N consecutive cycles — the second,
+independent release path Invariant A requires.
+
+> ⛔ **Rejection criterion, binding on the next revision:** a design consisting of D-1 alone
+> **must be rejected**. Constraint 3 proves the obvious edit fails; Invariant B and §3 prove a
+> correct `held` still leaves the structure intact.
+
+---
+
+## 8 · Regression cases ~~(6) — all six required~~ **(9) — all nine required**
+
+> ⚠️ **Count corrected 06-Aug-2026 19:2x (§G4):** the heading said **6** while the list already
+> carried **8**. Case **9** is added below, bringing it to **9**. ⛔ The stale heading is struck,
+> not deleted — a regression count that disagrees with its own list is exactly the kind of thing a
+> reader trusts without checking.
+
+1. same-day CNC **buy**
+2. same-day CNC **sell**
+3. **T+1 exit** ← goes RED on current code (constraint 5)
+4. **repeated monitor execution after a successful exit** ← would have caught the loop
+5. **service restart after a successful exit** ← would have caught the phantom
+6. **operator manually cancels a system-created GTT while the monitor runs** — does it recreate
+   immediately, next cycle, or never? ⭐ the only case sourced from an operator action rather
+   than code reading, and 🏷️ **still unobserved** (the 06-Aug attempt never reached the broker)
+7. 🔴 **STEADY STATE.** After a successful T+1 release, run **multiple consecutive monitor
+   cycles** and verify: **no new GTT · trade stays CLOSED · reservation stays released ·
+   available capital stable.** ⭐ Case 4 tests the *first* cycle after an exit; this tests the
+   *tenth*. **Today's loop was a steady-state failure, so this case is shaped exactly like the
+   bug.**
+
+8. 🔴 **COMBINED, production-like.** Restart **immediately** after a successful T+1 release ·
+   allow **multiple** monitor cycles · verify **no replay · no duplicate reservation · no
+   recreated GTT · no drift alert.** ⭐ It composes 5 and 7 and exercises **both** latent callers
+   at once — `_replay_open_trade` on the restart, `_check7` on the cycles.
+   ⛔ **Keep 5 and 7 as well: a composite that fails does not tell you which half broke.**
+
+9. 🔴 **SPANS MIDNIGHT — continuous run AND restart.** *(ChatGPT's, filed 06-Aug-2026.)*
+   ⭐⭐ **THE GAP, STATED AS A CASE: today's failure CROSSED A DAY BOUNDARY; the test set did not.**
+   Drive an injected `now_fn` across `D 23:59:59.9 → D+1 00:00:00.1` and validate **replay,
+   deferred loops and date-bound logic together** — in **both** shapes, because they fail
+   differently:
+   - **(i) CONTINUOUS** — the process stays up across midnight. Assert the **clock-bound** controls
+     roll to D+1: the daily-trade cap, **both** daily-loss halves, consecutive-losses and the
+     strategy governor must query **D+1** and see **zero**, not D's window.
+     ⚠️ **Anti-vacuity: assert D's counts are NON-ZERO first** — a day with no trades collapses the
+     two forms and proves nothing (the same trap as the E4/W10 no-cost-day case).
+   - **(ii) RESTART** — the process boots on D+1. Assert the **boot-bound** work actually re-runs:
+     `clear_stale_state`, the SU6 holiday guard, `initialize()`, and the B5 **shared day-floor**
+     passed to *both* seed and rehydrate (the `DESIGN_midnight_day_floor.md` residue).
+   ⭐ **What makes this an F6 case and not a general one:** a delivery position is the only thing
+   that is *supposed* to survive the boundary, so it is the only state where "rolled correctly" and
+   "never re-ran" produce **different** answers — and the T+1 predicate is read on **both** sides.
+   🏷️ **(S) 06-Aug source read** (`STOP_PROCEDURE_06-Aug-2026.md` §4) establishes the split the
+   case must pin: **counters clock-bound · kill-clear, holiday guard, seed and day-floor boot-bound.**
+   ⛔ **Do not simulate against the live DB — scratch only, injected clock, never a real wait.**
+
+**Gate:** `pytest tests/unit tests/integration` — ⛔ never `run_tests.py`.
+
+> ⚠️ **The existing BL-3 test is VACUOUS and must be fixed FIRST, then re-run on OLD code.**
+> `tests/unit/test_state_store.py:1944` asserts `sum_fm_ledger_margin_delta(rid_closed) == 0.0`
+> — and its fixture **inserts a `RELEASE_USED` row WITH a `reservation_id`**, a shape production
+> has never produced (0 of 220). The test's own comment describes the production failure mode
+> and asserts it cannot happen. ⭐ This is the fixture class: *a fixture asserting what its own
+> data cannot support makes a wrong reader look right.*
+
+## 9 · Post-deploy convergence checkpoint
+
+After a successful T+1 exit, all four must converge, per §4's trace:
+**reservation ledger · open-trade state · `gtt_state` · available capital.**
+
+⚠️ **The checkpoint's own instrument is compromised until D-3 lands.** Until `RELEASE_USED`
+carries `reservation_id`, view 3 can only be matched by **timestamp + bucket + amount**.
+⛔ Checking only the F6 branch is what let this ship.
+
+## 10 · Push passengers — ⛔ decided here, not by momentum at 18:15
+
+Two unpushed commits touch Python:
+
+| commit | change | risk |
+|---|---|---|
+| `c5c1926` | `docs(capital)`: pin WHY rehydrate keys on trade status | **comment only** |
+| `0087d3a` | `fix(alerts)`: signal alert's "Risk (1.5 %)" was the SL distance, not a fraction of capital (+ its test) | alert text; no capital or order path |
+
+⭐⭐ **This is not a choice.** `main` is **78 commits ahead** of `origin/main`, and **D1 forbids
+a partial deploy** — a push carries everything or nothing.
+
+⇒ **DECISION: the passengers ride.** The consequence, stated so it is not discovered later:
+**the regression gate must cover them too**, not just the F6 fix. Both are low-risk by
+inspection, and neither touches the capital or order path — but "low risk by inspection" is not
+the gate, the gate is the gate.
+
+## 11 · The blind-key callers, traced — ⛔ found, not fixed
+
+**Width:** whole repo, all `*.py`, `venv` excluded. **18 references to
+`sum_fm_ledger_margin_delta`; 4 non-test; exactly ONE production call site.**
+
+### 11.1 · `order_reconciler.py:3761` — `_check7_capital_accounting_drift` (BL-3)
+
+It compares `_Reservation.margin` against `sum_fm_ledger_margin_delta(rid)`, and on breach
+**logs `BL-3 CAPITAL_ACCOUNTING_DRIFT` and publishes `CapitalDriftDetected`**. ⇒ **it alarms,
+so it is on the capital path.**
+
+⭐⭐ **But it iterates `fund_manager.get_live_reservations()`** — and a released reservation is
+no longer live. ⇒ **it never asks the function about a closed reservation**, which is the only
+case where the blindness produces a wrong number.
+
+🏷️ **Revised classification: (b) LATENT, not live.** My earlier "CONFIRMED LIVE" was about the
+*function*, which is measurably wrong (689.41341 for a fully-released reservation); the *live
+consumer* is not affected. ⛔ **Recording the downgrade rather than leaving the stronger claim
+standing.**
+
+**Two ways it becomes live, both named:**
+- **False negative — the direction that matters.** If a trade is live in `fm._reservations`
+  while the ledger *has* released it, `ledger_sum` omits the `RELEASE_USED` and the two sides
+  agree spuriously ⇒ **`_check7` fails to detect the exact inconsistency it exists to detect.**
+- **Phase E.** The docstring defers orphan detection — *"rids in ledger but not in
+  `fm._reservations`"* — to Phase E. **That is precisely the change that would start querying
+  closed reservations and arm the false positive.**
+
+### 11.2 · `fund_manager.py:1900` — inside `_replay_open_trade` (`:1849`)
+
+Fetches the reservation's full ledger chain at boot to replay it; **blind to `RELEASE_USED`**.
+For a correctly-`OPEN` trade no `RELEASE_USED` exists, so it is harmless today.
+🔴 **It bites if a trade is `OPEN` while its reservation has been released** — the replay would
+re-reserve capital that was already freed, a **double-reserve**.
+🏷️ **(b) LATENT.** ⛔ An earlier note said *"rehydrate keys on trade status, so it does not
+drive the replay."* **That established it does not drive the selection; it did not establish
+the query is harmless.** Corrected here.
+
+### 11.3 · The three qualified sites are safe
+
+`fund_manager.py:2144` (`entry_type='RESERVE'`, 1422/1422) · `fund_manager.py:2113`
+(`entry_type='COMMIT'`, 223/223) · `state_store.py:2575` (`entry_type='COMMIT'`).
+**Hit count: 2 blind of 5 production sites; 0 live; 2 latent.**
+
+---
+
+## 12 · 🔴 THE TENSION IN TONIGHT'S PLAN — named now, not at 18:15
+
+**The bundle is the problem.** D-3 mixes the root-cause lifecycle fix with ledger auditability:
+
+- **D-3** (carry `reservation_id` onto `RELEASE_USED`) is a **schema + write-path change on the
+  capital ledger**, plus a backfill question for 220 existing rows. ⛔ **Not a same-evening
+  change under any honest reading of the careful loop.**
+- **D-2** (exit identity) must **survive a restart** (regression case 5) ⇒ **persistence** ⇒
+  **schema again.**
+- **D-1 alone** is forbidden by this document's own binding rejection criterion.
+
+### 12.1 · The proposed split — ⛔ PROPOSED, NOT CHOSEN
+
+- **(a) LIFECYCLE** — D-1 + D-2 — the fix, with its own gate and regression set.
+- **(b) AUDITABILITY** — D-3's `reservation_id` + the second release path + §11's two latent
+  blind callers. **Independently testable, no deadline, and it now has two named instances.**
+
+### 12.2 · Does (a) alone satisfy the rejection criterion? — **YES**
+
+Answered from the criterion, not the clock. The criterion rejects **D-1 alone**, for two stated
+reasons: constraint 3 (the obvious edit fails) and Invariant B + §3 (a correct `held` leaves the
+structure intact). **(a) = D-1 + D-2, and D-2 *is* Invariant B.** Both reasons are addressed.
+⇒ **(a) is not excluded by the criterion.**
+
+### 12.3 · ⛔ But the criterion is not what binds tonight — schema is
+
+**D-2 needs persistence to survive a restart.** An evening schema push has a measured,
+documented consequence: **every heartbeat-writing cron trips `_refuse_migration` until the next
+08:15 boot migrates** — a full night of CRITICALs.
+
+⇒ 🔴 **Tonight is only possible if D-2 can be satisfied WITHOUT a schema change.**
+
+### 12.3.1 · ⛔ ANSWERED — **NO. Measured from the schema, the writers, and the data.**
+
+**The domain** (`core/schema.sql:1227-1228`, CHECK constraint, confirmed identical on the live DB):
+`ACTIVE · TRIGGERED · CANCELLED · EXPIRED · REJECTED · CLEANED`
+
+**Every production writer** — width: all `*.py`, `venv` and tests excluded. `set_gtt_state_status`
+(`state_store.py:2262`) is the **only** mutator, and it has **three** production call sites, all
+inside `cnc_gtt_monitor`:
+
+| site | writes | when |
+|---|---|---|
+| `:537` | `CLEANED` | inside a handler |
+| `:587` | `CLEANED` | inside `_finalize_gtt_exit` — **the gated function** |
+| `:613` | `old_status` | inside `_recreate` — reached only via `_reprotect` (`TRIGGERED`) or auto-recreate (`EXPIRED`) |
+
+⇒ 🔴 **No status is written when a GTT is merely OBSERVED triggered.** The row stays `ACTIVE`
+until a handler *acts*, and the status then records **what the handler did**, not what was seen.
+
+**Confirmed three ways in the live data:**
+- `330456580` and `330638484` have `updated_at` **exactly equal** to the two F6 alert timestamps
+  (09:31:56.410156 · 09:47:04.871690) — they became `TRIGGERED` *at the moment F6 acted*.
+- `330648138` became `EXPIRED` at 10:02:13.675916, 34 ms before its replacement was created —
+  the same `_recreate` call.
+- ⭐⭐ **`330660310` (ASKAUTOLTD, the clean exit) went `ACTIVE → CLEANED` and NEVER passed
+  through `TRIGGERED` at all.**
+
+⇒ **The circularity is real and worse than suspected.** `CLEANED` is written by the gated
+function, and `TRIGGERED` is written by the *failure* branch. On the clean path the row never
+becomes `TRIGGERED`. **`gtt_state.status` cannot express "this exit was observed" — only "this
+is what was done about it."** An identity marker written by the gated function cannot guard it.
+
+⇒ 🔴 **D-2 requires a new persisted marker ⇒ schema ⇒ TONIGHT IS OFF.** ⛔ Answered from the
+schema and the writers, not from what would be convenient.
+
+### 12.3.2 · And the schema route is independently ruled out tonight
+
+Even if a marker existed, an **evening schema push makes every heartbeat-writing cron trip
+`_refuse_migration` until the next 08:15 boot migrates — a full night of CRITICALs.**
+⭐ **That rules out a schema change tonight on its own, independently of the careful loop.**
+⇒ **Two independent reasons, either sufficient.**
+
+### 12.4 · Pricing the miss, so the choice is made on numbers
+
+Cost is incurred **only if DIFFNKG's GTT triggers tomorrow**. Measured at 11:2x today:
+`last_price 446.60` · `sl_trigger 437.20` (**−2.10 %**) · `tgt_trigger 459.45` (**+2.88 %**).
+Neither is near. ⛔ I am not converting that to a probability.
+
+- **If it triggers:** one phantom, **~16 % of the delivery bucket**, cumulative stranding ~37 %.
+- ⭐ **And it is RECOVERABLE by hand.** A bad deploy to the only path that releases capital is not.
+
+⇒ **expected cost ≈ P(trigger) × one recoverable phantom**, against **a rushed change to the
+capital-release path.** ⭐⭐ **A deadline that can only be met by breaking a rule is a deadline
+that should be missed.**
+
+---
+
+## 13 · ⭐⭐ THE D-3 CONVERGENCE — one change closes four things
+
+**The inversion, and it changes what the fix is:** the function is **not** wrong. Its contract
+is right and **the DATA violates it.** The BL-3 test's fixture is what production *should* be
+writing. ⇒ **the defect is in the WRITER, not the reader.**
+
+**D-3 — carrying `reservation_id` onto `RELEASE_USED` — closes four things at once:**
+
+1. the **blind query** that voided Proof A;
+2. **`_check7`'s latent false negative** (§11.1) — the guard that goes silent;
+3. **`_replay_open_trade`'s latent double-reserve** (§11.2);
+4. it makes the **BL-3 test non-vacuous by making its fixture true.**
+
+⭐ **That is the strongest argument for (b) auditability being real work rather than tidying.**
+⛔ **And it does NOT make it urgent** — all three consumers are 🏷️ **LATENT**.
+
+### 13.1 · The durable lesson: **the fixture is a specification**
+
+The author wrote `reservation_id` on a `RELEASE_USED` row because they **believed** that is what
+production writes. ⇒ **the test is evidence that the divergence was never noticed — not evidence
+that it does not exist.**
+
+🏷️ **Filed as a V4 instance** *(a test asserting what its own fixture guarantees cannot be
+observed)* — ⭐ **and the strongest one yet: the author understood the failure mode, named it in
+the comment, and still built a fixture that could not exercise it.**
+
+### 13.2 · The corrected fixture must go RED on old code — ✅ confirmed
+
+Rewriting the fixture to production shape (a `RELEASE_USED` row with **no** `reservation_id`)
+leaves only the `+500` RESERVE visible ⇒ `sum_fm_ledger_margin_delta(rid_closed)` returns
+`500.0`, and `assert … == 0.0` **fails**. ⭐ Corroborated against live production data:
+**689.41341** for ASKAUTOLTD's fully-released reservation. ⛔ **If a corrected fixture does not
+go red, the correction is wrong.**
+
+---
+
+## 14 · The reservation-lifecycle dependency map
+
+⛔ **Map only — no fixes.** Width: all `*.py`, `venv` and tests excluded.
+
+```
+RESERVE ─┬─> COMMIT ─┬─> RELEASE       (fund_manager:606)  keyed reservation_id  1189/1189 ✅
+         │           └─> RELEASE_USED  (release_used)      keyed reservation_id     0/220  🔴
+         │
+         ├─> RECONCILE : order_reconciler:3761  _check7_capital_accounting_drift  [§11.1 LATENT]
+         │                 └─> publishes CapitalDriftDetected
+         │                        source_module="fund_manager_self_check"   (:3782, measured)
+         │                        └─> capital/drift_handler.py:111  on_drift
+         │                               └─> [DH1 GATE]  _ESCALATING_SOURCES (:66-70)
+         │                                      🔴 OPEN — the tag IS in the set
+         │                                      └─> TIERED KILL ESCALATION (single-sample SOFT/HARD)
+         │
+         └─> REPLAY    : fund_manager:1849  _replay_open_trade (:1900 query)      [§11.2 LATENT]
+                          └─> re-reserves at every 08:15 boot
+```
+
+### 14.1 · 🔴 DH1 does NOT bar this path — measured, and it is the opposite of the expectation
+
+```python
+# capital/drift_handler.py:66-70
+_ESCALATING_SOURCES: Final[frozenset[str]] = frozenset({
+    "fund_manager",                  # FM9 sync_from_broker
+    "fund_manager_self_check",       # BL-3 OrderReconciler._check7  ← THIS PATH
+    "fund_manager_bucket_overflow",  # H-1 / E.2
+})
+```
+`_check7` publishes with `source_module="fund_manager_self_check"` (`order_reconciler.py:3782`).
+**It is in the set, and the set's own comment names `_check7` explicitly.** ⇒ **the gate is OPEN.**
+
+> ⚠️ **AND THE DOCSTRING IS STALE, WHICH IS HOW THE WRONG RECALL WAS PRODUCED.**
+> `drift_handler.py:17` says *"Today that's `{"fund_manager"}`"* — **one** member. The frozenset
+> at `:66-70` has **three**. ⭐ The prose says the path is barred; the code says it escalates.
+> 🏷️ **Filed: doc/code divergence on a kill-path gate.**
+
+⭐ **The register's "the drift alarm cannot escalate" finding applies to G3, which publishes
+`source_module="order_reconciler"` — a DIFFERENT check with a DIFFERENT tag.** ⛔ It does not
+generalise to `_check7`, and assuming it does is exactly the error this section exists to stop.
+
+### 14.2 · Which direction is dangerous
+
+- **FALSE NEGATIVE (reachable in principle):** `RELEASE_USED` invisible ⇒ `fm_margin` and
+  `ledger_sum` agree spuriously ⇒ **no publish ⇒ no escalation.** ⭐⭐ **A guard going silent on
+  the one drift path that CAN kill** — and silence is indistinguishable from health.
+- **FALSE POSITIVE (unreachable today; armed by Phase E):** a closed reservation over-reports
+  ⇒ an escalating drift published against healthy state. ⛔ Not reachable while `_check7`
+  iterates live reservations only.
+
+---
+
+## 15 · ⚠️ The ATULAUTO phantom's disposition — ⛔ recorded, NOT actioned
+
+> # 🔴🔴 UPDATED 06-Aug-2026 ~18:4x — **THIS SECTION UNDERSTATED ITS SUBJECT BY FOUR COSTS. MEASURED, NOT INFERRED.**
+> **What this section had:** stranded capital + a respawning GTT.
+> **What 06-Aug measured:** the stock was **SOLD by its own GTT at ~09:31:56**, the system never
+> noticed, and the defect then did four more things. **One defect, FIVE resources.**
+>
+> **(P) The holdings timeline — `get_holdings`, 26 readings on 06-Aug:**
+> `08:15:11 → 1 holdings` · `09:15:07 → 1 holdings` · **every one of the remaining 24 → `0 holdings`.**
+> GTT `330456580` went `TRIGGERED` at **09:31:56**. **That is the sale.**
+>
+> **(P) What the monitor did next, in its own words:**
+> ```
+> 09:31:56  cnc_gtt_monitor.recreated → 330638484  why: "F6: GTT triggered but holding still > 0"
+> 09:47:04  cnc_gtt_monitor.recreated → 330648138  why: "F6: GTT triggered but holding still > 0"
+> 10:02:13  cnc_gtt_monitor.recreated → 330657774  why: "GTT missing; holding intact"
+> ```
+> Each respawn lands **35–43 ms** after the previous row leaves `ACTIVE`. Two CRITICAL Telegram
+> alerts delivered (09:31:56, 09:47:04) + one WARNING (10:02:14).
+>
+> | # | cost | resource consumed |
+> |---|---|---|
+> | 1 | ₹587.4228 re-reserved every boot | **capital** — ~21 % of the delivery bucket |
+> | 2 | 1 of 3 delivery slots, permanently *(`risk_engine.py:469`, no date bound)* | **concurrency** |
+> | 3 | 🔴 **`DUPLICATE_SYMBOL` blocks every intraday signal on ATULAUTO, indefinitely** *(`has_active_position`, no date filter, no product filter)* | **the symbol** |
+> | 4 | 🔴 **THREE LIVE SELL GTTs placed on a FLAT holding; `330657774` still resting** | **live orders at the broker** |
+> | 5 | 🔴 **a FABRICATED exit price when it eventually closes** — see §15.0 | **the data, permanently** |
+>
+> ⛔ **Cost 4 is not a bookkeeping error. The system placed real sell orders at Zerodha for stock it
+> does not own, on the strength of a predicate that cannot return anything but `held ≥ 1`.**
+
+### 15.0 · 🔴 THE FIFTH COST — **it does not end when the trade closes**
+
+**(S)** `orders/cnc_gtt_monitor.py:674-694` `_resolve_exit_price` falls through:
+**today's broker trade book → LTP → entry proxy.**
+
+⇒ On any later day the 06-Aug SELL is **not in that day's trade book**, so it books **that day's live
+quote** as the exit price for a sale that happened on 06-Aug at ~575.65.
+⇒ `_finalize_gtt_exit` closes the trade correctly and releases the capital correctly — **and writes a
+P&L computed from an unrelated price** into `record_gtt_close_financials` and `fm_ledger`.
+
+> ⛔⛔ **THAT FIGURE THEN FLOWS INTO THE DAILY-LOSS READER AND THE EXPECTANCY CORPUS** — the same
+> corpus every sizing conclusion of this week rests on *(`docs/design/sizing/`)*.
+> ⭐ **Costs 1–4 end when the trade closes. Cost 5 BEGINS there and persists in the data.**
+> ⇒ **"Correct closure, wrong P&L" is not a clean resolution, and no branch of F6 avoids it.**
+
+### 15.1 · 🔴🔴 THE **SIXTH** COST — ⭐⭐ **AND IT IS THE ONLY ONE THAT ARGUES *WHEN***
+
+> ⚠️ **NUMBERING CORRECTED 06-Aug ~19:4x:** this arrived described as *"the fifth"*, listing the
+> costs as capital · slot · symbol block · fabricated price. **That list omits cost 4 — the three
+> live sell GTTs at the broker** (§15's table). ⛔ **The tree already carries FIVE. This is the
+> SIXTH.** ⭐ Recorded because a mis-numbered cost is how one silently replaces another.
+
+**A MANUAL STOP IS NOW REQUIRED EVERY TRADING NIGHT UNTIL F6 LANDS — and a missed one costs a FULL
+TRADING DAY, SILENTLY.**
+
+**The chain, measured 06-Aug (full working: `docs/audit/STOP_PROCEDURE_06-Aug-2026.md` §4b):**
+a phantom `OPEN` row blocks the 17:35 self-exit → no exit ⇒ **no 08:15 boot** → **both** kill
+clearers are **boot-only** (`main.py:1914` / `:1919`, one production site each) → the day's routine
+15:15 `SOFT_KILL` **never clears** → **the next trading day opens in `SOFT_KILL`: no entries at all.**
+
+| | why this one outranks the other five |
+|---|---|
+| **it RECURS** | costs 1–5 are consequences of *one* phantom. This one **repeats every night the phantom persists** — indefinitely. |
+| **it is OPERATOR-DEPENDENT** | ⛔ the only mitigation is **a human remembering a command**, every trading night. Costs 1–5 need no one to do anything. |
+| **it FAILS SILENTLY** | ⭐⭐ it presents as **"no signals today"** — **indistinguishable from a quiet market.** Nothing alarms; the day simply produces nothing. |
+| **the delay is NON-LOCAL** | ⚠️ **a missed FRIDAY stop costs MONDAY** — the weekend is not a trading day, so the loss lands **three days after the mistake**, when the cause is hardest to see. |
+
+⛔ **AND THERE IS NO CHEAPER MITIGATION — CANCELLING THE GTT DOES NOT WORK. (S), verified at source,
+not cited:** with the GTT cancelled at the broker `bg is None` ⇒ `triggered=False`,
+`present_active=False`; the `abs()` phantom keeps `held=1` and `row_qty=1`, so **branches 1–4 all
+fail** (`:486` no · `:492` no · `:497` `1 != 1` false · `:501` `held==0` false) and **`:513`
+`held == row_qty` fires `_recreate`** — or `_queue_preopen` out-of-hours, which rebuilds it on **the
+first in-hours cycle**. ⇒ 🏷️ **The only levers are the nightly manual stop, or F6.**
+
+> ⭐⭐ **THIS IS THE PRIORITY ARGUMENT. Costs 1–5 argue that F6 MATTERS; cost 6 argues WHEN** — it
+> converts F6 from *"a defect with bounded consequences"* into *"a standing nightly operator
+> obligation with a silent, three-day-delayed failure mode."*
+> 🔴 **AND TOMORROW'S FREE MEASUREMENT (§4.1 of the Friday card) DECIDES WHETHER IT IS ONE NIGHT OR
+> MANY:** the `−1` row **GONE** ⇒ `held = 0` ⇒ branch 4 fires ⇒ the phantom closes ⇒ **the
+> obligation ends** *(DIFFNKG still defers the self-exit — but a real carry is a real reason)*; the
+> row **SURVIVES** ⇒ **the obligation stands indefinitely.**
+
+### 15.2 · 🔒 THE RETIREMENT TEST — ⭐⭐ **WRITTEN NOW, WHILE THE WORKAROUND IS NEW**
+
+> ⭐⭐ **WHY TODAY AND NOT WHEN F6 LANDS:** a retirement test authored by the person who is **tired of
+> the workaround** is not the same document as one authored today. ⛔ **This exists to prevent the
+> common failure mode where a workaround outlives the defect it mitigated** — nobody remembers why
+> the nightly stop is done, so it is either done forever or dropped without checking.
+
+🏷️ **FRAMING, and it is load-bearing: the nightly stop is a TEMPORARY COMPENSATING CONTROL tied to
+explicit preconditions — ⛔ NOT steady-state design. F6 is its EXIT CRITERION, not a nice-to-have.**
+
+**When F6 lands, RUN THIS CHECKLIST. ⛔ All four, in order. The workaround is not retired until #4.**
+
+| # | exit criterion | how it is verified | ⛔ not satisfied by |
+|---|---|---|---|
+| **1** | **the nightly stop is no longer required** — the service **self-exits at 17:35 with a carry open** | observe a real evening with a delivery position held: `eod_self_exit` fires, `ActiveState=inactive`, census emitted | *"the predicate looks right"* — this needs an **observed evening**, not a source read |
+| **2** | **the boot dependency is REMOVED — or explicitly RE-JUSTIFIED** | either a non-boot path clears a prior-day kill, **or** a written statement that boot-only is intended **and** that the self-exit now guarantees the boot | ⛔ leaving it boot-only **silently** — that is the whole defect, one layer up |
+| **3** | **Friday's three-way measurement still converges** | broker truth · reservation replay · internal state agree (`FRIDAY_MORNING_07-Aug-2026.md` §1) | a single view agreeing with itself |
+| **4** | **the recurring obligation is FORMALLY CLOSED** | ⛔ **struck from HOT memory (§G4: struck, legible, dated), the AR-style preconditions marked spent, and this section marked RETIRED** | ⭐⭐ **merely STOPPING doing it.** An undocumented stop is indistinguishable from forgetting |
+
+### 15.3 · ⚠️ THE PRIORITY ARGUMENT CARRIES PRECONDITIONS TOO
+
+⭐ **Extended from the conclusion to the PRIORITY, because a priority inherited without its reasons
+is the same failure one level up.** Cost 6 ranks F6 where it does **only while** these hold:
+
+1. **boot behaviour** — the 08:15 boot remains the only thing that runs the boot-bound work;
+2. **the kill-clear path** — both clearers remain boot-only, **one production site each**;
+3. **the self-exit logic** — it remains blocked by an open row *(including a phantom one)*.
+
+⛔ **If any changes, the priority is RE-EVALUATED, not INHERITED.** ⭐ A ranking is a measurement
+with a date on it, not a property of the item.
+
+---
+
+`trd_e66ee17b…` is `OPEN` with `margin_reserved=587.4228`, and `_replay_open_trade` re-reserves
+it at **every 08:15 boot** — **~21 % of the delivery bucket, every day, for a position that does
+not exist.**
+
+### 15.1 · Is there a supported way to close it? — **NO. And that is itself a finding.**
+
+**Width:** all of `scripts/` (40+ files), `system_manager.py`'s full argument surface, and every
+`*.py` reference to `CLOSED_MANUAL` / `close_trade` outside the reconciler.
+
+Every hit is a **reader** or a **backfill of already-closed rows** — `backfill_closure_source_w8`
+(rows already `CLOSED_MANUAL`), `check_vm_state`, `eod_cleanup`, `reconstruct_excursions`.
+**`system_manager.py` exposes only `--date`, `--config-dir`, `--db-path`, `--dry-run`,
+`--no-soft-kill`. No script closes an OPEN trade.**
+
+**The only three code paths that transition `OPEN → CLOSED`, and all three are shut:**
+
+| path | why it cannot run |
+|---|---|
+| `_check1_manual_close` → `CLOSED_MANUAL` | ⛔ **excluded by the delivery skip** (`order_reconciler.py:871`) — an ACTIVE `gtt_state` row with a matching `trade_id` exists |
+| `_finalize_gtt_exit` → `CLOSED` | ⛔ **gated on `held == 0`**, which `:464` makes permanently false |
+| EOD squareoff | MIS only; CNC is exempt |
+
+⭐⭐ **Both doors are held shut by the two halves of the same defect** — and the second observation
+is the sharper one: **CHECK1 *would* close this trade. The delivery skip is what prevents it, and
+the ACTIVE `gtt_state` row keeping that skip armed was itself created by the loop.** The defect's
+own artifact is what keeps the trade alive.
+
+⛔ **Not closed, and no closure proposed.** ⛔ Raw DB manipulation remains forbidden. ⭐ Recorded so
+the daily ~21 % cost is a decision taken, not a condition that persists by default.
+
+⭐ **Today produced TWO latent consumers nobody had named. The map is what stops a third being
+discovered after deployment.** ⛔ Enumerate before building.
+
+### 14.3 · Every edge classified — **functional · audit · safety**
+
+| edge | class | why the label matters |
+|---|---|---|
+| `RESERVE → COMMIT → RELEASE` | **functional** | ordinary capital lifecycle |
+| `RELEASE_USED` key gap | **audit** | frees the money correctly; destroys the trail |
+| `_replay_open_trade` | **functional** | wrong value ⇒ wrong capital, no alarm |
+| **`_check7 → DH1 → kill`** | 🔴 **SAFETY** | ⭐ **today proved a reviewer cannot tell this by looking at it** — it reads as one more drift log |
+
+⛔ **Label every edge before touching any single subsystem.** A change that looks local on a
+functional edge is not local on a safety edge, and nothing in the code says which is which.
+
+> ### 📋 STANDING REQUIREMENT — **every future dependency diagram carries at least one explicit SAFETY review**
+> ⭐ **Today's map read as "one more drift log" until the edge was classified.** The classification
+> is what made the kill path visible — nothing in the code, the alarm's name, or the module it lives
+> in would have shown it. ⛔ **A dependency map with no safety pass is a map of the functional
+> system only, and it will be trusted as if it were the whole one.**
+> ➡️ Run `campaign_practices.md` **M11**'s checklist against every drift edge the map contains.
+
+---
+
+## 14.4 · 🔴🔴 HARD ORDERING CONSTRAINT — **D-3 BEFORE PHASE E**
+
+> ⛔ **`reservation_id` must land on `RELEASE_USED` BEFORE any change that queries CLOSED
+> reservations.** Phase E's deferred orphan detection — *"rids in ledger but not in
+> `fm._reservations`"* — is exactly such a change.
+
+**The chain, every link measured:** a fully-released reservation reports its **entire** margin as
+still held (**689.41341**) ⇒ a large spurious drift ⇒ published on `fund_manager_self_check` ⇒
+**a tag DH1 does NOT bar** ⇒ **single-sample SOFT/HARD escalation.**
+
+⇒ **Shipping Phase E before D-3 would arm a spurious kill on every closed delivery reservation.**
+⭐ **The only thing preventing it today is that `_check7` iterates live reservations only — and
+Phase E is precisely the change that removes that.**
+
+### 14.5 · ⭐⭐ This RE-RANKS (b), and the reason must not be re-derived
+
+(b) auditability was filed as **real work, but not urgent — all consumers LATENT**. ✅ **That
+still holds today.** ⛔ **It stops holding the moment Phase E is scheduled.**
+
+> **(b)'s urgency is not a property of the defect. It is a property of the ROADMAP.**
+
+⚠️ **There is no Phase E work item** in the register or anywhere in `docs/` — the only forward
+reference is the `_check7` docstring. ⭐ **So this constraint has been recorded where the work
+would actually be picked up: `docs/04_db_schema_reference.md` (beside the existing
+`release_used()` key-gap note), not only here.** A rule living solely in a design nobody opens
+is not a rule.
+
+---
+
+## 15 · What this design does NOT settle
+
+- The **expression** for D-1 (deliberately — see the rejection criterion).
+- Whether §3's transient window exists. 🏷️ **UNVERIFIED.**
+- The `(d)` capital-comparison question (equity vs free cash) — a **separate** finding, filed
+  against the existing drift row, not in scope here.
+- Whether the `reservation_id`-blind-query class is a **fourth** M1 group or an instance of an
+  existing one. ⛔ Filed, not folded.

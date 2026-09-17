@@ -1,0 +1,44 @@
+# config/scoring_weights.yaml — Trading System v2
+#
+# All secondary screener step weights and tier thresholds (P9b).
+# NO weights are hardcoded in screening/*.py — this file is the single source.
+# Weights are non-negative integers; final score = sum of weights for passed steps.
+# Adjust weights based on live data once system is trading (v2 → v2.1 iteration).
+#
+# Locked decisions: P9b
+
+steps:
+  volume_surge: 15      # Step 1: volume vs 20-day avg
+  vwap_position: 10     # Step 2: price relative to VWAP (direction-aware)
+  atr_filter: 10        # Step 3: ATR-based volatility gate
+  rsi_range: 10         # Step 4: RSI in acceptable range
+  price_action: 15      # Step 5: candle structure + swing confirmation
+  sector_strength: 10   # Step 6: sector index momentum
+  time_of_day: 5        # Step 7: entry time quality (later in session = lower weight)
+  spread_check: 5       # Step 8: bid-ask spread vs ATR
+  circuit_check: 10     # Step 9: upper/lower circuit state via kite.quote()
+  signal_age: 10        # Step 10: signal freshness (now - triggered_at ≤ 90s, P9a)
+
+min_pass_score: 60
+
+# BUILD 1 (#4, 24-Jun): the scoring-side `tier_multipliers` block was DELETED.
+# Position-size tier weights are owned by system_config.position_sizing
+# .tier_multipliers (0.70/0.50); the sizer never read these (0.75/0.5) — it was
+# misleading dead config. The thresholds below still drive tier ASSIGNMENT.
+high_score_threshold: 80
+medium_score_threshold: 65
+
+# ── V3 03.03/03.04 — Hard-Gate extraction + scorer re-scale (DEFAULT-OFF) ──
+# off (default) = the 10-step scorer + the 60/80/65 thresholds above run UNCHANGED
+#   (byte-identical live path). The v3_* keys are separate so OFF/reports keep 60/80/65.
+# shadow = compute both, live follows OLD, log NEW old-vs-new. enforce = gate + 8-step
+#   + v3 thresholds decide. Flip off→shadow→enforce ONLY after the offline parity
+#   recompute (scripts/v3_hardgate_parity_recompute.py) is signed off. Thresholds are
+#   the analytic fresh-reference start (min 60→50 / med 65→56 / high 80→75) and MUST be
+#   data-fit before enforce.
+v3_hardgate_mode: "shadow"         # off | shadow | enforce  (quoted — YAML reads bare off as false). SHADOW 12-Jul: compute+log OLD-vs-NEW; LIVE follows OLD (byte-identical). soak ≥5 sessions before any enforce discussion
+v3_gate_steps: [circuit_check, signal_age]   # steps the Hard-Gate owns (excluded from v3 scoring)
+v3_freshness_max_sec: 60.0         # freshness gate cutoff (matches OLD signal_age>60s reject)
+v3_min_pass_score: 50
+v3_high_score_threshold: 75
+v3_medium_score_threshold: 56

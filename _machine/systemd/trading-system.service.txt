@@ -1,0 +1,52 @@
+# /etc/systemd/system/trading-system.service
+[Unit]
+Description=Trading System v2 (paper/live mode)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=ubuntu
+Group=ubuntu
+WorkingDirectory=/home/ubuntu/systems/trading-system
+Environment="PATH=/home/ubuntu/systems/venv/bin:/usr/bin:/bin"
+Environment=PYTHONUNBUFFERED=1
+EnvironmentFile=/home/ubuntu/systems/trading-system/.env
+
+# Headless (no --interactive): account+mode auto-select to
+# primary account (LFL836). stdin from /dev/null so
+# any accidental prompt fails fast instead of hanging.
+ExecStart=/home/ubuntu/systems/venv/bin/python \
+    /home/ubuntu/systems/trading-system/main.py --mode live
+StandardInput=null
+
+# Send SIGINT on stop so main.py's Ctrl+C handler runs
+# (clean shutdown, SHUTDOWN event, DB flush)
+KillSignal=SIGINT
+TimeoutStopSec=30
+
+# Restart policy: only restart on non-zero exit (crash/error).
+# Exit 0 = holiday guard shutdown or normal EOD completion -- no restart.
+# Exit 3 = startup check failure (would loop on same failure) -- no restart.
+# Exit 1/2 = runtime error/crash -- restart so system can recover mid-day.
+Restart=on-failure
+RestartSec=10
+RestartPreventExitStatus=3 4 5
+
+# Logging to journal (journalctl -u trading-system)
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=trading-system
+
+# Security hardening
+NoNewPrivileges=true
+ProtectSystem=full
+ProtectHome=false
+PrivateTmp=true
+
+[Install]
+WantedBy=multi-user.target
+
+# /etc/systemd/system/trading-system.service.d/watchman.conf
+[Unit]
+Wants=trading-watchman.service

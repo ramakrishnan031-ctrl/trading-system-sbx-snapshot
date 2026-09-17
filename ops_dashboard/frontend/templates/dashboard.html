@@ -1,0 +1,427 @@
+{% extends "base.html" %}
+{% block title %}AlgoCore Systems — Dashboard{% endblock %}
+{% block nav_dashboard %}active{% endblock %}
+{% block content %}
+<div x-data="dashPage()" x-init="load()" @ops-refresh.window="load()" class="dash-page">
+
+  <!-- Merged Alerts banner (L10 — Alerts has no standalone menu) -->
+  <div class="info-banner" x-show="alerts.length" x-cloak>
+    <span class="sev-chip sev-CRITICAL" x-show="critAlerts()" x-cloak x-text="critAlerts() + ' critical'"></span>
+    <span x-text="alerts.length + ' alert(s) today' + (alerts[0] ? (' · latest: ' + (alerts[0].title || '')) : '')"></span>
+  </div>
+
+  <!-- ═══ TODAY'S TRADING SUMMARY — 12 KPI cards (clickable → deep-link routes) ═══ -->
+  <section class="panel mc-panel">
+    <div class="mc-head">
+      <h2 class="mc-title">Today's Trading Summary</h2>
+    </div>
+    <div class="kpi-deck">
+      <template x-for="k in kpis()" :key="k.key">
+        <a class="kc" :class="'kc-' + k.tone" :href="k.href || '#'"
+           @click="(!k.href) && $event.preventDefault()">
+          <div class="kc-top">
+            <span class="kc-ic" :class="'ic-' + k.tone" x-html="kpiIcon(k.key)"></span>
+            <span class="kc-label" x-text="k.label"></span>
+          </div>
+          <span class="kc-val num" :class="valSize(k.val)" x-text="k.val"></span>
+          <div class="kc-foot">
+            <span class="kc-sub" x-text="k.sub"></span>
+            <svg x-show="k.spark && sparkOf(k.spark)" x-cloak class="kc-spark"
+                 :class="'spark-' + k.spark" viewBox="0 0 80 22"
+                 preserveAspectRatio="none" aria-hidden="true">
+              <polyline :points="sparkOf(k.spark, 80, 22)" fill="none" class="spark-line"/>
+            </svg>
+          </div>
+        </a>
+      </template>
+    </div>
+    <div class="mc-hint"><span class="mc-hint-ic">☝</span> Click any metric to view detailed reports</div>
+  </section>
+
+  <!-- ═══ SIGNAL → TRADE PIPELINE — 13 stage cards, colored top-rail, arrows ═══ -->
+  <section class="panel mc-panel">
+    <div class="mc-head">
+      <h2 class="mc-title">Signal <span class="mc-arw">→</span> Trade Pipeline</h2>
+      <span class="mc-flow">Real-time Flow</span>
+    </div>
+    <div class="pl-rail">
+      <template x-for="(st, i) in (pipeline.stages || [])" :key="st.key">
+        <div class="pl-card" :class="['pl-' + st.color, st.active ? 'pl-active' : '']">
+          <span class="pl-name" x-text="st.name"></span>
+          <span class="pl-count num" x-text="fmtInt(st.count)"></span>
+          <span class="pl-last">Last: <span x-text="clockOf(st.last_event)"></span></span>
+        </div>
+      </template>
+    </div>
+  </section>
+
+  <!-- ═══ 3-COLUMN OPS ROW — Capacity · Service Health · Recent Events ═══ -->
+  <div class="mc-3col">
+
+    <!-- ── DAILY CAPACITY MONITOR ── -->
+    <section class="panel mc-panel">
+      <div class="mc-head">
+        <h2 class="mc-title">Daily Capacity Monitor</h2>
+        <a class="mc-link" href="/capacity">All limits ⌄</a>
+      </div>
+      <div class="tbl-scroll">
+        <table class="cap-tbl">
+          <thead><tr>
+            <th>Limit</th><th class="rt">Used</th><th class="rt">Cap</th>
+            <th class="rt">Left</th><th>Usage %</th><th class="rt">Status</th>
+          </tr></thead>
+          <tbody>
+            <template x-for="row in capacity.rows" :key="row.key">
+              <tr>
+                <td class="cap-lim">
+                  <span x-text="row.label"></span>
+                  <span class="cap-new" x-show="row.inert" x-cloak>NEW</span>
+                </td>
+                <td class="rt num" x-text="fmtCap(row.used, row.unit)"></td>
+                <td class="rt num" x-text="fmtCap(row.limit, row.unit)"></td>
+                <td class="rt num" :class="(row.remaining !== null && row.remaining < 0) ? 'txt-red' : ''"
+                    x-text="row.remaining !== null ? fmtCap(row.remaining, row.unit) : '—'"></td>
+                <td>
+                  <div class="usage">
+                    <span class="usage-pct num" x-text="(row.pct !== null && row.pct !== undefined) ? row.pct + '%' : '—'"></span>
+                    <span class="usage-bar">
+                      <span class="usage-fill" :class="'uf-' + capTier(row.pct)"
+                            :style="'width:' + Math.min(100, Math.max(0, row.pct || 0)) + '%'"></span>
+                    </span>
+                  </div>
+                </td>
+                <td class="rt"><span class="cap-badge" :class="'cb-' + (row.status || 'OK')" x-text="row.status"></span></td>
+              </tr>
+            </template>
+            <tr x-show="!capacity.rows || capacity.rows.length === 0" x-cloak>
+              <td colspan="6" class="ev-empty">No capacity data.</td>
+            </tr>
+          </tbody>
+        </table>
+      </div>
+      <div class="cap-legend">
+        <span class="lg"><span class="lg-dot uf-ok"></span> 0-60%</span>
+        <span class="lg"><span class="lg-dot uf-warn"></span> 60-80%</span>
+        <span class="lg"><span class="lg-dot uf-crit"></span> 80-100%</span>
+      </div>
+    </section>
+
+    <!-- ── SERVICE HEALTH ── -->
+    <section class="panel mc-panel">
+      <div class="mc-head"><h2 class="mc-title">Service Health</h2></div>
+      <table class="svc-tbl">
+        <thead><tr><th>Service</th><th>Status</th><th class="rt">Last Update</th></tr></thead>
+        <tbody>
+          <template x-for="u in (service_health || [])" :key="u.unit">
+            <tr>
+              <td class="svc-name">
+                <span class="svc-dot" :class="svcOk(u.state) ? 'dot-ok' : (svcDown(u.state) ? 'dot-down' : 'dot-idle')"></span>
+                <span x-text="u.unit.replace('.service','').replace('.timer','')"></span>
+              </td>
+              <td><span class="svc-badge" :class="svcOk(u.state) ? 'svb-active' : (svcDown(u.state) ? 'svb-inactive' : 'svb-idle')"
+                        x-text="svcLabel(u.state)"></span></td>
+              <td class="rt svc-upd num" :class="svcStamp(u) === 'UNAVAILABLE' ? 'svc-unavail' : ''"
+                  :title="u.last_change_at || 'no state-change stamp reported by systemd'"
+                  x-text="svcStamp(u)"></td>
+            </tr>
+          </template>
+          <tr x-show="!service_health || service_health.length === 0" x-cloak>
+            <td colspan="3" class="ev-empty">No service data.</td>
+          </tr>
+        </tbody>
+      </table>
+      <a class="mc-link mc-link-foot" href="/services">View all services →</a>
+    </section>
+
+    <!-- ── RECENT EVENTS ── -->
+    <section class="panel mc-panel">
+      <div class="mc-head">
+        <h2 class="mc-title">Recent Events</h2>
+        <a class="mc-link" href="/live-activity">View all</a>
+      </div>
+      <ul class="ev-list">
+        <template x-for="(ev, i) in (events || [])" :key="ev.ref_id || i">
+          <li class="ev-row">
+            <span class="ev-time num" x-text="ev.time || '—'"></span>
+            <span class="ev-ic" :class="'evc-' + evCls(ev)" x-html="evIcon(evCls(ev))"></span>
+            <span class="ev-name">
+              <span x-text="ev.event"></span>
+              <span class="ev-det" x-show="ev.note" x-cloak x-text="'(' + ev.note + ')'"></span>
+            </span>
+            <span class="ev-tag" :class="'evt-' + evCls(ev)" x-text="ev.badge"></span>
+          </li>
+        </template>
+        <li x-show="!events || events.length === 0" x-cloak class="ev-empty">
+          No trading events today yet.
+        </li>
+      </ul>
+    </section>
+  </div>
+
+  <!-- ═══ STRATEGY SUMMARY (compact) ═══ -->
+  <section class="panel mc-panel">
+    <div class="mc-head"><h2 class="mc-title">Strategy Summary <span class="mc-today">(Today)</span></h2></div>
+    <div class="ss-grid">
+      <div class="ss-stat">
+        <span class="ss-k">Strategies</span>
+        <span class="ss-v num" x-text="stratCounts().total"></span>
+        <span class="ss-n">Total</span>
+      </div>
+      <div class="ss-stat ss-green">
+        <span class="ss-k">Active</span>
+        <span class="ss-v num" x-text="stratCounts().active"></span>
+        <span class="ss-n">Running</span>
+      </div>
+      <div class="ss-stat ss-orange">
+        <span class="ss-k">Quiet</span>
+        <span class="ss-v num" x-text="stratCounts().quiet"></span>
+        <span class="ss-n">No trades</span>
+      </div>
+      <div class="ss-stat ss-red">
+        <span class="ss-k">Silent</span>
+        <span class="ss-v num" x-text="stratCounts().silent"></span>
+        <span class="ss-n">Inactive</span>
+      </div>
+      <div class="ss-bw ss-best" x-show="bestWorst()" x-cloak>
+        <span class="ss-bw-k">Best</span>
+        <span class="ss-bw-name" x-text="bestWorst() ? bestWorst().best.basic.display_name : ''"></span>
+        <span class="ss-bw-pnl num" :class="bestWorst() && bestWorst().best.performance.net_pnl < 0 ? 'txt-red' : 'txt-green'"
+              x-text="bestWorst() ? money(bestWorst().best.performance.net_pnl) : ''"></span>
+        <span class="ss-n">P&amp;L</span>
+      </div>
+      <div class="ss-bw ss-worst" x-show="bestWorst()" x-cloak>
+        <span class="ss-bw-k">Worst</span>
+        <span class="ss-bw-name" x-text="bestWorst() ? bestWorst().worst.basic.display_name : ''"></span>
+        <span class="ss-bw-pnl num" :class="bestWorst() && bestWorst().worst.performance.net_pnl < 0 ? 'txt-red' : 'txt-green'"
+              x-text="bestWorst() ? money(bestWorst().worst.performance.net_pnl) : ''"></span>
+        <span class="ss-n">P&amp;L</span>
+      </div>
+      <a class="ss-all" href="/strategies">View All Strategies →</a>
+    </div>
+    <span x-show="!strategies.rows || strategies.rows.length === 0" x-cloak class="ev-empty">No strategy activity.</span>
+  </section>
+
+</div>
+
+<script>
+function dashPage() {
+  return Object.assign(pageBase("/api/pipeline"), {
+    pipeline: { stages: [], halt: {} }, capacity: { rows: [] }, strategies: { rows: [] },
+    pnl: {}, dashData: {}, alerts: [],
+    async load() {
+      try {
+        const [p, cap, s, pnl, dsh, al] = await Promise.all([
+          fetch("/api/pipeline", {credentials:"same-origin"}).then(r => r.json()),
+          fetch("/api/capacity", {credentials:"same-origin"}).then(r => r.json()),
+          fetch("/api/strategies", {credentials:"same-origin"}).then(r => r.json()),
+          fetch("/api/pnl", {credentials:"same-origin"}).then(r => r.json()),
+          fetch("/api/dashboard", {credentials:"same-origin"}).then(r => r.json()),
+          fetch("/api/alerts", {credentials:"same-origin"}).then(r => r.json()),
+        ]);
+        this.pipeline = p || { stages: [], halt: {} };
+        this.capacity = cap || { rows: [] };
+        this.strategies = s || { rows: [] };
+        this.pnl = pnl || {};
+        this.dashData = dsh || {};
+        this.alerts = (al && al.alerts) || [];
+      } catch (e) { /* bar shows the error state */ }
+    },
+
+    // ── shared readers ────────────────────────────────────────────────────
+    st(key) { const r = (this.pipeline.stages || []).find(s => s.key === key); return r ? Number(r.count) : 0; },
+    cnt(k) { return (this.dashData.summary && this.dashData.summary.counters && this.dashData.summary.counters[k] != null)
+                    ? this.dashData.summary.counters[k] : 0; },
+    wins() { return (this.strategies.rows || []).reduce((a, r) => a + (r.trading ? r.trading.wins : 0), 0); },
+    losses() { return (this.strategies.rows || []).reduce((a, r) => a + (r.trading ? r.trading.losses : 0), 0); },
+    winRate() { const w = this.wins(), l = this.losses(); return (w + l) ? (Math.round(1000 * w / (w + l)) / 10) + '%' : '—'; },
+    profitFactor() { const pf = this.cnt('profit_factor'); return (pf === null || pf === undefined || pf === 0) ? '—' : pf; },
+    pnlNet() { return this.pnl.summary ? this.pnl.summary.net : this.cnt('net_pnl_today'); },
+    critAlerts() { return (this.alerts || []).filter(a => a.severity === 'CRITICAL').length; },
+    capRow(key) { return (this.capacity.rows || []).find(r => r.key === key) || null; },
+
+    // ── formatters ────────────────────────────────────────────────────────
+    fmtInt(v) { return Number(v || 0).toLocaleString('en-IN'); },
+    money(v) { const n = Number(v || 0); return (n < 0 ? "-₹" : "₹") + Math.abs(n).toLocaleString('en-IN', {minimumFractionDigits: 2, maximumFractionDigits: 2}); },
+    pctOf(part, whole) { whole = Number(whole || 0); if (!whole) return null; return Math.round(1000 * Number(part) / whole) / 10; },
+    fmtCap(v, unit) {
+      if (v === null || v === undefined) return "—";
+      if (unit === "rs") return (Number(v) < 0 ? "-₹" : "₹") + Math.abs(Number(v)).toLocaleString('en-IN', {minimumFractionDigits: 2, maximumFractionDigits: 2});
+      return this.fmtInt(v);
+    },
+    clockOf(ts) { if (!ts) return "—"; const s = String(ts).replace('T', ' '); const t = s.slice(11, 19); return t || "—"; },
+
+    // ── KPI deck (12 cards, all from existing pipeline/counters/strategies) ─
+    kpis() {
+      const rec = this.st('received'), acc = this.st('validated'), rej = this.st('rejected');
+      const oc = this.st('orders_created'), of = this.st('orders_filled');
+      const closed = this.st('trade_closed'), open = this.cnt('open_positions');
+      const w = this.wins(), l = this.losses();
+      const sub = (p) => (p === null) ? 'Today' : (p + '% of received');
+      const subC = (p) => (p === null) ? 'Today' : (p + '% of created');
+      // ⭐ THE TONE IS THE ARTWORK'S, CARD BY CARD. Four differ from the first
+      // build and each was read off the approved PNG at 5x: Open Trades,
+      // Closed Trades and Profit Factor are drawn NEUTRAL (grey border, blue
+      // icon), and Win Rate is drawn BLUE — ⛔ not green. The tone colours the
+      // border and the icon chip only; ⛔ the VALUE is white on all twelve.
+      return [
+        { key: 'received',  label: 'Signals Received', val: this.fmtInt(rec), sub: 'Today', tone: 'info', href: '/signals', spark: 'signals' },
+        { key: 'accepted',  label: 'Signals Accepted', val: this.fmtInt(acc), sub: sub(this.pctOf(acc, rec)), tone: 'pos', href: '/signals' },
+        { key: 'rejected',  label: 'Signals Rejected', val: this.fmtInt(rej), sub: sub(this.pctOf(rej, rec)), tone: 'neg', href: '/signals' },
+        { key: 'orders_created', label: 'Orders Created', val: this.fmtInt(oc), sub: 'Today', tone: 'info', href: '/orders' },
+        { key: 'orders_filled',  label: 'Orders Filled',  val: this.fmtInt(of), sub: subC(this.pctOf(of, oc)), tone: 'pos', href: '/orders' },
+        { key: 'open',      label: 'Open Trades',   val: this.fmtInt(open),   sub: 'Active now', tone: 'neutral', href: '/positions' },
+        { key: 'closed',    label: 'Closed Trades', val: this.fmtInt(closed), sub: 'Today', tone: 'neutral', href: '/pnl' },
+        { key: 'wins',      label: 'Wins',   val: this.fmtInt(w), sub: 'Today', tone: 'pos', href: '/statistics' },
+        { key: 'losses',    label: 'Losses', val: this.fmtInt(l), sub: 'Today', tone: 'neg', href: '/statistics' },
+        { key: 'winrate',   label: 'Win Rate', val: this.winRate(), sub: 'Today', tone: 'info', href: '/statistics' },
+        { key: 'pf',        label: 'Profit Factor', val: this.profitFactor(), sub: 'Today', tone: 'neutral', href: '/statistics' },
+        { key: 'pnl',       label: "Today's P&L", val: this.money(this.pnlNet()), sub: 'Net',
+          tone: (Number(this.pnlNet()) < 0 ? 'neg' : 'pos'), href: '/pnl', spark: 'pnl' },
+      ];
+    },
+    kpiIcon(key) { return DASH_ICONS[key] || DASH_ICONS._dot; },
+
+    // ⛔ A VALUE MAY NOT ESCAPE ITS CARD. The deck is twelve across at the
+    // artwork's own width, which leaves ~100px of inner card; "₹2,395.00"
+    // overflowed the card AND the panel at 29px. The steps below are keyed to
+    // the rendered length, so a short value keeps the artwork's 29px exactly
+    // and only a long one steps down — never below 17px, which stays inside
+    // the spec's "Critical Metrics: 16-18px".
+    valSize(v) {
+      const n = String(v == null ? '' : v).length;
+      if (n <= 7) return '';
+      if (n <= 8) return 'kc-val-md';
+      if (n <= 10) return 'kc-val-sm';
+      return 'kc-val-xs';
+    },
+
+    // ── the artwork's TWO sparklines, each from a real series ─────────────
+    // `pnl`  → the stored equity curve.  `signals` → the SAME per-minute rows
+    // Screen 18's market pulse reads. ⛔ Neither is synthesised, and a series
+    // with nothing in it draws NO line rather than a flat one along the axis.
+    sparkSeries(which) {
+      if (which === 'pnl') return (this.pnl.equity_curve || []).map(p => p.cum_pnl);
+      if (which === 'signals') {
+        const s = this.dashData.signals_spark;
+        return (s && s.available) ? (s.points || []) : [];
+      }
+      return [];
+    },
+    sparkOf(which, w, h) {
+      w = w || 80; h = h || 22;
+      const pts = this.sparkSeries(which);
+      if (pts.length < 2) return "";
+      let min = Math.min(0, ...pts), max = Math.max(0, ...pts);
+      if (min === max) { min -= 1; max += 1; }
+      const step = w / (pts.length - 1);
+      return pts.map((v, i) =>
+        (i * step).toFixed(1) + "," + ((h - 2) - (h - 4) * (v - min) / (max - min) + 1).toFixed(1)
+      ).join(" ");
+    },
+
+    // ── capacity usage tier (bar color; independent of STATUS word) ────────
+    capTier(pct) { const p = Number(pct || 0); return p >= 80 ? 'crit' : (p >= 60 ? 'warn' : 'ok'); },
+
+    // ── service health ────────────────────────────────────────────────────
+    svcOk(s)   { return String(s).toLowerCase() === 'active'; },
+    svcDown(s) { const t = String(s).toLowerCase(); return t === 'inactive' || t === 'failed' || t === 'deactivating'; },
+    svcLabel(s) { const t = String(s).toLowerCase();
+      if (t === 'active') return 'ACTIVE';
+      if (t === 'inactive') return 'INACTIVE';
+      if (t === 'failed') return 'FAILED';
+      if (t === 'unavailable') return 'UNAVAIL';
+      return String(s).toUpperCase(); },
+    // ⛔ NEVER THE DASHBOARD'S OWN CLOCK. This column used to print `ist_now`
+    // for any ACTIVE unit, so every healthy row showed the same number — the
+    // current time — which reads as a measurement and is not one. Measured on
+    // production 18-Aug: token-watcher last changed state 21 DAYS earlier while
+    // this column said "now". The stamp is the unit's real
+    // `StateChangeTimestamp`; where systemd reports none, the cell says so.
+    svcStamp(u) {
+      const raw = u && u.last_change_at;
+      if (!raw) return 'UNAVAILABLE';
+      // systemd prints "Tue 2026-08-18 08:15:31 IST" — show the clock, and the
+      // DATE too when the transition was not today, so a three-week-old stamp
+      // can never read as this morning.
+      const m = String(raw).match(/(\d{4})-(\d{2})-(\d{2})\s+(\d{2}:\d{2}:\d{2})/);
+      if (!m) return String(raw);
+      const [, y, mo, d, clock] = m;
+      const todayIso = (this.dashData && this.dashData.today) || '';
+      return (todayIso === (y + '-' + mo + '-' + d)) ? clock : (d + '-' + MON3[+mo - 1] + ' ' + clock);
+    },
+
+    // ── recent-event styling key, from the row's STRUCTURED category ──────
+    // ⛔ THE OLD `evCat()` IS GONE. It substring-matched the event TEXT to guess
+    // a category, and against the only source that panel could read every row
+    // fell through to one bucket — four of its five branches were unreachable.
+    // The badge is now decided server-side by the builder that KNOWS the
+    // category; this maps it to a CSS class and nothing else.
+    evCls(ev) { return EV_CLASS[ev && ev.category] || 'sys'; },
+    evIcon(cls) { return EV_ICONS[cls] || EV_ICONS.sys; },
+
+    // ── strategy summary ──────────────────────────────────────────────────
+    bestWorst() {
+      const rows = this.strategies.rows || [];
+      if (!rows.length) return null;
+      return { best: rows[0], worst: rows[rows.length - 1] };   // net-P&L rank order
+    },
+    stratCounts() {
+      const rows = this.strategies.rows || [];
+      let active = 0, quiet = 0, silent = 0;
+      rows.forEach(r => {
+        const c = r.silence && r.silence.color;
+        if (c === 'RED') silent++;
+        else if (c === 'YELLOW') quiet++;
+        else active++;   // GREEN, or null = outside an expected-activity window (no alarm)
+      });
+      return { total: rows.length, active, quiet, silent };
+    },
+  });
+}
+
+// Inline icon sets (static, controlled strings → x-html safe). Feather-style,
+// stroke=currentColor so each inherits its tone/category color.
+const _S = 'stroke="currentColor" stroke-width="2" fill="none" stroke-linecap="round" stroke-linejoin="round"';
+const DASH_ICONS = {
+  received:       `<svg viewBox="0 0 24 24" ${_S}><path d="M4 11a9 9 0 0 1 9-9"/><path d="M4 4a16 16 0 0 1 16 16"/><circle cx="5" cy="19" r="1.6" fill="currentColor" stroke="none"/></svg>`,
+  accepted:       `<svg viewBox="0 0 24 24" ${_S}><circle cx="12" cy="12" r="9"/><path d="M8.5 12.5l2.5 2.5 4.5-5"/></svg>`,
+  rejected:       `<svg viewBox="0 0 24 24" ${_S}><circle cx="12" cy="12" r="9"/><path d="M9 9l6 6M15 9l-6 6"/></svg>`,
+  orders_created: `<svg viewBox="0 0 24 24" ${_S}><rect x="5" y="3" width="14" height="18" rx="2"/><path d="M9 8h6M9 12h6M9 16h4"/></svg>`,
+  orders_filled:  `<svg viewBox="0 0 24 24" ${_S}><rect x="4" y="4" width="16" height="16" rx="2"/><path d="M8.5 12.5l2.5 2.5 4.5-5"/></svg>`,
+  open:           `<svg viewBox="0 0 24 24" ${_S}><path d="M3 12h4l2 6 4-14 2 8h6"/></svg>`,
+  closed:         `<svg viewBox="0 0 24 24" ${_S}><path d="M20 6L9 17l-5-5"/></svg>`,
+  wins:           `<svg viewBox="0 0 24 24" ${_S}><path d="M8 21h8M12 17v4M6 4h12v4a6 6 0 0 1-12 0z"/><path d="M6 6H3v2a3 3 0 0 0 3 3M18 6h3v2a3 3 0 0 1-3 3"/></svg>`,
+  losses:         `<svg viewBox="0 0 24 24" ${_S}><path d="M3 7l6 6 4-4 8 8"/><path d="M21 17v-6h-6"/></svg>`,
+  winrate:        `<svg viewBox="0 0 24 24" ${_S}><path d="M19 5L5 19"/><circle cx="7.5" cy="7.5" r="2.5"/><circle cx="16.5" cy="16.5" r="2.5"/></svg>`,
+  pf:             `<svg viewBox="0 0 24 24" ${_S}><path d="M4 20V10M10 20V4M16 20v-7M22 20H2"/></svg>`,
+  pnl:            `<svg viewBox="0 0 24 24" ${_S}><path d="M8 6h8M8 10h8M14 6a4 4 0 0 1 0 8H9l6 5"/></svg>`,
+  _dot:           `<svg viewBox="0 0 24 24" ${_S}><circle cx="12" cy="12" r="8"/></svg>`,
+};
+//: Short month names for a service stamp that is NOT from today.
+const MON3 = ["Jan","Feb","Mar","Apr","May","Jun","Jul","Aug","Sep","Oct","Nov","Dec"];
+
+//: STRUCTURED category → the row's styling class. ⭐ The keys are exactly
+//: live_activity.CATEGORIES, so a category the feed can emit always has a class
+//: and ⛔ none is folded into a near-enough one. The artwork draws SIGNAL /
+//: ORDER / RISK / EXIT; `Trade` maps to `exit` because those rows ARE the exits.
+const EV_CLASS = {
+  Signal: 'signal', Order: 'order', Position: 'order', Trade: 'exit',
+  Risk: 'risk', Capital: 'sys', System: 'sys', Alert: 'risk',
+};
+//: ⛔ `Capital` IS NOT `risk`. Found by rendering the digest: routine
+//: `Capital Reserved` / `Capital Released` rows came out RED under a warning
+//: triangle, and red is the loudest signal on this page. The binding spec's own
+//: vocabulary (KPI COLORS) reserves red for losses/rejections and orange for
+//: warnings; a ledger reservation is neither, so it takes the existing neutral
+//: informational treatment. ⛔ No new colour token is introduced.
+//: `Alert` KEEPS the risk treatment: a telegram alert is raised precisely
+//: because something needs attention.
+const EV_ICONS = {
+  signal: `<svg viewBox="0 0 24 24" ${_S}><path d="M4 11a9 9 0 0 1 9-9"/><path d="M4 4a16 16 0 0 1 16 16"/><circle cx="5" cy="19" r="1.6" fill="currentColor" stroke="none"/></svg>`,
+  risk:   `<svg viewBox="0 0 24 24" ${_S}><path d="M12 3l9 16H3z"/><path d="M12 10v4M12 17.5v.5"/></svg>`,
+  order:  `<svg viewBox="0 0 24 24" ${_S}><rect x="5" y="3" width="14" height="18" rx="2"/><path d="M9 8h6M9 12h6"/></svg>`,
+  exit:   `<svg viewBox="0 0 24 24" ${_S}><path d="M5 3v18l7-4 7 4V3z"/></svg>`,
+  sys:    `<svg viewBox="0 0 24 24" ${_S}><circle cx="12" cy="12" r="8"/><path d="M12 8v4l2 2"/></svg>`,
+};
+</script>
+{% endblock %}

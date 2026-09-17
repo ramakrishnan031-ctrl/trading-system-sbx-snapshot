@@ -1,0 +1,2583 @@
+"""
+capital/fund_manager.py -- Trading System v2
+
+Purpose:
+    Single source of truth for all capital state. Every capital mutation
+    (reserve, release, commit, release_used) flows through this module.
+    Replaces 5+ scattered capital tracking points identified in the audit.
+
+Locked Design Decisions:
+    FM1  -- Single source of truth: total, available, reserved, used,
+             daily_realized_pnl.
+    FM2  -- Three-balance invariant: available + reserved + used == total.
+             Checked inside EVERY mutation before commit. (audit G3)
+    FM3  -- Two independent buckets: intraday (70%) and positional (30%).
+             Cross-bucket borrowing is FORBIDDEN.
+    FM4  -- required_margin = qty * price / leverage. NOT notional.
+             Audit catastrophic flaw fix: old code deducted 5x actual margin.
+    FM5  -- Atomic reserve/release/commit via single threading.RLock.
+    FM6  -- reservation_id (16 hex chars) per reserve() call. Stored in
+             _reservations dict for release/commit lookups.
+    FM7  -- daily_realized_pnl tracked; on_daily_loss_breach fired post-trade.
+    FM8  -- get_snapshot() returns frozen CapitalSnapshot under lock.
+    FM9  -- sync_from_broker(balance): sets total, recomputes available.
+             NEVER subtracts used from broker balance (audit double-deduction fix).
+    FM10 -- Every mutation writes to fm_ledger (state_store) in same txn.
+             BL-5: ledger row is written BEFORE the in-memory mutation
+             (write-ahead logging). If the app crashes between the INSERT
+             and the bucket update, rehydrate replays fm_ledger to rebuild
+             in-memory state. If the ledger INSERT itself raises, the
+             mutation is skipped and the caller sees the exception.
+    FM11 -- Invariant violation raises CapitalInvariantViolation (CRITICAL).
+    FM12 -- Constructor validates bucket pcts sum to 1.0 and leverage_map
+             covers all 4 intents.
+    FM13 -- initialize(broker_balance) called once at startup.
+    FM14 -- reset_daily_pnl() called at EOD.
+    FM15 -- Layer 3 (capital/). Imports: stdlib + core.*.
+    FM16 -- SystemConfig.capital added.
+    FM17 -- NOT in scope: position sizing, risk per trade, cost deduction.
+    FM18 -- BL-1: rehydrate_from_open_trades reconstructs in-memory state
+             from the persistence triangle (fm_ledger + trades + orders) on
+             startup. Uses _apply_reserve / _apply_release / _apply_commit
+             pure-mutation helpers shared with the public reserve / release
+             / commit_to_used paths -- public methods orchestrate (validate
+             -> ledger -> apply -> invariant), replay invokes _apply* without
+             writing the ledger back. Invariant is checked ONCE at the end
+             of replay (not per step), since intermediate states between
+             RESERVE and COMMIT are momentarily unusual. Failure raises
+             CapitalStateInconsistent (distinct from CapitalInvariantViolation
+             so callers can distinguish startup-replay corruption from a live
+             mid-mutation invariant break).
+    FM19 -- BL-9: optional kill_switch dependency. _check_invariant calls
+             kill_switch.hard_kill BEFORE the existing on_critical_failure
+             callback and BEFORE re-raising, so a provably corrupted bin-card
+             state cancels open orders immediately rather than just blocking
+             new ones. hard_kill is wrapped in its own try/except -- if the
+             kill path itself fails, the invariant exception still propagates
+             (belt-and-braces). kill_switch=None degrades gracefully: the
+             existing on_critical_failure path still runs (soft_kill wiring
+             remains available for other critical-signal callers).
+    FM20 -- BL-4 (Phase C.1): commit_to_used wraps its entire body in a
+             hard-kill handler. Any exception (unknown reservation, ledger
+             failure, apply failure, invariant violation) fires
+             kill_switch.hard_kill before re-raising the original. Unlike
+             BL-9, this handler does NOT invoke on_critical_failure -- the
+             callback stays narrow to invariant-violation semantics.
+             Scope: commit_to_used only; reserve() and release_used() keep
+             their existing (recoverable / reconciler-backstopped) error
+             policies.
+
+What This Module Does NOT Do:
+    - Does not size positions (capital/position_sizer.py)
+    - Does not compute risk per trade (capital/risk_engine.py)
+    - Does not deduct broker costs (caller passes net values)
+    - Does not subscribe to events directly
+"""
+from __future__ import annotations
+
+import math
+import threading
+import time
+import uuid
+from dataclasses import dataclass
+from typing import TYPE_CHECKING, Any, Callable, Final, Optional
+
+from capital.invariant import assert_capital_invariant
+from core.effect_telemetry import handle as _effect_handle
+from core.events import CapitalDriftDetected, EventBus
+from core.exceptions import CapitalInvariantViolation, CapitalStateInconsistent
+from core.logger import log_exception
+from core.state_store import StateStore
+from core.time_authority import now_ist
+
+if TYPE_CHECKING:
+    from capital.kill_switch import KillSwitch
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Constants
+# ─────────────────────────────────────────────────────────────────────────────
+
+_INTRADAY_INTENTS: frozenset[str] = frozenset({"INTRADAY", "COVER_ORDER", "BRACKET_ORDER"})
+_POSITIONAL_INTENTS: frozenset[str] = frozenset({"DELIVERY"})
+_ALL_INTENTS: frozenset[str] = _INTRADAY_INTENTS | _POSITIONAL_INTENTS
+
+# EF-3: release_used now requires `direction` to compute PnL correctly.
+# LONG profits when exit > entry; SHORT profits when exit < entry.
+_VALID_DIRECTIONS: Final[frozenset[str]] = frozenset({"LONG", "SHORT"})
+
+_INTRADAY_BUCKET = "intraday"
+_POSITIONAL_BUCKET = "positional"
+
+
+def resolve_bucket_allocation(
+    *,
+    conditional_enabled: bool,
+    delivery_active: bool,
+    intraday_active: bool,
+    intraday_pct: float,
+    positional_pct: float,
+) -> tuple[float, float]:
+    """SLICE2.5-PHASE-3 (B): the EFFECTIVE (intraday_pct, positional_pct) split.
+
+    Pure + deterministic (unit-tested directly; main.py calls it and passes the
+    result to FundManager, which is otherwise UNCHANGED). Always sums to 1.0 so
+    the FM12 ctor invariant holds.
+
+      conditional_enabled FALSE (default) -> the fixed config split, byte-for-byte
+                                             unchanged (zero behaviour change).
+      conditional_enabled TRUE:
+        only-intraday (not delivery_active)            -> (1.0, 0.0)
+        only-delivery (delivery_active, not intraday)  -> (0.0, 1.0)
+        BOTH active                                    -> the config split
+        neither active                                 -> (1.0, 0.0)  [safe idle]
+
+    delivery 0% => every delivery reserve() rejects "Insufficient positional
+    capital" and never borrows intraday (the no-borrow guarantee is already in
+    reserve(): it consults ONLY the intent's bucket).
+    """
+    if not conditional_enabled:
+        return intraday_pct, positional_pct
+    if delivery_active and not intraday_active:
+        delivery = 1.0
+    elif delivery_active and intraday_active:
+        delivery = positional_pct
+    else:  # not delivery_active (incl. neither active) -> all intraday
+        delivery = 0.0
+    return 1.0 - delivery, delivery
+
+
+# FIX-113: Invariant tolerance (rupees) for floating-point comparisons.
+# Why 1.0 is appropriate:
+#   - Paper mode: LTP-based fills vs limit-price orders introduce ±0.05-0.50 rounding
+#   - Live mode: broker-reported margin vs local calc can differ by ±0.10-0.50 due to:
+#       * Broker using different rounding for stamp duty/GST
+#       * Intraday leverage timing (margin released async)
+#   - 1.0 rupee catches genuine errors (10+ rupee drift) while tolerating noise
+#   - Too tight (e.g., 0.1) would false-alarm on legitimate rounding differences
+_INVARIANT_TOLERANCE = 1.0
+
+# FIX-166 F17: canonical copy now in core.constants
+from core.constants import PRODUCT_TO_INTENT as _PRODUCT_TO_INTENT
+
+
+def _row_get(row: Any, key: str) -> Any:
+    """Safe field access for a sqlite3.Row OR a dict (A-1/E-1 recovery reads
+    trade rows from both). sqlite3.Row raises IndexError on a missing column;
+    a dict returns None via .get. Returns None on any miss."""
+    if row is None:
+        return None
+    try:
+        return row[key]
+    except (KeyError, IndexError, TypeError):
+        try:
+            return row.get(key)   # dict-like
+        except AttributeError:
+            return None
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Return-type dataclasses
+# ─────────────────────────────────────────────────────────────────────────────
+
+@dataclass(frozen=True)
+class ReservationResult:
+    success: bool
+    reservation_id: str    # 16 hex chars; empty string on failure
+    margin: float          # required margin; 0.0 on failure
+    bucket: str            # "intraday" | "positional"; empty on failure
+    reason_if_failed: str  # empty on success
+
+
+@dataclass(frozen=True)
+class CommitResult:
+    reservation_id: str
+    actual_margin: float    # margin deducted from used at fill price/qty
+    excess_returned: float  # margin adjustment to available (positive=returned, negative=deficit)
+    bucket: str
+
+
+@dataclass(frozen=True)
+class ReleaseResult:
+    reservation_id: str
+    margin_released: float
+    bucket: str
+    pnl_delta: float        # realized PnL change (0 for plain release)
+
+
+@dataclass(frozen=True)
+class CapitalSnapshot:
+    total: float
+    intraday_avail: float
+    intraday_reserved: float
+    intraday_used: float
+    positional_avail: float
+    positional_reserved: float
+    positional_used: float
+    daily_realized_pnl: float
+    ts: str   # ISO-8601 IST string
+    # FIX 1: how much of each bucket's reserved+used is margin the broker has
+    # ALREADY removed from `net` (a carried position). Defaulted so existing
+    # positional construction and every current consumer are unaffected.
+    intraday_carry: float = 0.0
+    positional_carry: float = 0.0
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Internal reservation record
+# ─────────────────────────────────────────────────────────────────────────────
+
+@dataclass
+class _Reservation:
+    reservation_id: str
+    symbol: str
+    qty: int
+    price: float
+    intent: str
+    margin: float
+    bucket: str
+    signal_id: Optional[str]
+    ts: str
+    slm_buffer: float = 0.0  # FIX-090: buffer held for SL-M margin
+    strategy: Optional[str] = None  # H-7 (Wave-5): tag for the per-strategy cap count
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Module-level helper (FM4)
+# ─────────────────────────────────────────────────────────────────────────────
+
+def required_margin(
+    qty: int,
+    price: float,
+    intent: str,
+    leverage_map: dict[str, float],
+) -> float:
+    """
+    Compute required margin = qty * price / leverage.
+    NOT notional (audit catastrophic flaw fix: FM4).
+
+    Args:
+        qty:          number of shares
+        price:        order price per share
+        intent:       semantic product intent
+        leverage_map: {intent -> leverage_multiplier}
+
+    Returns:
+        Margin amount in rupees.
+    """
+    leverage = leverage_map.get(intent, 1.0)
+    return (qty * price) / leverage
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# FundManager
+# ─────────────────────────────────────────────────────────────────────────────
+
+class FundManager:
+    """
+    Single source of truth for all capital state (FM1).
+
+    Thread-safe via single RLock. Every public method is atomic.
+    Every mutation writes to fm_ledger for audit trail (FM10).
+
+    Usage::
+        fm = FundManager(store, bus, logger,
+                         intraday_bucket_pct=0.70,
+                         positional_bucket_pct=0.30,
+                         daily_loss_limit_pct=0.03,
+                         leverage_map={"INTRADAY": 5.0, ...})
+        fm.initialize(broker_balance=500000.0)
+        result = fm.reserve("RELIANCE", 10, 2500.0, "INTRADAY", "sig_abc")
+        if result.success:
+            ...
+    """
+
+    def __init__(
+        self,
+        state_store: StateStore,
+        bus: EventBus,
+        logger: object,
+        intraday_bucket_pct: float = 0.70,
+        positional_bucket_pct: float = 0.30,
+        # BUILD 1 (#1, 24-Jun): single daily-loss source. The post-close realized
+        # breach ₹ limit = daily_loss_limit_pct × current capital (was a fixed
+        # absolute ₹). Default is the conservative 3%, not the stale 10000 (#A.4).
+        daily_loss_limit_pct: float = 0.03,
+        leverage_map: Optional[dict[str, float]] = None,
+        on_daily_loss_breach: Optional[Callable[[], None]] = None,
+        on_critical_failure: Optional[Callable[[str], None]] = None,
+        kill_switch: Optional["KillSwitch"] = None,
+        slm_margin_buffer_pct: float = 0.05,  # FIX-090
+    ) -> None:
+        # FM12: validate constructor arguments
+        if leverage_map is None:
+            leverage_map = {
+                "INTRADAY": 5.0,
+                "COVER_ORDER": 6.0,
+                "DELIVERY": 1.0,
+                "BRACKET_ORDER": 5.0,
+            }
+        missing = _ALL_INTENTS - set(leverage_map.keys())
+        if missing:
+            raise ValueError(
+                f"leverage_map is missing entries for intents: {sorted(missing)}"
+            )
+        if abs((intraday_bucket_pct + positional_bucket_pct) - 1.0) > 1e-9:
+            raise ValueError(
+                f"intraday_bucket_pct ({intraday_bucket_pct}) + "
+                f"positional_bucket_pct ({positional_bucket_pct}) must equal 1.0"
+            )
+        if not (0 < daily_loss_limit_pct <= 1):
+            raise ValueError(
+                f"daily_loss_limit_pct must be > 0 and <= 1, got {daily_loss_limit_pct}"
+            )
+
+        self._store = state_store
+        self._bus = bus
+        self._log = logger
+        self._intraday_pct = intraday_bucket_pct
+        self._positional_pct = positional_bucket_pct
+        self._daily_loss_limit_pct = daily_loss_limit_pct
+        self._leverage_map = dict(leverage_map)
+        self._slm_buffer_pct = slm_margin_buffer_pct  # FIX-090
+        self._on_loss_breach = on_daily_loss_breach
+        self._on_critical = on_critical_failure
+        self._kill_switch = kill_switch  # FM19 / BL-9
+
+        # effect-telemetry (ledger #1, frozen contract A2.1 + A2.3): handles
+        # resolved once; hot-path ops are single integer increments.
+        self._fx_ledger = _effect_handle("fund_manager")
+        self._fx_loss_breach = _effect_handle("fm.daily_loss_post_trade")
+        self._fx_invariant = _effect_handle("fm.invariant_violation")
+        self._fx_overflow = _effect_handle("fm.bucket_overflow")
+        self._fx_commit_kill = _effect_handle("fm.commit_hard_kill")
+
+        self._lock = threading.RLock()
+
+        # BL-5: per-instance session id, stamped on every fm_ledger row so
+        # restart audits can partition mutations by FundManager lifetime.
+        self._session_id = "fm_" + uuid.uuid4().hex[:12]
+        self._log.info(
+            "fund_manager.session_start",
+            extra={"session_id": self._session_id},
+        )
+
+        # Capital state (FM1, FM3) -- set by initialize()
+        self._total: float = 0.0
+
+        # Intraday bucket
+        self._intraday_avail: float = 0.0
+        self._intraday_reserved: float = 0.0
+        self._intraday_used: float = 0.0
+
+        # Positional bucket
+        self._positional_avail: float = 0.0
+        self._positional_reserved: float = 0.0
+        self._positional_used: float = 0.0
+
+        # FIX 1 (10-Aug-2026) -- CARRIED-POSITION MARGIN, per bucket.
+        #
+        # The margin for open positions that the BROKER HAS ALREADY REMOVED
+        # from the `net` we re-base on. Buying delivery converts cash into a
+        # holding: the money leaves `net` permanently (measured 10-Aug --
+        # net 209.80 alongside 907.02 of stock, an account of 1,117). A
+        # blocked intraday margin is likewise already out of `net`.
+        #
+        # Without this, re-basing counts such a position TWICE -- once by its
+        # ABSENCE from `net`, once by its PRESENCE as a replayed reservation
+        # deducted from a bucket whose base is a fraction of that same,
+        # already-reduced cash. On 10-Aug that produced
+        # `0.30 * 209.80 - 907.02 = -844.08` and INV6 hard-killed BOTH books
+        # over a position that already existed and could not be undone.
+        #
+        # Set ONLY by rehydrate_from_open_trades (the one place prior-session
+        # positions are replayed) and consumed identically by the boot and by
+        # the 09:15 sync_from_broker, so both end with ONE meaning for these
+        # fields. Zero outside a rehydrated session => byte-identical to the
+        # previous arithmetic.
+        self._intraday_carry: float = 0.0
+        self._positional_carry: float = 0.0
+
+        # FIX-051: _daily_pnl removed; read from fm_ledger SQL instead
+        self._initialized: bool = False
+
+        # FM6: active reservations
+        self._reservations: dict[str, _Reservation] = {}
+
+        # M-C5: reservation_ids with a commit_adopted_entry commit IN FLIGHT.
+        # Guarded by self._lock; a test-and-set on entry, discarded in a finally.
+        # NOT part of the 3-balance invariant — it is pure concurrency control, so
+        # a stale entry could only cause a no-op, never a capital error. See
+        # commit_adopted_entry for why the durable fm_ledger COMMIT-row guard alone
+        # cannot cover the window between the guard and the commit.
+        self._commit_claims: set[str] = set()
+
+        # FIX-035 / B-1: unrealized MTM tracking per trade_id. ADVISORY ONLY — this
+        # dict is NOT part of the 3-balance invariant (available+reserved+used==total)
+        # and never touches _total / reservations / buckets. It is read by the
+        # pre-trade daily-loss gate; the order_reconciler 15s cycle populates+prunes it
+        # (see _refresh_unrealized_mtm). Freshness is stamped so the gate can fall back
+        # to realized-only when the MTM is stale/unavailable (never silently).
+        self._unrealized_mtm: dict[str, float] = {}
+        self._mtm_refreshed_at: Optional[float] = None   # time.monotonic() of last refresh
+        self._mtm_available: bool = False                # False until a successful refresh / on outage
+
+    # ── public API ────────────────────────────────────────────────────────────
+
+    @property
+    def portfolio_lock(self):
+        """
+        Audit 1.2 / Portfolio Lock: expose the internal RLock for callers
+        that need approve+reserve to be a single critical section.
+
+        signal_processor wraps RiskEngine.approve + FundManager.reserve in
+        `with fm.portfolio_lock:` so two concurrent signals targeting the
+        same sector/bucket cannot both pass approve and then both reserve.
+        Without the lock, sector-exposure / max-positions checks race
+        against concurrent reserves -- a 20%-cap sector can overshoot
+        because both signals saw "19% before me" and both reserved.
+
+        It is an RLock, so reserve()/release() (which take the same lock
+        internally) can be called by code holding portfolio_lock without
+        deadlock.
+        """
+        return self._lock
+
+    def initialize(self, broker_balance: float) -> None:
+        """
+        Set total capital from first broker sync, split into buckets (FM13).
+        Writes INIT row to fm_ledger.
+        Must be called exactly once before any reserve/release.
+
+        H-4: double-initialize guard. A second call would write a second INIT
+        row (with balance_before=0.0 -- corrupt) and silently zero existing
+        reservations/used. WARNING + no-op is safer than silently destroying
+        live capital state.
+        """
+        with self._lock:
+            if self._initialized:
+                self._log.warning(
+                    "fund_manager.initialize called again; no-op (H-4 guard)",
+                    extra={
+                        "existing_total": self._total,
+                        "ignored_balance": broker_balance,
+                    },
+                )
+                return
+            ts = now_ist().isoformat()
+            # BL-5: ledger row first (write-ahead), then in-memory mutation.
+            self._write_ledger(
+                ts=ts,
+                entry_type="INIT",
+                amount=broker_balance,
+                bucket="both",
+                balance_before=0.0,
+                balance_after=broker_balance,
+                reason=f"initialize with broker_balance={broker_balance}",
+            )
+            self._total = broker_balance
+            self._intraday_avail = broker_balance * self._intraday_pct
+            self._intraday_reserved = 0.0
+            self._intraday_used = 0.0
+            self._positional_avail = broker_balance * self._positional_pct
+            self._positional_reserved = 0.0
+            self._positional_used = 0.0
+            # FIX 1: a fresh session carries nothing until rehydrate says so.
+            self._intraday_carry = 0.0
+            self._positional_carry = 0.0
+            # FIX-051: _daily_pnl removed; read from SQL
+            self._initialized = True
+
+            self._log.info(
+                "fund_manager.initialize",
+                extra={"total": broker_balance,
+                       "intraday_avail": self._intraday_avail,
+                       "positional_avail": self._positional_avail},
+            )
+
+    def required_margin(
+        self,
+        qty: int,
+        price: float,
+        intent: str,
+    ) -> float:
+        """
+        Public margin-compute using the FM's leverage map (H-3).
+
+        Thin wrapper over the module-level required_margin() free function so
+        callers (e.g. order_placer for trades.margin_reserved metadata) do not
+        reach into self._leverage_map and do not need to know leverage internals.
+
+        Args:
+            qty:    number of shares
+            price:  order price per share
+            intent: semantic product intent (INTRADAY, DELIVERY, COVER_ORDER, ...)
+
+        Returns:
+            Required margin in rupees. Intents absent from _leverage_map fall
+            back to 1.0x via required_margin()'s .get() default (FM4).
+        """
+        return required_margin(qty, price, intent, self._leverage_map)
+
+    def reserve(
+        self,
+        symbol: str,
+        qty: int,
+        price: float,
+        intent: str,
+        signal_id: Optional[str] = None,
+        strategy: Optional[str] = None,   # H-7 (Wave-5): tag reservation for the per-strategy cap
+    ) -> ReservationResult:
+        """
+        Atomically compute margin and reserve it from the appropriate bucket (FM5).
+
+        Returns ReservationResult(success=True, ...) or success=False with reason.
+        Does NOT raise on insufficient capital -- returns failure gracefully.
+
+        Raises:
+            CapitalInvariantViolation: invariant check fails post-mutation (FM11).
+            RuntimeError: if not initialized.
+        """
+        with self._lock:
+            self._assert_initialized()
+
+            if not isinstance(qty, (int, float)) or not isinstance(price, (int, float)):
+                return ReservationResult(
+                    success=False, reservation_id="", margin=0.0, bucket="",
+                    reason_if_failed=f"Invalid numeric input: qty={qty}, price={price}",
+                )
+            try:
+                if math.isnan(qty) or math.isnan(price) or math.isinf(qty) or math.isinf(price):
+                    return ReservationResult(
+                        success=False, reservation_id="", margin=0.0, bucket="",
+                        reason_if_failed=f"Invalid numeric input: qty={qty}, price={price}",
+                    )
+            except TypeError:
+                pass
+
+            bucket = self._bucket_for_intent(intent)
+            base_margin = required_margin(qty, price, intent, self._leverage_map)
+
+            # FIX-090: Add SL-M margin buffer (5% for unknown fill price risk)
+            # Buffer is held until SL-M is accepted, then released via release_slm_buffer()
+            slm_buffer = base_margin * self._slm_buffer_pct
+            total_margin = base_margin + slm_buffer
+
+            avail_before = self._bucket_avail(bucket)
+
+            if total_margin > avail_before:
+                return ReservationResult(
+                    success=False,
+                    reservation_id="",
+                    margin=total_margin,
+                    bucket=bucket,
+                    reason_if_failed=(
+                        f"Insufficient {bucket} capital: need {total_margin:.2f}, "
+                        f"have {avail_before:.2f}"
+                    ),
+                )
+
+            # BL-5: write-ahead. Project the post-mutation balance, write the
+            # ledger row first, then execute the in-memory mutation.
+            rid = uuid.uuid4().hex[:16]
+            ts = now_ist().isoformat()
+            projected_after = avail_before - total_margin
+            self._write_ledger(
+                ts=ts,
+                entry_type="RESERVE",
+                amount=total_margin,
+                bucket=bucket,
+                balance_before=avail_before,
+                balance_after=projected_after,
+                signal_id=signal_id,
+                reservation_id=rid,
+                reason=f"{symbol} qty={qty} @ {price} intent={intent} (base={base_margin:.2f} buffer={slm_buffer:.2f})",
+                margin_delta=+total_margin,
+            )
+
+            # FM18: pure mutation via shared helper (used by both this public
+            # path and rehydrate replay). Public path: ledger then apply then
+            # invariant. Replay path: apply only (no ledger, no invariant).
+            self._apply_reserve(
+                reservation_id=rid,    # NM-4: local `rid` is a tight-scope alias
+                bucket=bucket,
+                margin=total_margin,
+                symbol=symbol,
+                qty=qty,
+                price=price,
+                intent=intent,
+                signal_id=signal_id,
+                ts=ts,
+                slm_buffer=slm_buffer,  # FIX-090
+                strategy=strategy,      # H-7 (Wave-5)
+            )
+
+            # C.1: capture violation, defer hard_kill to after lock release.
+            try:
+                self._check_invariant("reserve", rid)
+            except CapitalInvariantViolation as exc:
+                _violation = exc
+            else:
+                _violation = None
+
+            if _violation is None:
+                _result = ReservationResult(
+                    success=True,
+                    reservation_id=rid,
+                    margin=total_margin,  # FIX-090: includes buffer
+                    bucket=bucket,
+                    reason_if_failed="",
+                )
+
+        # Outside lock
+        if _violation is not None:
+            self._handle_invariant_violation(_violation)
+            raise _violation
+        return _result
+
+    def release(self, reservation_id: str, reason: str = "") -> bool:
+        """
+        Return reserved margin to available. Used on cancellation / rejection (FM5).
+
+        Returns:
+            True  -- margin released successfully.
+            False -- reservation_id not found (already released or unknown). Idempotent.
+
+        Raises:
+            CapitalInvariantViolation: invariant check fails post-mutation.
+        """
+        with self._lock:
+            self._assert_initialized()
+            # Peek (not pop) — BL-5 write-ahead commits before in-memory change.
+            res = self._reservations.get(reservation_id)
+            if res is None:
+                return False   # FM5: idempotent
+
+            avail_before = self._bucket_avail(res.bucket)
+            projected_after = avail_before + res.margin
+            ts = now_ist().isoformat()
+            self._write_ledger(
+                ts=ts,
+                entry_type="RELEASE",
+                amount=-res.margin,
+                bucket=res.bucket,
+                balance_before=avail_before,
+                balance_after=projected_after,
+                signal_id=res.signal_id,
+                reservation_id=reservation_id,
+                reason=reason or "released",
+                margin_delta=-res.margin,
+            )
+
+            # FM18: pure mutation via shared helper (used by both this public
+            # path and rehydrate replay).
+            self._apply_release(reservation_id)
+
+            # C.1: capture violation, defer hard_kill to after lock release.
+            try:
+                self._check_invariant("release", reservation_id)
+            except CapitalInvariantViolation as exc:
+                _violation = exc
+            else:
+                _violation = None
+
+        # Outside lock
+        if _violation is not None:
+            self._handle_invariant_violation(_violation)
+            raise _violation
+        return True
+
+    def release_slm_buffer(self, reservation_id: str, reason: str = "") -> bool:
+        """
+        FIX-090: Release the SL-M margin buffer for a reservation.
+
+        Called after SL-M order is successfully accepted by broker. Releases
+        the buffer (typically 5% of base margin) back to available capital.
+
+        Returns:
+            True  -- buffer released successfully.
+            False -- reservation_id not found or buffer already released (idempotent).
+
+        Raises:
+            CapitalInvariantViolation: invariant check fails post-mutation.
+        """
+        with self._lock:
+            self._assert_initialized()
+            res = self._reservations.get(reservation_id)
+            if res is None:
+                self._log.debug(
+                    "fund_manager.release_slm_buffer_unknown",
+                    extra={"reservation_id": reservation_id},
+                )
+                return False
+
+            if res.slm_buffer <= 0.0:
+                self._log.debug(
+                    "fund_manager.release_slm_buffer_already_released",
+                    extra={"reservation_id": reservation_id},
+                )
+                return False
+
+            # Release buffer: deduct from reserved, add to available
+            buffer_amount = res.slm_buffer
+            bucket = res.bucket
+            avail_before = self._bucket_avail(bucket)
+            ts = now_ist().isoformat()
+
+            # Write ledger (FIX-090: use RELEASE entry_type, reason distinguishes buffer release)
+            self._write_ledger(
+                ts=ts,
+                entry_type="RELEASE",
+                amount=buffer_amount,
+                bucket=bucket,
+                balance_before=avail_before,
+                balance_after=avail_before + buffer_amount,
+                reservation_id=reservation_id,
+                reason=reason or "SL-M buffer released",
+                margin_delta=-buffer_amount,
+            )
+
+            # Update reservation: reduce margin and clear buffer
+            self._bucket_add_avail(bucket, buffer_amount)
+            self._bucket_deduct_reserved(bucket, buffer_amount)
+
+            # Update the reservation in-place
+            updated_res = _Reservation(
+                reservation_id=res.reservation_id,
+                symbol=res.symbol,
+                qty=res.qty,
+                price=res.price,
+                intent=res.intent,
+                margin=res.margin - buffer_amount,
+                bucket=res.bucket,
+                signal_id=res.signal_id,
+                ts=res.ts,
+                slm_buffer=0.0,  # Buffer now released
+            )
+            self._reservations[reservation_id] = updated_res
+
+            # Invariant check
+            try:
+                self._check_invariant("release_slm_buffer", reservation_id)
+            except CapitalInvariantViolation as exc:
+                _violation = exc
+            else:
+                _violation = None
+
+        # Outside lock
+        if _violation is not None:
+            self._handle_invariant_violation(_violation)
+            raise _violation
+
+        self._log.info(
+            "fund_manager.slm_buffer_released",
+            extra={
+                "reservation_id": reservation_id,
+                "buffer_amount": buffer_amount,
+                "bucket": bucket,
+            },
+        )
+        return True
+
+    def top_up_reservation(
+        self,
+        reservation_id: str,
+        additional_margin: float,
+        reason: str = "",
+    ) -> ReservationResult:
+        """
+        FIX-075: Increase an existing reservation's margin.
+
+        Used when price drift detection requires more margin than originally
+        reserved. Atomically checks available capital and increases the
+        reservation if sufficient funds exist.
+
+        Args:
+            reservation_id: existing reservation to top up
+            additional_margin: additional margin to add (must be > 0)
+            reason: audit trail note (e.g., "price drift 2% → 102")
+
+        Returns:
+            ReservationResult(success=True, ...) if top-up succeeded
+            ReservationResult(success=False, ...) if insufficient capital
+
+        Raises:
+            ValueError: if reservation_id not found or additional_margin <= 0
+            CapitalInvariantViolation: invariant check fails post-mutation
+        """
+        if additional_margin <= 0:
+            raise ValueError(f"additional_margin must be > 0, got {additional_margin}")
+
+        with self._lock:
+            self._assert_initialized()
+            res = self._reservations.get(reservation_id)
+            if res is None:
+                raise ValueError(
+                    f"reservation_id {reservation_id!r} not found; "
+                    f"cannot top up unknown reservation"
+                )
+
+            bucket = res.bucket
+            avail_before = self._bucket_avail(bucket)
+
+            if additional_margin > avail_before:
+                # Insufficient capital for top-up
+                return ReservationResult(
+                    success=False,
+                    reservation_id=reservation_id,
+                    margin=additional_margin,
+                    bucket=bucket,
+                    reason_if_failed=(
+                        f"insufficient {bucket} capital for top-up: "
+                        f"need ₹{additional_margin:.2f}, avail ₹{avail_before:.2f}"
+                    ),
+                )
+
+            # Top-up succeeds: deduct from available, add to reserved
+            projected_after = avail_before - additional_margin
+            ts = now_ist().isoformat()
+            self._write_ledger(
+                ts=ts,
+                entry_type="TOP_UP",
+                amount=additional_margin,
+                bucket=bucket,
+                balance_before=avail_before,
+                balance_after=projected_after,
+                signal_id=res.signal_id,
+                reservation_id=reservation_id,
+                reason=reason or "price drift top-up",
+                margin_delta=additional_margin,
+            )
+
+            # Update in-memory state
+            self._bucket_deduct_avail(bucket, additional_margin)
+            self._bucket_add_reserved(bucket, additional_margin)
+
+            # Update reservation record with new margin
+            # dataclass is frozen, so create a new instance
+            new_margin = res.margin + additional_margin
+            self._reservations[reservation_id] = _Reservation(
+                reservation_id=res.reservation_id,
+                symbol=res.symbol,
+                qty=res.qty,
+                price=res.price,
+                intent=res.intent,
+                bucket=res.bucket,
+                margin=new_margin,
+                signal_id=res.signal_id,
+                ts=res.ts,
+                slm_buffer=res.slm_buffer,
+            )
+
+            # FIX-165a: invariant check inside lock (was outside — race condition)
+            try:
+                self._check_invariant("TOP_UP", reservation_id)
+            except CapitalInvariantViolation as exc:
+                _violation = exc
+            else:
+                _violation = None
+
+            if _violation is None:
+                _result = ReservationResult(
+                    success=True,
+                    reservation_id=reservation_id,
+                    margin=new_margin,
+                    bucket=bucket,
+                    reason_if_failed="",
+                )
+
+        # Outside lock: handle violation (FIX-165a)
+        if _violation is not None:
+            self._handle_invariant_violation(_violation)
+            raise _violation
+        return _result
+
+    def commit_to_used(
+        self,
+        reservation_id: str,
+        actual_fill_price: float,
+        actual_qty: int,
+    ) -> CommitResult:
+        """
+        Move margin from reserved to used on order fill (FM5).
+        Handles partial fills: excess margin returns to available.
+
+        BL-4 (Phase C.1): ANY exception raised inside this method (unknown
+        reservation, ledger-write failure, apply-mutation failure, invariant
+        violation) implies the broker has confirmed the fill but capital
+        accounting is inconsistent -- an unrecoverable state. Before re-
+        raising, the method fires kill_switch.hard_kill() so callers cannot
+        accidentally swallow the corruption by catching Exception broadly
+        (OrderPlacer._handle_entry_fill does exactly that today).
+
+        Scoping note: this hard-kill policy is SPECIFIC to commit_to_used.
+        reserve() failures are recoverable via signal rejection.
+        release_used() failures keep the existing swallow+reconciler backstop
+        (the position has already been realized at broker; capital cleanup
+        proceeds out-of-band). Widening this pattern to other mutators
+        requires its own test matrix per-method.
+
+        Args:
+            reservation_id:   from reserve().
+            actual_fill_price: the actual fill price (may differ from reserved).
+            actual_qty:        filled quantity (may be < reserved qty).
+
+        Raises:
+            ValueError: reservation_id unknown (then also fires hard_kill).
+            CapitalInvariantViolation: invariant fails post-mutation (BL-9
+                fires hard_kill inside _check_invariant; BL-4's outer handler
+                may fire it again -- hard_kill is idempotent).
+            Any other exception from ledger/apply is re-raised (also after
+                hard_kill has fired).
+        """
+        try:
+            with self._lock:
+                self._assert_initialized()
+                res = self._reservations.get(reservation_id)
+                if res is None:
+                    raise ValueError(
+                        f"reservation_id {reservation_id!r} not found in active reservations"
+                    )
+
+                actual_margin = required_margin(
+                    actual_qty, actual_fill_price, res.intent, self._leverage_map
+                )
+                # Allow negative excess: when fill price > reserved price,
+                # the deficit must be deducted from available to keep the
+                # invariant balanced.
+                excess = res.margin - actual_margin
+
+                # BL-5: ledger row first. COMMIT is a bucket-internal reshape
+                # (reserved -> used, excess -> avail), so margin_delta=0.
+                avail_before = self._bucket_avail(res.bucket)
+                projected_after = avail_before + excess
+                ts = now_ist().isoformat()
+                self._write_ledger(
+                    ts=ts,
+                    entry_type="COMMIT",
+                    amount=actual_margin,
+                    bucket=res.bucket,
+                    balance_before=avail_before,
+                    balance_after=projected_after,
+                    signal_id=res.signal_id,
+                    reservation_id=reservation_id,
+                    reason=(
+                        f"fill: qty={actual_qty} price={actual_fill_price} "
+                        f"excess_returned={excess:.2f}"
+                    ),
+                    margin_delta=0.0,
+                )
+
+                # FM18: pure mutation via shared helper (used by both this public
+                # path and rehydrate replay).
+                self._apply_commit(
+                    reservation_id=reservation_id,
+                    actual_margin=actual_margin,
+                    excess=excess,
+                )
+
+                self._check_invariant("commit_to_used", reservation_id)
+
+                return CommitResult(
+                    reservation_id=reservation_id,
+                    actual_margin=actual_margin,
+                    excess_returned=excess,
+                    bucket=res.bucket,
+                )
+        except Exception as exc:
+            # C.1: lock is released by `with` __exit__ before this handler
+            # runs, so kill_switch.hard_kill below is safe (no deadlock).
+            # Invariant violations also flow through _handle_invariant_violation
+            # to preserve on_critical_failure dispatch (previously done from
+            # inside _check_invariant). hard_kill is idempotent at the
+            # kill_switch state machine so the BL-4 commit-specific kill
+            # below remains safe to fire alongside.
+            if isinstance(exc, CapitalInvariantViolation):
+                self._handle_invariant_violation(exc)
+            # BL-4 (Phase C.1): commit_to_used failure implies broker-
+            # confirmed fill but capital state inconsistent. Trip hard_kill
+            # before re-raising so callers that catch Exception broadly
+            # (e.g. OrderPlacer._handle_entry_fill) cannot swallow corruption.
+            # Pattern mirrors BL-9 (_check_invariant); hard_kill is
+            # idempotent per kill_switch state machine so double-fire from
+            # BL-9 + BL-4 on an invariant violation is safe.
+            # BL-4 does NOT invoke on_critical_failure (stays narrow to
+            # BL-9 semantic; a ledger/apply failure is not necessarily an
+            # invariant breach).
+            reason = (
+                f"commit_to_used failed for reservation_id="
+                f"{reservation_id}: {exc}"
+            )
+            self._log.critical(
+                "commit_to_used_failed_hard_kill",
+                extra={
+                    "reservation_id": reservation_id,
+                    "error": str(exc),
+                    "error_type": type(exc).__name__,
+                    "actual_fill_price": actual_fill_price,
+                    "actual_qty": actual_qty,
+                },
+            )
+            if self._kill_switch is not None:
+                # effect-telemetry (frozen A2.3): a commit failure escalated
+                # to HARD_KILL (BL-4).
+                self._fx_commit_kill.inc()
+                try:
+                    self._kill_switch.hard_kill(
+                        reason=reason,
+                        triggered_by="fund_manager.commit_to_used",
+                    )
+                except Exception as kse:
+                    log_exception(self._log, kse)
+                    self._log.critical(
+                        "commit_to_used: kill_switch.hard_kill ALSO failed",
+                        extra={"kill_error": str(kse)},
+                    )
+            else:
+                self._log.critical(
+                    "commit_to_used failed with kill_switch=None; "
+                    "escalation not possible"
+                )
+            raise
+
+    # ── A-1/E-1: capital for ADOPTED recovery entries ─────────────────────────
+    # An ENTRY that reached the broker but whose local orders row never persisted
+    # (timeout / crash) is recovered by the reconciler's tag-correlation pass.
+    # These three methods are the ONLY capital touch-points for that recovery, so
+    # release/commit stays in exactly one place (the caller never mutates buckets
+    # directly). All three are crash-aware: rehydrate_from_open_trades replays
+    # only OPEN/PARTIAL trades, so a crashed PENDING/UNKNOWN_IN_FLIGHT entry's
+    # reservation is NOT in memory at startup — it must be reconstructed from the
+    # durable fm_ledger RESERVE row before it can be committed or released.
+
+    def commit_adopted_entry(
+        self,
+        trade_row: Any,
+        actual_fill_price: float,
+        actual_qty: int,
+    ) -> Optional[CommitResult]:
+        """Commit capital for an ADOPTED, broker-confirmed FILLED entry whose
+        normal fill path (OrderPlacer._handle_entry_fill -> commit_to_used) never
+        ran (A-1 timeout / E-1 crash).
+
+        Crash-aware:
+          * reservation PRESENT in memory (timeout — same process still holds it)
+              -> commit_to_used (existing accounting; excess/SL-M buffer handled
+                 exactly as a normal fill).
+          * reservation ABSENT (crash — rehydrate skipped the PENDING trade)
+              -> restore the RESERVE in-memory from the durable fm_ledger RESERVE
+                 row, THEN commit_to_used -> reserved becomes used.
+
+        Exactly ONE COMMIT per trade, on THREE independent gates:
+          1. The caller's atomic trade-state transition
+             (state_store.adopt_recovery_trade_to_open / mark_recovery_trade_exiting)
+             — the primary exactly-once gate, and the only reason M-C5 was never
+             reachable in production.
+          2. The fm_ledger COMMIT-row check below — DURABLE, and the one that
+             survives a restart: it stops a LATER cycle re-committing a trade
+             committed in an earlier one.
+          3. M-C5: an in-memory CAS claim — CONCURRENT, and the one that makes this
+             method safe ON ITS OWN, without leaning on (1).
+
+        M-C5 (16-Jul-2026) — why (3) exists: gate (2) is evaluated INSIDE self._lock
+        while the commit itself runs OUTSIDE it (it must — see the lock-release note
+        below). Two callers that did NOT gate on (1) would therefore BOTH pass (2)
+        (no COMMIT row exists yet — neither has written one) and BOTH proceed to
+        commit_to_used. The loser does not corrupt capital: _apply_commit pops the
+        reservation, so the second commit_to_used finds no reservation, raises
+        ValueError, and BL-4 fires hard_kill — a SPURIOUS emergency halt caused by
+        nothing but a race. Claiming the reservation_id atomically under the lock we
+        already hold makes the loser a clean no-op instead. The claim is a
+        test-and-set on a set — it costs one dict lookup and is released in a
+        finally; NO lock is held across the commit I/O (that is the M-C4 anti-pattern
+        M-C8 exists to avoid).
+
+        Returns the CommitResult, or None if there is nothing to commit (no
+        reservation resolvable, already committed, or a concurrent commit for the
+        same reservation is already in flight). On a genuine commit failure,
+        commit_to_used's BL-4 handler fires hard_kill and re-raises.
+        """
+        with self._lock:
+            self._assert_initialized()
+            rid = self._resolve_reservation_id(trade_row)
+            # Exactly-one-commit guard BEFORE any in-memory restore, so an
+            # already-committed trade (whose reservation was popped by the first
+            # commit) is never re-reserved from the ledger.
+            if rid and self._commit_exists(rid):
+                self._log.info(
+                    "fund_manager.commit_adopted_entry_already_committed",
+                    extra={"reservation_id": rid},
+                )
+                return None
+            # Restore the reserve if a crash lost it (idempotent no-op if present).
+            rid = self._restore_reserve_from_ledger(trade_row)
+            if rid is None:
+                self._log.critical(
+                    "fund_manager.commit_adopted_entry_no_reservation",
+                    extra={"trade_id": _row_get(trade_row, "trade_id")},
+                )
+                return None
+            # M-C5 CAS: claim this reservation, or concede to whoever holds it.
+            # Same lock as the guard above, so guard-and-claim are one atomic step
+            # and the window that gate (2) cannot cover is closed.
+            if rid in self._commit_claims:
+                self._log.info(
+                    "fund_manager.commit_adopted_entry_commit_in_flight",
+                    extra={"reservation_id": rid},
+                )
+                return None
+            self._commit_claims.add(rid)
+        # Lock released: commit_to_used manages its own lock and defers its BL-4
+        # hard_kill to AFTER lock release (C.1), so we must NOT call it while
+        # holding self._lock. RLock reentrancy would keep the lock held across
+        # hard_kill's downstream (rate_limiter / broker cancel) and risk deadlock.
+        try:
+            return self.commit_to_used(rid, actual_fill_price, actual_qty)
+        finally:
+            # Always release the claim — including when commit_to_used raised.
+            # On success the durable ledger guard (2) takes over from here, so
+            # holding the claim would only leak memory. On failure, releasing is
+            # what lets a legitimate retry happen; if the ledger row was already
+            # written before the failure, guard (2) no-ops that retry anyway.
+            with self._lock:
+                self._commit_claims.discard(rid)
+
+    def restore_adopted_reservation(self, trade_row: Any) -> bool:
+        """For an ADOPTED entry still RESTING at the broker (OPEN / TRIGGER
+        PENDING — not yet filled), ensure its RESERVE is present in memory so
+        available capital is not over-counted while the order is live.
+
+        Timeout case: the reservation is already in memory (no-op). Crash case:
+        it is reconstructed from the durable fm_ledger RESERVE row. Idempotent —
+        safe to call every recovery cycle until the entry fills (commit) or
+        terminalises (release). Returns True iff a reservation is present after.
+        """
+        with self._lock:
+            self._assert_initialized()
+            rid = self._restore_reserve_from_ledger(trade_row)
+            if rid is None:
+                return False
+            # Restoring moves avail -> reserved (total unchanged) -> invariant
+            # holds. C.1: capture, defer hard_kill to after lock release.
+            try:
+                self._check_invariant("restore_adopted_reservation", rid)
+            except CapitalInvariantViolation as exc:
+                _violation = exc
+            else:
+                _violation = None
+        if _violation is not None:
+            self._handle_invariant_violation(_violation)
+            raise _violation
+        return True
+
+    def release_adopted_reservation(
+        self, trade_row: Any, reason: str = ""
+    ) -> bool:
+        """Release the capital for a recovery trade being marked FAILED — the
+        entry was broker-confirmed ABSENT, or REJECTED/CANCELLED (it genuinely
+        did not fill). This is the ONLY evidence-based capital-release point for
+        the recovery path.
+
+        Crash-aware:
+          * reservation PRESENT (timeout) -> release() (existing path).
+          * reservation ABSENT (crash)    -> in-memory available already excludes
+            this margin (rehydrate skipped the PENDING trade), but the fm_ledger
+            still carries an orphaned RESERVE row. Restore the reserve, THEN
+            release() — net in-memory change is ZERO and a balancing RELEASE row
+            is written so the ledger chain (RESERVE -> RELEASE) is consistent.
+            No double-release (memory nets to zero; the ledger balances once).
+
+        Idempotent — returns False (no-op) if there is nothing to release.
+        """
+        with self._lock:
+            self._assert_initialized()
+            rid = self._resolve_reservation_id(trade_row)
+            if not rid:
+                return False
+            if rid not in self._reservations:
+                # crash-absent: reconstruct so release() has an in-memory
+                # reservation to pop AND writes the balancing RELEASE ledger row.
+                if self._restore_reserve_from_ledger(trade_row) is None:
+                    return False   # no reservation and no RESERVE row -> nothing to do
+        # Lock released before release() (same C.1 deadlock reasoning as commit).
+        return self.release(rid, reason=reason)
+
+    def release_used(
+        self,
+        symbol: str,
+        exit_price: float,
+        exit_qty: int,
+        intent: str,
+        entry_price: float,
+        direction: str,
+        costs: float = 0.0,
+        trade_id: Optional[str] = None,   # M-C7: reverse the persisted committed margin
+    ) -> ReleaseResult:
+        """
+        Release used margin on position close (FM5). Updates daily_realized_pnl (FM7).
+
+        Args:
+            symbol:      trading symbol (for ledger)
+            exit_price:  price at which position was closed
+            exit_qty:    number of shares closed
+            intent:      original intent (determines bucket and leverage)
+            entry_price: original entry price (for PnL calculation)
+            direction:   "LONG" | "SHORT" — required for direction-correct PnL.
+            costs:       total round-trip transaction costs (passed by caller).
+                         E4 (2026-07-17): EVERY production caller must pass the
+                         REAL costs from the shared CostCalculator. Passing 0.0
+                         writes a GROSS pnl_delta, which silently breaks the
+                         "pnl_delta is NET" contract that the daily-loss limit,
+                         available capital, rehydrate and the reports all rely
+                         on. The 0.0 default is retained only for tests that
+                         model a zero-cost close.
+
+        CONTRACT — pnl_delta is NET (E4/W10, 2026-07-17):
+            pnl_delta := gross_pnl - costs, and that same NET number is what is
+            credited to bucket avail and to _total. `costs` is written to the
+            ledger ALONGSIDE, for observability only; readers must NEVER
+            subtract it again. get_daily_realized_net_pnl therefore sums
+            pnl_delta alone. See docs/audit/e4_investigation_17jul2026.md.
+
+        PnL sign convention (EF-3):
+            LONG  profit = exit > entry  (close above cost)
+            SHORT profit = exit < entry  (cover below sell price)
+
+        Both produce positive pnl_delta when profitable and negative when
+        losing. The daily_realized_pnl aggregate is therefore direction-
+        agnostic by construction. Prior to EF-3 this method was LONG-only,
+        which silently inverted SHORT PnL; caught during A.3.d pre-work
+        because BL-7 had kept _on_order_filled from ever firing on exits,
+        so no caller had exercised non-breakeven SHORT prices before.
+
+        Raises:
+            ValueError: direction not in {LONG, SHORT}.
+            CapitalInvariantViolation: invariant fails post-mutation.
+        """
+        if direction not in _VALID_DIRECTIONS:
+            raise ValueError(
+                f"release_used: direction must be one of "
+                f"{sorted(_VALID_DIRECTIONS)}, got {direction!r}"
+            )
+        with self._lock:
+            self._assert_initialized()
+            bucket = self._bucket_for_intent(intent)
+            # M-C7: reverse the PERSISTED committed margin (proportional to
+            # exit_qty), NOT a recompute from the CURRENT leverage_map.
+            # commit_to_used persisted the commit-time margin (M1) in the COMMIT
+            # fm_ledger row and rehydrate replays that same M1; recomputing here
+            # with required_margin(...current leverage...) drifted `used`
+            # permanently whenever the leverage_map changed across a restart
+            # (M1 seeded, M2 released -> M1-M2 residual, silent because the
+            # mis-released amount lands in avail and the global invariant still
+            # balances). committed_M1 * exit_qty/committed_qty is
+            # leverage-change-invariant: a full close (sum of exit_qty ==
+            # committed_qty) frees exactly M1; partials (M-O2) free their slice.
+            margin = self._committed_release_margin(
+                trade_id, exit_qty, entry_price, intent
+            )
+
+            # EF-3: direction-aware gross PnL. LONG: (exit-entry)*qty.
+            # SHORT: (entry-exit)*qty. Subtract costs for net PnL.
+            if direction == "LONG":
+                gross_pnl = (exit_price - entry_price) * exit_qty
+            else:  # SHORT
+                gross_pnl = (entry_price - exit_price) * exit_qty
+            pnl = gross_pnl - costs
+
+            avail_before = self._bucket_avail(bucket)
+            projected_after = avail_before + margin + pnl
+
+            # BL-5: write-ahead. Record the intended mutation first; replay
+            # via rehydrate uses direction + pnl_delta to rebuild the same end
+            # state (EF-3 direction correctness carries into the ledger).
+            #
+            # E4/W10 CONTRACT (2026-07-17): pnl_delta is NET (gross - costs) —
+            # exactly the number credited to avail/_total below, which is what
+            # makes rehydrate's replay of pnl_delta reproduce a continuous run.
+            # `costs` is persisted for OBSERVABILITY ONLY and must never be
+            # subtracted from pnl_delta by any reader.
+            ts = now_ist().isoformat()
+            self._write_ledger(
+                ts=ts,
+                entry_type="RELEASE_USED",
+                amount=-margin,
+                bucket=bucket,
+                balance_before=avail_before,
+                balance_after=projected_after,
+                reason=(
+                    f"{symbol} exit: qty={exit_qty} price={exit_price} "
+                    f"pnl={pnl:.2f} costs={costs:.2f}"
+                ),
+                direction=direction,
+                # E4 side finding: trade_id was accepted but never persisted, so
+                # every RELEASE_USED row had trade_id NULL and the ledger could
+                # not be joined to `trades` — which is what blocked per-trade
+                # reconciliation of this very bug. Column already exists (no DDL).
+                trade_id=trade_id,
+                margin_delta=-margin,
+                pnl_delta=pnl,
+                costs=costs,
+            )
+
+            # In-memory mutation (caught up to the ledger)
+            self._bucket_deduct_used(bucket, margin)
+            self._bucket_add_avail(bucket, margin + pnl)
+            # PnL changes total capital (FM2 invariant: avail+res+used==total)
+            self._total += pnl
+            # FIX-051: _daily_pnl removed; will read from SQL for loss check
+
+            # C.1: capture violation, defer hard_kill to after lock release.
+            try:
+                self._check_invariant("release_used", symbol)
+            except CapitalInvariantViolation as exc:
+                _violation = exc
+                _result = None
+            else:
+                _violation = None
+                # FM7: check daily loss limit after updating PnL (existing
+                # behavior: only runs when invariant was OK; on violation
+                # the state is corrupt and the loss check is moot).
+                # FIX-051: Read daily PnL from SQL instead of in-memory accumulator
+                # BUILD 1 (#1, 24-Jun): the ₹ limit is derived from
+                # daily_loss_limit_pct × current capital (self._total) — the SAME
+                # pct the pre-trade gate uses, just on a realized (post-close)
+                # basis. Replaces the deleted absolute capital.daily_loss_limit.
+                today = now_ist().date().isoformat()
+                daily_pnl = self._store.get_daily_realized_net_pnl(today)
+                loss_limit = self._daily_loss_limit_pct * self._total
+                if self._total > 0 and daily_pnl <= -loss_limit:
+                    self._log.critical(
+                        "fund_manager.daily_loss_breach",
+                        extra={"daily_pnl": daily_pnl,
+                               "limit": loss_limit,
+                               "daily_loss_limit_pct": self._daily_loss_limit_pct,
+                               "capital": self._total},
+                    )
+                    if self._on_loss_breach is not None:
+                        # effect-telemetry (frozen A2.3): the post-trade
+                        # daily-loss breach callback fired (FM7 half of the
+                        # dual mechanism).
+                        self._fx_loss_breach.inc()
+                        self._on_loss_breach()
+
+                _result = ReleaseResult(
+                    reservation_id="",
+                    margin_released=margin,
+                    bucket=bucket,
+                    pnl_delta=pnl,
+                )
+
+        # Outside lock
+        if _violation is not None:
+            self._handle_invariant_violation(_violation)
+            raise _violation
+        return _result
+
+    def _committed_release_margin(
+        self,
+        trade_id: Optional[str],
+        exit_qty: int,
+        entry_price: float,
+        intent: str,
+    ) -> float:
+        """M-C7: the margin to free on release = the PERSISTED committed margin,
+        proportional to exit_qty (committed_M1 * exit_qty / committed_qty). This
+        is leverage-change-invariant — a full close frees exactly the committed
+        M1 regardless of any leverage_map edit since commit; sequential partials
+        each free their slice and sum to M1 (denominator is always the ORIGINAL
+        committed_qty).
+
+        Falls back to the legacy leverage recompute ONLY when the committed row
+        is unresolvable (no trade_id / missing COMMIT row / unparseable qty) — no
+        worse than the pre-M-C7 behaviour, and LOGGED so it is never silent. A
+        release must never raise here (the position is already realised at the
+        broker; capital cleanup proceeds).
+        """
+        if trade_id is not None:
+            committed = self._store.get_entry_commit_margin(trade_id)
+            if committed is not None:
+                committed_margin, committed_qty = committed
+                if committed_qty > 0:
+                    return committed_margin * exit_qty / committed_qty
+            self._log.warning(
+                "fund_manager.release_used_commit_unresolved",
+                extra={
+                    "trade_id": trade_id,
+                    "reason": "no COMMIT row / unparseable qty; M-C7 recompute fallback",
+                },
+            )
+        return required_margin(exit_qty, entry_price, intent, self._leverage_map)
+
+    def sync_from_broker(self, broker_balance: float) -> None:
+        """
+        Update total capital from broker truth (FM9).
+        Available = total - reserved - used (per bucket).
+        NEVER subtracts used from broker_balance (audit double-deduction fix).
+
+        Args:
+            broker_balance: net equity from broker (already the total; NOT net of positions).
+        """
+        with self._lock:
+            self._assert_initialized()
+            old_total = self._total
+
+            # FIX 1: `broker_balance` is CASH. Any position carried into this
+            # session had its margin taken out of that cash by the broker
+            # already, so the account is cash + carry -- and re-basing on cash
+            # alone would deduct the carry a SECOND time, exactly as the
+            # 08:15 boot did on 10-Aug. Identical rule, identical fields as
+            # rehydrate_from_open_trades: ONE semantic, two call sites.
+            carry_total = self._intraday_carry + self._positional_carry
+            new_total = broker_balance + carry_total
+
+            # BL-5: write-ahead. SYNC recomputes bucket availables from the
+            # authoritative broker balance; the ledger row records the
+            # total-level delta so rehydrate can distinguish a sync event
+            # from a reservation / release.
+            ts = now_ist().isoformat()
+            self._write_ledger(
+                ts=ts,
+                entry_type="SYNC",
+                amount=new_total - old_total,
+                bucket="both",
+                balance_before=old_total,
+                balance_after=new_total,
+                reason=f"broker sync: {old_total:.2f} -> {new_total:.2f}",
+            )
+
+            # In-memory mutation
+            self._total = new_total
+            # Recompute available = base - reserved - used, per bucket. The
+            # base is the bucket's share of CASH plus its OWN carry (see
+            # _bucket_base); with no carry this is the previous
+            # `broker_balance * pct` unchanged.
+            intraday_total = self._bucket_base(_INTRADAY_BUCKET)
+            positional_total = self._bucket_base(_POSITIONAL_BUCKET)
+
+            # H-1: silent max(0.0, ...) clamps removed. sync_from_broker was the
+            # only mutator skipping _check_invariant; bucket overflow (broker
+            # total shrinks below reserved+used on a bucket) was silently
+            # masked. Now surfaces as CapitalInvariantViolation via the
+            # per-bucket INV6 guard added to _check_invariant.
+            self._intraday_avail = (
+                intraday_total - self._intraday_reserved - self._intraday_used
+            )
+            self._positional_avail = (
+                positional_total - self._positional_reserved - self._positional_used
+            )
+            self._log.info(
+                "fund_manager.sync_from_broker",
+                extra={"old_total": old_total, "new_total": new_total,
+                       "broker_cash": broker_balance, "carry": carry_total},
+            )
+
+            # C.1 (2026-04-25): collect drift events to publish AFTER lock
+            # release. Publishing inside the capital lock can deadlock if a
+            # subscriber blocks on a downstream resource (kill_switch,
+            # rate_limiter, broker call) while another thread holds that
+            # resource and waits on the capital lock.
+            _pending_publishes: list[CapitalDriftDetected] = []
+
+            # CapitalDriftDetected if significant TOTAL change (FM9)
+            # FIX 1: compare like with like. `old_total` already includes the
+            # carry, so differencing it against raw broker CASH would report a
+            # phantom drift of exactly the carry on the first sync after a
+            # rehydrate -- a guaranteed false CAPITAL_DRIFT every morning a
+            # position is held.
+            delta = new_total - old_total
+            if abs(delta) > 1.0:
+                _pending_publishes.append(CapitalDriftDetected(
+                    source_module="fund_manager",
+                    expected=old_total,
+                    actual=new_total,
+                    delta=delta,
+                ))
+
+            # H-1: detect bucket overflow (either bucket went negative after
+            # sync). Capture BEFORE _check_invariant fires -- the invariant
+            # path raises and would short-circuit the append if ordered after.
+            bucket_overflow = (
+                self._intraday_avail < -_INVARIANT_TOLERANCE
+                or self._positional_avail < -_INVARIANT_TOLERANCE
+            )
+            if bucket_overflow:
+                # effect-telemetry (frozen A2.3): a bucket overflow detected
+                # (H-1; IA-P6-06 — 0 ever, by design).
+                self._fx_overflow.inc()
+                # Most-negative bucket gives the rupee magnitude for BL-2
+                # tiering; drift_handler routes escalating sources by
+                # source_module (fund_manager_bucket_overflow is a new
+                # escalating source, added to _ESCALATING_SOURCES).
+                gap = min(self._intraday_avail, self._positional_avail)
+                _pending_publishes.append(CapitalDriftDetected(
+                    source_module="fund_manager_bucket_overflow",
+                    expected=0.0,   # buckets should never go negative
+                    actual=gap,     # most-negative bucket available
+                    delta=abs(gap), # rupee magnitude for BL-2 tiering
+                ))
+
+            # H-1: invariant check now runs on every sync. Per-bucket INV6
+            # guard fires CapitalInvariantViolation on bucket overflow.
+            # C.1: capture violation, defer hard_kill to after lock release.
+            try:
+                self._check_invariant("sync_from_broker", self._session_id)
+            except CapitalInvariantViolation as exc:
+                _violation = exc
+            else:
+                _violation = None
+
+        # Outside lock: publish events first, then dispatch violation.
+        for evt in _pending_publishes:
+            try:
+                self._bus.publish(evt)
+            except Exception as pub_exc:
+                self._log.error(
+                    "fund_manager.publish_drift_failed: %s",
+                    pub_exc,
+                )
+
+        if _violation is not None:
+            self._handle_invariant_violation(_violation)
+            raise _violation
+
+    def get_live_reservations(self) -> dict[str, "_Reservation"]:
+        """
+        Return a locked snapshot copy of live reservations (BL-3).
+
+        Used by OrderReconciler._check7_capital_accounting_drift to verify
+        that fund_manager's in-memory _reservations dict still matches the
+        signed sum of fm_ledger margin_delta rows for each rid.
+
+        Returns a SHALLOW copy of self._reservations under the lock; the
+        _Reservation dataclasses themselves are not deep-copied because they
+        are treated as immutable in this codebase. Mutating the returned
+        dict has no effect on FundManager state.
+
+        Full _Reservation objects (not just margins) are returned so future
+        checks can verify symbol/qty/intent without a signature change.
+        """
+        with self._lock:
+            return dict(self._reservations)
+
+    def count_live_reservations(self) -> int:
+        """Return the number of live (uncommitted) entry reservations (FIX-185).
+
+        Every accepted entry holds exactly one reservation from reserve() until
+        the entry FILLS (commit pops it as the trade flips to OPEN) or fails
+        (release pops it). So this count is the authoritative number of in-flight
+        positions that have reserved capital but are NOT yet OPEN/PARTIAL — i.e.
+        reserved-but-not-placed plus PENDING_FILL. The risk_engine OPEN_POSITIONS
+        check uses it as a TOCTOU-proof hard-cap input that does not depend on the
+        signal_processor's in-memory in-flight snapshot (which can under-count in
+        a restart burst). Read under self._lock; callers already holding
+        portfolio_lock (an RLock) re-acquire it safely.
+        """
+        with self._lock:
+            return len(self._reservations)
+
+    def count_live_reservations_for_strategy(self, strategy: str) -> int:
+        """H-7 (Wave-5): live (uncommitted) entry reservations for ONE strategy — the
+        per-strategy analog of count_live_reservations (FIX-185). Every accepted entry
+        holds one reservation from reserve() until it FILLS (commit pops it as the trade
+        flips to OPEN) or fails (release pops it), so OPEN/PARTIAL trades and live
+        reservations partition the strategy's positions with no overlap and no gap. This
+        is the authoritative count of the strategy's reserved-but-not-yet-OPEN positions.
+        Read under self._lock; a caller already holding portfolio_lock (an RLock)
+        re-acquires safely, so the signal_processor per-strategy cap check + reserve() is
+        ONE atomic critical section (the H-7 TOCTOU fix)."""
+        with self._lock:
+            return sum(1 for r in self._reservations.values() if r.strategy == strategy)
+
+    def get_snapshot(self) -> CapitalSnapshot:
+        """Return a frozen, consistent point-in-time view of capital state (FM8).
+
+        FIX-051: daily_realized_pnl is read from SQL (fm_ledger) instead of in-memory float.
+        """
+        with self._lock:
+            # FIX-051: Read daily PnL from SQL to avoid float drift
+            today = now_ist().date().isoformat()
+            daily_pnl = self._store.get_daily_realized_net_pnl(today)
+
+            return CapitalSnapshot(
+                total=self._total,
+                intraday_avail=self._intraday_avail,
+                intraday_reserved=self._intraday_reserved,
+                intraday_used=self._intraday_used,
+                positional_avail=self._positional_avail,
+                positional_reserved=self._positional_reserved,
+                positional_used=self._positional_used,
+                daily_realized_pnl=daily_pnl,
+                ts=now_ist().isoformat(),
+                intraday_carry=self._intraday_carry,
+                positional_carry=self._positional_carry,
+            )
+
+    def update_unrealized_mtm(self, trade_id: str, unrealized_pnl: float) -> None:
+        """
+        FIX-035: Update unrealized MTM for a trade (thread-safe).
+
+        Args:
+            trade_id:       Trade identifier.
+            unrealized_pnl: Current unrealized P&L for this trade.
+                           Positive = profit, negative = loss.
+        """
+        with self._lock:
+            self._unrealized_mtm[trade_id] = unrealized_pnl
+
+    def remove_unrealized_mtm(self, trade_id: str) -> None:
+        """
+        FIX-035: Remove unrealized MTM entry for a closed trade (thread-safe).
+
+        Args:
+            trade_id: Trade identifier to remove.
+        """
+        with self._lock:
+            self._unrealized_mtm.pop(trade_id, None)
+
+    def get_total_unrealized_mtm(self) -> float:
+        """
+        FIX-035: Return sum of all unrealized MTM (thread-safe).
+
+        Returns the aggregate unrealized P&L across all tracked trades.
+        Positive = net unrealized profit, negative = net unrealized loss.
+        Returns 0.0 if no trades are tracked.
+        """
+        with self._lock:
+            return sum(self._unrealized_mtm.values())
+
+    # ── B-1: MTM freshness + set-based prune (populated by order_reconciler) ──────
+    _MTM_STALE_AFTER_SEC: float = 45.0   # 3× the 15s reconciler cadence: tolerate one
+    #                                      missed refresh, STALE after ~2 missed cycles.
+
+    def mark_unrealized_mtm_refreshed(self, available: bool) -> None:
+        """B-1: stamp the last MTM refresh. `available=True` after a successful
+        get_quote refresh; `False` on a quote outage (so the gate degrades to
+        realized-only immediately, not only once the age threshold trips)."""
+        with self._lock:
+            self._mtm_refreshed_at = time.monotonic()
+            self._mtm_available = bool(available)
+
+    def get_unrealized_mtm_status(self) -> tuple[float, bool]:
+        """B-1: return (total_unrealized, is_fresh). is_fresh is True only when the
+        last refresh succeeded AND is within _MTM_STALE_AFTER_SEC. The daily-loss gate
+        uses the unrealized term ONLY when fresh; otherwise it runs realized-only+WARN
+        (never fabricates, never silently drops it)."""
+        with self._lock:
+            total = sum(self._unrealized_mtm.values())
+            fresh = (
+                self._mtm_available
+                and self._mtm_refreshed_at is not None
+                and (time.monotonic() - self._mtm_refreshed_at) <= self._MTM_STALE_AFTER_SEC
+            )
+            return total, fresh
+
+    def prune_unrealized_mtm(self, keep_trade_ids) -> int:
+        """B-1: SET-BASED removal — drop any MTM entry whose trade_id is NOT in
+        `keep_trade_ids` (the current OPEN/PARTIAL set). This makes removal correct
+        for a trade closed by ANY path (SL/TGT/manual/EOD) without hooking each close
+        path, and prevents a stale entry from wrongly inflating the daily loss.
+        Returns the number pruned."""
+        keep = set(keep_trade_ids or ())
+        with self._lock:
+            stale = [tid for tid in self._unrealized_mtm if tid not in keep]
+            for tid in stale:
+                self._unrealized_mtm.pop(tid, None)
+            return len(stale)
+
+    def reset_daily_pnl(self) -> None:
+        """Reset daily realized PnL to 0 at EOD. reserved/used NOT reset (FM14).
+
+        FIX-051: Reads old_pnl from SQL (fm_ledger) instead of in-memory accumulator.
+        The RESET_PNL ledger entry with negative pnl_delta brings the SQL sum back to 0.
+        """
+        with self._lock:
+            # FIX-051: Read current PnL from SQL instead of in-memory float
+            ts_now = now_ist()
+            today = ts_now.date().isoformat()
+            old_pnl = self._store.get_daily_realized_net_pnl(today)
+
+            ts = ts_now.isoformat()
+            # BL-5: ledger first, then zero-out
+            # The pnl_delta=-old_pnl entry ensures SUM(pnl_delta) = 0 for the day
+            self._write_ledger(
+                ts=ts,
+                entry_type="RESET_PNL",
+                amount=0.0,
+                bucket="both",
+                balance_before=old_pnl,
+                balance_after=0.0,
+                reason=f"EOD reset: previous pnl={old_pnl:.2f}",
+                pnl_delta=-old_pnl,
+            )
+            # FIX-051: No in-memory _daily_pnl to zero out; SQL is the source of truth
+            self._log.info(
+                "fund_manager.reset_daily_pnl",
+                extra={"previous_pnl": old_pnl},
+            )
+
+    # ── BL-1 / FM18: rehydrate (startup replay) ──────────────────────────────
+
+    def rehydrate_from_open_trades(
+        self,
+        start_of_today_iso: Optional[str] = None,
+    ) -> dict[str, Any]:
+        """
+        Reconstruct in-memory capital state from the persistence triangle:
+        fm_ledger (capital transitions) + trades (position identity) +
+        orders (entry product). Called once at startup, AFTER initialize().
+
+        Walks every OPEN/PARTIAL trade, looks up its reservation_id via
+        signal_id -> first RESERVE row in fm_ledger, then replays the
+        ordered RESERVE/COMMIT chain for that reservation through
+        _apply_reserve / _apply_commit -- the same mutation helpers the
+        public reserve()/commit_to_used() use, but WITHOUT writing the
+        ledger back (that's where the data came from).
+
+        Symbol/qty/price/intent are sourced from trades + orders, not the
+        ledger -- see EF-5 for why the ledger lacks those columns by design
+        (each table owns what it owns).
+
+        After per-trade replay, today's RELEASE_USED rows are walked to
+        rebuild daily_realized_pnl + total. That step ONLY adjusts PnL/total;
+        it does NOT touch buckets (the closed trades whose RELEASE_USED rows
+        these are weren't replayed in Phase 1, so their bucket movements
+        already cancel out).
+
+        The bin-card invariant is checked ONCE at the end. Per-step
+        invariants would false-positive on legitimately-mid-flight states.
+        On failure, raises CapitalStateInconsistent (NOT
+        CapitalInvariantViolation -- callers can distinguish startup-replay
+        corruption from a live mutation invariant break).
+
+        Args:
+            start_of_today_iso: ISO-8601 IST timestamp; floor of today used
+                for PnL carryover. Defaults to today 00:00:00 IST.
+
+        Returns:
+            dict with keys:
+                replayed_trades:   number of open trades replayed
+                replayed_pnl_rows: number of RELEASE_USED rows applied for daily_pnl
+                anomalies:         list of {trade_id, signal_id?, reason}
+                                   for trades skipped due to data gaps
+
+        Raises:
+            CapitalStateInconsistent: invariant fails after replay completes.
+            RuntimeError: if not initialized.
+        """
+        with self._lock:
+            self._assert_initialized()
+
+            if start_of_today_iso is None:
+                today = now_ist()
+                start_of_today_iso = today.replace(
+                    hour=0, minute=0, second=0, microsecond=0
+                ).isoformat()
+
+            anomalies: list[dict[str, Any]] = []
+            replayed_trades = 0
+
+            # Phase 1: per-open-trade replay
+            # FIX 1: measure what Phase 1 commits to the POSITIONAL bucket, by
+            # difference. Taken from the partition itself rather than by
+            # re-deriving margins from `trades`, so it cannot disagree with
+            # what the replay actually applied (anomaly skips, qty/price
+            # fallbacks and all).
+            _positional_committed_before = (
+                self._positional_reserved + self._positional_used
+            )
+            open_trades = self._store.get_all_open_trades()
+            for trade in open_trades:
+                if self._replay_open_trade(trade, anomalies):
+                    replayed_trades += 1
+
+            # FIX 1: un-double-count the carry.
+            #
+            # `initialize()` split BROKER CASH into the buckets, and Phase 1
+            # has just deducted these positions' margin from those buckets --
+            # but the broker had ALREADY removed that margin from the cash we
+            # split (the shares are bought; the money is gone from `net`).
+            # Deducting it again is what drove positional_avail to -844.08 on
+            # 10-Aug and hard-killed both books.
+            #
+            # Restore each bucket's available and lift `_total` from CASH to
+            # the true ACCOUNT value. The position is NOT forgotten: it stays
+            # in reserved/used at full value, and the carry is now named, so
+            # the exposure is more visible than before, not less. Net effect
+            # on free capital is ZERO -- the carry enters the base and is
+            # immediately consumed by reserved/used.
+            # SCOPED TO THE POSITIONAL BUCKET, DELIBERATELY -- and this is the
+            # conservative half of the fix, not an oversight.
+            #
+            # MEASURED (10-Aug, live): broker `net` was 209.80 while 907.02 of
+            # CNC stock was held -- an account of ~1,117. Delivery cash is GONE
+            # from `net`; the position is a HOLDING, not a claim on cash.
+            #
+            # NOT MEASURED: whether a blocked INTRADAY margin is likewise out
+            # of `net`. It almost certainly is, but the margins() capture that
+            # would prove it (MONDAY §3.6b) never ran -- no delivery entry
+            # occurred -- so it stays (I), not (P). Correcting intraday on an
+            # inference would change live sizing on a same-day crash restart
+            # using a broker property we have never observed.
+            #
+            # Leaving intraday alone is fail-safe in the only direction that
+            # matters: today it UNDER-states intraday availability, so the
+            # system trades smaller, never larger. Delivery is the reachable,
+            # measured, quarterly-recurring case (SEBI settlement sweep).
+            #
+            # To extend this to intraday: take the §3.6b margins() readings
+            # first, then populate _intraday_carry the same way. The field and
+            # _bucket_base already carry the semantics; only this assignment
+            # changes.
+            self._intraday_carry = 0.0
+            self._positional_carry = (
+                self._positional_reserved + self._positional_used
+                - _positional_committed_before
+            )
+            self._positional_avail += self._positional_carry
+            self._total += self._positional_carry
+            if self._positional_carry:
+                self._log.info(
+                    "fund_manager.rehydrate_carry",
+                    extra={
+                        "positional_carry": self._positional_carry,
+                        "total_after": self._total,
+                        "reason": (
+                            "margin already removed from broker net by the "
+                            "broker; re-added to the bucket base so it is not "
+                            "deducted twice"
+                        ),
+                    },
+                )
+
+            # Phase 2: today's realized-PnL carryover. For each CLOSED trade
+            # (whose RESERVE+COMMIT were NOT replayed in Phase 1 because the
+            # trade is not open), we apply only the *net* effect of the full
+            # lifecycle: bucket avail += pnl, _total += pnl.
+            # FIX-051: _daily_pnl removed; SQL (fm_ledger.pnl_delta) is the source of truth.
+            # The -margin/+margin legs of the CLOSED lifecycle cancel to zero,
+            # so we don't touch reserved/used here.
+            # M-C1: the SINGLE source of the today-RELEASE_USED row-selection,
+            # shared with today_realized_pnl_carryover() (the live-seed Σ). Sharing
+            # one query guarantees the live-seed subtraction and this re-addition
+            # operate on the EXACT same rows + pnl_delta sign → they cancel to
+            # broker.net by construction (no live warm-restart double-count).
+            pnl_rows = self._today_release_used_pnl_rows(start_of_today_iso)
+            replayed_pnl_rows = 0
+            for row in pnl_rows:
+                pnl = float(row["pnl_delta"])
+                bucket = row["bucket"]
+                self._bucket_add_avail(bucket, pnl)
+                # FIX-051: No in-memory _daily_pnl to update; SQL has pnl_delta rows
+                self._total += pnl
+                replayed_pnl_rows += 1
+
+            # Phase 3: invariant check ONCE (FM18). Wrap to distinguish
+            # startup-replay corruption from a live mid-mutation break.
+            # C.1 (2026-04-25): capture violation, defer hard_kill+on_critical
+            # to after lock release.
+            try:
+                self._check_invariant("rehydrate", "BL-1")
+            except CapitalInvariantViolation as exc:
+                _violation = exc
+            else:
+                _violation = None
+
+        # Outside lock
+        if _violation is not None:
+            self._handle_invariant_violation(_violation)
+            raise CapitalStateInconsistent(
+                f"Capital state invariant failed after rehydrate: {_violation}",
+                anomalies=anomalies,
+                replayed_trades=replayed_trades,
+                replayed_pnl_rows=replayed_pnl_rows,
+            ) from _violation
+
+        # FIX-051: Read daily_pnl from SQL for logging
+        today = now_ist().date().isoformat()
+        daily_pnl = self._store.get_daily_realized_net_pnl(today)
+
+        self._log.info(
+            "fund_manager.rehydrate_complete",
+            extra={
+                "replayed_trades": replayed_trades,
+                "replayed_pnl_rows": replayed_pnl_rows,
+                "anomaly_count": len(anomalies),
+                "daily_pnl": daily_pnl,
+                "total": self._total,
+            },
+        )
+        for a in anomalies:
+            self._log.warning("fund_manager.rehydrate_anomaly", extra=a)
+
+        return {
+            "replayed_trades": replayed_trades,
+            "replayed_pnl_rows": replayed_pnl_rows,
+            "anomalies": anomalies,
+        }
+
+    def _today_release_used_pnl_rows(self, start_of_today_iso: str) -> list:
+        """The fm_ledger RELEASE_USED rows for today (realized-PnL carryover).
+
+        The SINGLE source of this row-selection, shared by rehydrate Phase 2
+        (which re-applies the PnL per bucket) and today_realized_pnl_carryover()
+        (the live-seed subtraction, M-C1). Sharing one query guarantees the seed
+        subtraction and the Phase-2 re-addition operate on the EXACT same rows +
+        pnl_delta sign, so they cancel to broker.net by construction.
+        """
+        return self._store.fetch_all(
+            """
+            SELECT pnl_delta, bucket FROM fm_ledger
+            WHERE entry_type = 'RELEASE_USED'
+              AND ts >= ?
+              AND pnl_delta != 0
+            ORDER BY ledger_id ASC
+            """,
+            (start_of_today_iso,),
+        )
+
+    def today_realized_pnl_carryover(
+        self, start_of_today_iso: Optional[str] = None
+    ) -> float:
+        """Σ of today's RELEASE_USED pnl_delta — EXACTLY the rows rehydrate
+        Phase 2 re-applies (via the shared _today_release_used_pnl_rows helper).
+
+        M-C1 (2026-07-07): on a LIVE mid-day warm restart the broker's net margin
+        ALREADY reflects today's realized PnL, but rehydrate Phase 2 re-adds that
+        same PnL per bucket → the live capital seed double-counts it. main.py
+        subtracts this carryover from the LIVE seed (seed = broker.net - Sigma) so
+        seed + Phase 2 == broker.net by construction: no double-count, and no
+        phantom -today_pnl drift on the next sync_from_broker.
+
+        SIGNED: a loss day -> Sigma < 0 -> seed = broker.net + |loss|, then Phase 2
+        adds the negative back to the base. Cold boot (no closed trades) ->
+        Sigma = 0 -> seed unchanged. Read-only (no capital state; no initialize
+        required) so it is safe to call BEFORE initialize() at startup. PAPER does
+        NOT call this: its static paper_capital seed already excludes today's PnL,
+        which is why paper was already correct (the parity reference).
+        """
+        if start_of_today_iso is None:
+            start_of_today_iso = now_ist().replace(
+                hour=0, minute=0, second=0, microsecond=0
+            ).isoformat()
+        return sum(
+            float(row["pnl_delta"])
+            for row in self._today_release_used_pnl_rows(start_of_today_iso)
+        )
+
+    def _replay_open_trade(
+        self,
+        trade: Any,
+        anomalies: list[dict[str, Any]],
+    ) -> bool:
+        """
+        Replay one open trade's RESERVE+COMMIT ledger chain. Returns True if
+        anything was applied; False if the trade was skipped as an anomaly.
+
+        Per BL-1 spec, ONLY RESERVE and COMMIT are replayed for an OPEN/
+        PARTIAL trade -- those are the only entries that produce a coherent
+        end state for an open position. RELEASE / RELEASE_USED rows in the
+        chain would imply the trade should not be open; they're noted as
+        anomalies but not applied (Phase 2 handles RELEASE_USED for
+        closed-trade PnL carryover separately).
+        """
+        trade_id = trade["trade_id"]
+        signal_id = trade["signal_id"]
+
+        if signal_id is None:
+            anomalies.append({
+                "trade_id": trade_id,
+                "reason": "trade.signal_id is NULL",
+            })
+            return False
+
+        # EF-5: prefer the reservation_id column on trades (populated from
+        # order_placer.place via order_manager.create_trade). Fall back to
+        # the two-hop lookup (signal_id -> first RESERVE row in fm_ledger)
+        # for pre-EF-5 trade rows where the column is NULL.
+        try:
+            rid = trade["reservation_id"]
+        except (KeyError, IndexError):
+            rid = None
+        if not rid:
+            rid = self._store.get_reservation_id_for_signal(signal_id)
+        if rid is None:
+            anomalies.append({
+                "trade_id": trade_id,
+                "signal_id": signal_id,
+                "reason": "no RESERVE row in fm_ledger for this signal_id",
+            })
+            return False
+
+        # Fetch the ledger chain for this reservation, in INSERT order.
+        rows = self._store.fetch_all(
+            """
+            SELECT ledger_id, ts, entry_type, amount, bucket,
+                   balance_before, balance_after, signal_id,
+                   reservation_id, margin_delta, pnl_delta
+            FROM fm_ledger
+            WHERE reservation_id = ?
+            ORDER BY ledger_id ASC
+            """,
+            (rid,),
+        )
+        if not rows:
+            anomalies.append({
+                "trade_id": trade_id,
+                "signal_id": signal_id,
+                "reservation_id": rid,
+                "reason": "reservation_id present in lookup but no ledger rows found",
+            })
+            return False
+
+        # Decision (a): symbol/qty/price/intent come from trades + orders.
+        symbol = trade["symbol"]
+
+        qty_filled = int(trade["qty_filled"] or 0)
+        if qty_filled > 0:
+            qty = qty_filled
+        else:
+            qty = int(trade["qty_planned"])
+            self._log.warning(
+                "fund_manager.rehydrate_qty_fallback",
+                extra={
+                    "trade_id": trade_id,
+                    "qty_filled": qty_filled,
+                    "qty_planned": qty,
+                    "reason": "qty_filled=0; trade placed but unfilled at crash",
+                },
+            )
+
+        entry_actual = trade["entry_actual_price"]
+        if entry_actual is not None and float(entry_actual) != 0.0:
+            price = float(entry_actual)
+        else:
+            price = float(trade["entry_target_price"])
+            self._log.warning(
+                "fund_manager.rehydrate_price_fallback",
+                extra={
+                    "trade_id": trade_id,
+                    "entry_actual_price": entry_actual,
+                    "entry_target_price": price,
+                    "reason": "entry_actual_price unset; using target as fallback",
+                },
+            )
+
+        product = trade["product"]
+        intent = _PRODUCT_TO_INTENT.get(product) if product else None
+        if intent is None:
+            # Pathological: no ENTRY order row, or product not in map.
+            # Fall back to bucket of the first RESERVE row.
+            first_reserve = next(
+                (r for r in rows if r["entry_type"] == "RESERVE"), None
+            )
+            if first_reserve is None:
+                anomalies.append({
+                    "trade_id": trade_id,
+                    "signal_id": signal_id,
+                    "reservation_id": rid,
+                    "reason": (
+                        f"no entry order product mapping (product={product!r}) "
+                        f"and no RESERVE row to infer bucket from"
+                    ),
+                })
+                return False
+            bucket = first_reserve["bucket"]
+            intent = "INTRADAY" if bucket == _INTRADAY_BUCKET else "DELIVERY"
+            self._log.warning(
+                "fund_manager.rehydrate_intent_fallback",
+                extra={
+                    "trade_id": trade_id,
+                    "product": product,
+                    "fallback_intent": intent,
+                    "fallback_bucket": bucket,
+                },
+            )
+
+        # Replay loop: apply only RESERVE + COMMIT.
+        applied_any = False
+        saw_reserve = False
+        for row in rows:
+            et = row["entry_type"]
+            bucket = row["bucket"]
+            if et == "RESERVE":
+                if saw_reserve:
+                    continue   # second RESERVE for same rid -- skip
+                self._apply_reserve(
+                    reservation_id=rid,    # NM-4: local `rid` is a tight-scope alias
+                    bucket=bucket,
+                    margin=float(row["amount"]),
+                    symbol=symbol,
+                    qty=qty,
+                    price=price,
+                    intent=intent,
+                    signal_id=signal_id,
+                    ts=row["ts"],
+                )
+                saw_reserve = True
+                applied_any = True
+            elif et == "COMMIT":
+                if not saw_reserve:
+                    anomalies.append({
+                        "trade_id": trade_id,
+                        "reservation_id": rid,
+                        "reason": "COMMIT ledger row precedes RESERVE",
+                    })
+                    continue
+                actual_margin = float(row["amount"])
+                excess = float(row["balance_after"]) - float(row["balance_before"])
+                self._apply_commit(
+                    reservation_id=rid,
+                    actual_margin=actual_margin,
+                    excess=excess,
+                )
+                applied_any = True
+            else:
+                # RELEASE / RELEASE_USED / etc. on an OPEN trade -- pathological.
+                anomalies.append({
+                    "trade_id": trade_id,
+                    "reservation_id": rid,
+                    "ledger_id": row["ledger_id"],
+                    "reason": (
+                        f"unexpected entry_type={et!r} in chain for "
+                        f"OPEN/PARTIAL trade; not applied"
+                    ),
+                })
+
+        return applied_any
+
+    # ── _apply_* helpers (FM18 / BL-1) ────────────────────────────────────────
+    # Pure mutation helpers shared by public methods (after ledger write) and
+    # rehydrate replay (without ledger write). NEITHER writes the ledger NOR
+    # checks the invariant; the orchestrating caller is responsible for both.
+
+    def _apply_reserve(
+        self,
+        *,
+        reservation_id: str,
+        bucket: str,
+        margin: float,
+        symbol: str,
+        qty: int,
+        price: float,
+        intent: str,
+        signal_id: Optional[str],
+        ts: str,
+        slm_buffer: float = 0.0,  # FIX-090
+        strategy: Optional[str] = None,  # H-7 (Wave-5)
+    ) -> None:
+        """Move margin from avail to reserved; record the reservation.
+
+        NM-4 (2026-04-26 audit): param renamed rid -> reservation_id so all
+        three _apply_* helpers use the same canonical name.
+
+        FIX-090: slm_buffer tracks the buffer portion held for SL-M margin.
+        """
+        self._bucket_deduct_avail(bucket, margin)
+        self._bucket_add_reserved(bucket, margin)
+        self._reservations[reservation_id] = _Reservation(
+            reservation_id=reservation_id,
+            symbol=symbol,
+            qty=qty,
+            price=price,
+            intent=intent,
+            margin=margin,
+            bucket=bucket,
+            signal_id=signal_id,
+            ts=ts,
+            slm_buffer=slm_buffer,  # FIX-090
+            strategy=strategy,      # H-7 (Wave-5)
+        )
+
+    def _apply_release(self, reservation_id: str) -> None:
+        """Pop reservation; restore margin to avail; deduct from reserved."""
+        res = self._reservations.pop(reservation_id)
+        self._bucket_add_avail(res.bucket, res.margin)
+        self._bucket_deduct_reserved(res.bucket, res.margin)
+
+    def _apply_commit(
+        self,
+        *,
+        reservation_id: str,
+        actual_margin: float,
+        excess: float,
+    ) -> None:
+        """Pop reservation; deduct full reserved; add actual to used; excess
+        (if any) returns to avail."""
+        res = self._reservations.pop(reservation_id)
+        self._bucket_deduct_reserved(res.bucket, res.margin)
+        self._bucket_add_used(res.bucket, actual_margin)
+        if excess != 0.0:
+            self._bucket_add_avail(res.bucket, excess)
+
+    # ── A-1/E-1 recovery-capital helpers (MUST hold self._lock) ────────────────
+
+    def _resolve_reservation_id(self, trade_row: Any) -> Optional[str]:
+        """reservation_id for a recovery trade row: prefer the EF-5
+        trades.reservation_id column, else the signal_id -> first fm_ledger
+        RESERVE row lookup (same two-hop fallback _replay_open_trade uses)."""
+        rid = _row_get(trade_row, "reservation_id")
+        if rid:
+            return rid
+        sig = _row_get(trade_row, "signal_id")
+        if sig:
+            return self._store.get_reservation_id_for_signal(sig)
+        return None
+
+    def _commit_exists(self, reservation_id: str) -> bool:
+        """True if a COMMIT row already exists for this reservation — the
+        exactly-one-commit guard for commit_adopted_entry (defence in depth
+        behind the caller's atomic trade-state transition)."""
+        row = self._store.fetch_one(
+            "SELECT 1 FROM fm_ledger WHERE reservation_id = ? "
+            "AND entry_type = 'COMMIT' LIMIT 1",
+            (reservation_id,),
+        )
+        return row is not None
+
+    def _restore_reserve_from_ledger(self, trade_row: Any) -> Optional[str]:
+        """Reconstruct the in-memory RESERVE for a recovery trade whose
+        reservation was lost to a crash (rehydrate_from_open_trades replays only
+        OPEN/PARTIAL trades, so a crashed PENDING/UNKNOWN_IN_FLIGHT entry's
+        reserve is never re-applied at startup).
+
+        Idempotent: returns the reservation_id unchanged if it is ALREADY present
+        in memory (the timeout / same-process case, or a prior recovery cycle)
+        WITHOUT re-applying it. Otherwise reads the durable fm_ledger RESERVE row
+        (the source of truth) and re-applies it via _apply_reserve WITHOUT
+        writing the ledger (that row already exists) — mirroring the RESERVE leg
+        of _replay_open_trade. Returns None if there is nothing to restore
+        (no reservation id resolvable, or no RESERVE row).
+
+        MUST be called with self._lock held (mutates buckets via _apply_reserve).
+        """
+        rid = self._resolve_reservation_id(trade_row)
+        if not rid:
+            return None
+        if rid in self._reservations:
+            return rid   # already present — do NOT double-apply (idempotent)
+
+        row = self._store.fetch_one(
+            """
+            SELECT ts, amount, bucket, signal_id FROM fm_ledger
+            WHERE reservation_id = ? AND entry_type = 'RESERVE'
+            ORDER BY ledger_id ASC LIMIT 1
+            """,
+            (rid,),
+        )
+        if row is None:
+            return None
+
+        bucket = row["bucket"]
+        margin = float(row["amount"])
+        # Intent must route to the SAME bucket the RESERVE used; derive it from
+        # the ledger bucket (authoritative), NOT product — a crashed trade has no
+        # orders row to read product from. Mirrors _replay_open_trade's fallback.
+        intent = "INTRADAY" if bucket == _INTRADAY_BUCKET else "DELIVERY"
+        # symbol/qty/price are informational on the reservation record; the
+        # commit math uses res.margin (from the ledger) + res.intent.
+        symbol = _row_get(trade_row, "symbol") or ""
+        try:
+            qty = int(_row_get(trade_row, "qty_planned") or 0)
+        except (TypeError, ValueError):
+            qty = 0
+        try:
+            price = float(_row_get(trade_row, "entry_target_price") or 0.0)
+        except (TypeError, ValueError):
+            price = 0.0
+
+        self._apply_reserve(
+            reservation_id=rid,
+            bucket=bucket,
+            margin=margin,
+            symbol=symbol,
+            qty=qty,
+            price=price,
+            intent=intent,
+            signal_id=row["signal_id"],
+            ts=row["ts"],
+        )
+        self._log.warning(
+            "fund_manager.reserve_restored_for_recovery",
+            extra={
+                "reservation_id": rid, "bucket": bucket,
+                "margin": margin, "symbol": symbol,
+                "reason": "crash lost the in-memory reservation; restored from ledger",
+            },
+        )
+        return rid
+
+    # ── bucket helpers ────────────────────────────────────────────────────────
+
+    def _bucket_base(self, bucket: str) -> float:
+        """FIX 1: the capital base a bucket's partitions sum to.
+
+        = its share of BROKER CASH + the margin the broker has already taken
+          out of that cash for THIS bucket's carried positions.
+
+        Its own carry, NOT a pro-rata slice of the total carry: the money is
+        locked in one bucket's stock, so handing the other bucket 70% of it
+        would manufacture capacity out of someone else's holding. (That is
+        also why simply lifting `_total` and keeping `_total * pct` does not
+        work -- on 10-Aug it would have left positional at
+        `0.30 * 1,116.82 - 907.02 = -571.97`, still negative.)
+
+        `_total` is cash + carry, so `_total - carry_total` recovers the cash
+        part, and the bases still sum to `_total` exactly -- which is the
+        global identity `_check_invariant` actually enforces.
+
+        With no carry this returns `self._total * pct`, i.e. the previous
+        expression unchanged.
+        """
+        carry_total = self._intraday_carry + self._positional_carry
+        cash = self._total - carry_total
+        if bucket == _INTRADAY_BUCKET:
+            return cash * self._intraday_pct + self._intraday_carry
+        return cash * self._positional_pct + self._positional_carry
+
+    def _bucket_for_intent(self, intent: str) -> str:
+        if intent in _INTRADAY_INTENTS:
+            return _INTRADAY_BUCKET
+        if intent in _POSITIONAL_INTENTS:
+            return _POSITIONAL_BUCKET
+        raise ValueError(f"Unknown intent: {intent!r}")
+
+    def _bucket_avail(self, bucket: str) -> float:
+        return self._intraday_avail if bucket == _INTRADAY_BUCKET else self._positional_avail
+
+    def _bucket_reserved(self, bucket: str) -> float:
+        return self._intraday_reserved if bucket == _INTRADAY_BUCKET else self._positional_reserved
+
+    def _bucket_used(self, bucket: str) -> float:
+        return self._intraday_used if bucket == _INTRADAY_BUCKET else self._positional_used
+
+    def _bucket_deduct_avail(self, bucket: str, amount: float) -> None:
+        if bucket == _INTRADAY_BUCKET:
+            self._intraday_avail -= amount
+        else:
+            self._positional_avail -= amount
+
+    def _bucket_add_avail(self, bucket: str, amount: float) -> None:
+        if bucket == _INTRADAY_BUCKET:
+            self._intraday_avail += amount
+        else:
+            self._positional_avail += amount
+
+    def _bucket_add_reserved(self, bucket: str, amount: float) -> None:
+        if bucket == _INTRADAY_BUCKET:
+            self._intraday_reserved += amount
+        else:
+            self._positional_reserved += amount
+
+    def _bucket_deduct_reserved(self, bucket: str, amount: float) -> None:
+        if bucket == _INTRADAY_BUCKET:
+            self._intraday_reserved -= amount
+        else:
+            self._positional_reserved -= amount
+
+    def _bucket_add_used(self, bucket: str, amount: float) -> None:
+        if bucket == _INTRADAY_BUCKET:
+            self._intraday_used += amount
+        else:
+            self._positional_used += amount
+
+    def _bucket_deduct_used(self, bucket: str, amount: float) -> None:
+        if bucket == _INTRADAY_BUCKET:
+            self._intraday_used -= amount
+        else:
+            self._positional_used -= amount
+
+    # ── invariant (FM2, FM11, INV7) ──────────────────────────────────────────
+
+    def _check_invariant(self, mutation_type: str, context_id: str) -> None:
+        """
+        Verify available + reserved + used == total for both buckets combined.
+        Delegates to assert_capital_invariant (INV7 refactor: behavior-preserving).
+
+        fund_manager tracks _total directly (initial broker balance +/- all PnL).
+        Passes cash_floor=self._total and realized_pnl_today=0.0 so that
+        compute_rhs returns _total unchanged — equivalent to the previous
+        inline check.
+
+        C.1 (2026-04-25): on violation, this method ONLY raises
+        CapitalInvariantViolation. It no longer fires hard_kill or
+        on_critical inline; those are deferred to the public mutator that
+        catches the exception OUTSIDE its `with self._lock` block (via
+        _handle_invariant_violation). Holding the capital lock during
+        kill_switch.hard_kill could deadlock if kill_switch's downstream
+        (logging, broker cancel, rate_limiter) blocks while another thread
+        waits on the capital lock.
+        """
+        total_avail = self._intraday_avail + self._positional_avail
+        total_reserved = self._intraday_reserved + self._positional_reserved
+        total_used = self._intraday_used + self._positional_used
+        try:
+            # H-1 + M-C3: per-bucket INV6 non-negativity guard. The global sum
+            # check alone hides per-bucket corruption — one partition negative,
+            # another positive enough to offset, so the global sum passes (e.g. a
+            # wrong-bucket release drives positional_used < 0 while its avail stays
+            # >= 0; or sync_from_broker shrinks the balance). H-1 caught only a
+            # NEGATIVE avail; M-C3 extends the trigger to a negative per-bucket USED
+            # or RESERVED too (neither can EVER legitimately be < 0), surfacing the
+            # "borrow" case as NEGATIVE_MARGIN_* instead of silence. Non-negativity
+            # ONLY: assert_capital_invariant runs here solely when a partition is
+            # already negative, so its INV6 field-guard raises BEFORE the equality
+            # check — a legitimate PnL-shifted per-bucket split (avail+reserved+used
+            # != total*pct) is never reached, so this cannot false-fire (a false
+            # CapitalInvariantViolation -> hard_kill).
+            if (self._intraday_avail < -_INVARIANT_TOLERANCE
+                    or self._intraday_used < -_INVARIANT_TOLERANCE
+                    or self._intraday_reserved < -_INVARIANT_TOLERANCE):
+                assert_capital_invariant(
+                    margin_available=self._intraday_avail,
+                    margin_reserved=self._intraday_reserved,
+                    margin_used=self._intraday_used,
+                    cash_floor=self._bucket_base(_INTRADAY_BUCKET),
+                    realized_pnl_today=0.0,
+                    bucket="intraday",
+                    mutation_type=mutation_type,
+                    reservation_id=context_id,
+                    tolerance=_INVARIANT_TOLERANCE,
+                )
+            if (self._positional_avail < -_INVARIANT_TOLERANCE
+                    or self._positional_used < -_INVARIANT_TOLERANCE
+                    or self._positional_reserved < -_INVARIANT_TOLERANCE):
+                assert_capital_invariant(
+                    margin_available=self._positional_avail,
+                    margin_reserved=self._positional_reserved,
+                    margin_used=self._positional_used,
+                    cash_floor=self._bucket_base(_POSITIONAL_BUCKET),
+                    realized_pnl_today=0.0,
+                    bucket="positional",
+                    mutation_type=mutation_type,
+                    reservation_id=context_id,
+                    tolerance=_INVARIANT_TOLERANCE,
+                )
+            assert_capital_invariant(
+                margin_available=total_avail,
+                margin_reserved=total_reserved,
+                margin_used=total_used,
+                cash_floor=self._total,        # rhs = _total + min(0,0) = _total
+                realized_pnl_today=0.0,        # fund_manager tracks _total directly
+                bucket="global",
+                mutation_type=mutation_type,
+                reservation_id=context_id,
+                tolerance=_INVARIANT_TOLERANCE,
+            )
+        except CapitalInvariantViolation as exc:
+            log_exception(self._log, exc)
+            # C.1: hard_kill / on_critical moved to _handle_invariant_violation,
+            # invoked by the public mutator AFTER lock release. Just re-raise
+            # so the caller's lock-scoped try/except can capture and defer.
+            raise
+
+    def _handle_invariant_violation(
+        self, exc: CapitalInvariantViolation
+    ) -> None:
+        """
+        C.1 (2026-04-25): side-effect dispatch for an invariant violation.
+        MUST be called with the capital lock RELEASED -- holding the lock
+        during kill_switch.hard_kill risks deadlock if the kill path blocks
+        on rate_limiter while another capital-mutating thread waits on the
+        lock.
+
+        Mirrors the behavior previously inlined in _check_invariant's catch:
+          1. kill_switch.hard_kill (if wired)
+          2. on_critical_failure callback (if wired)
+
+        Both wrapped in best-effort try/except so the caller can always
+        re-raise the original CapitalInvariantViolation cleanly.
+        """
+        # effect-telemetry (frozen A2.3): a 3-balance invariant violation
+        # handled/escalated (IA-P6-06 — 0 ever, by design).
+        self._fx_invariant.inc()
+        if self._kill_switch is not None:
+            try:
+                self._kill_switch.hard_kill(
+                    reason=f"capital_invariant_violated: {exc}",
+                    triggered_by="fund_manager._check_invariant",
+                )
+            except Exception as kse:
+                self._log.critical(
+                    "kill_switch.hard_kill failed during invariant violation",
+                    extra={"kill_error": str(kse)},
+                )
+        else:
+            self._log.critical(
+                "invariant violation with kill_switch=None; "
+                "on_critical_failure path (if wired) still runs"
+            )
+        if self._on_critical is not None:
+            try:
+                self._on_critical(str(exc))
+            except Exception as cbe:
+                self._log.error(
+                    "on_critical_failure callback raised",
+                    extra={"error": str(cbe)},
+                )
+
+    # ── ledger write (FM10 / BL-5 write-ahead) ────────────────────────────────
+
+    def _write_ledger(
+        self,
+        *,
+        ts: str,
+        entry_type: str,
+        amount: float,
+        bucket: str,
+        balance_before: float,
+        balance_after: float,
+        signal_id: Optional[str] = None,
+        reservation_id: Optional[str] = None,
+        reason: Optional[str] = None,
+        direction: Optional[str] = None,
+        trade_id: Optional[str] = None,
+        margin_delta: float = 0.0,
+        pnl_delta: float = 0.0,
+        costs: float = 0.0,
+    ) -> None:
+        """
+        Write one row to fm_ledger inside a transaction (FM10 / BL-5).
+
+        BL-5 contract: this is a WRITE-AHEAD entry. Callers invoke it BEFORE
+        mutating in-memory bucket state. The row persists the intent; the
+        in-memory mutation catches up next. If this INSERT raises, the caller
+        skips the mutation (propagates the exception). If this INSERT succeeds
+        and the mutation crashes before completing, rehydrate (B.2) replays
+        fm_ledger rows to rebuild in-memory state.
+
+        entry_type is validated by a CHECK constraint in the schema; an
+        unknown value raises sqlite3.IntegrityError at INSERT time.
+        """
+        try:
+            with self._store.transaction() as cur:
+                cur.execute(
+                    """
+                    INSERT INTO fm_ledger
+                        (ts, entry_type, amount, bucket,
+                         balance_before, balance_after,
+                         signal_id, reservation_id, reason,
+                         session_id, direction, trade_id,
+                         margin_delta, pnl_delta, costs)
+                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    """,
+                    (ts, entry_type, amount, bucket,
+                     balance_before, balance_after,
+                     signal_id, reservation_id, reason,
+                     self._session_id, direction, trade_id,
+                     margin_delta, pnl_delta, costs),
+                )
+            # effect-telemetry (frozen A2.1): an fm_ledger row written —
+            # counted only after the transaction committed.
+            self._fx_ledger.inc()
+        except Exception as exc:
+            log_exception(self._log, exc)
+            raise
+
+    # ── guard ─────────────────────────────────────────────────────────────────
+
+    def _assert_initialized(self) -> None:
+        if not self._initialized:
+            raise RuntimeError(
+                "FundManager.initialize(broker_balance) must be called before "
+                "any capital operation"
+            )

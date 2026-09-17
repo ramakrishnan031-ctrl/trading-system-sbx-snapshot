@@ -1,0 +1,1207 @@
+"""
+signals/webhook_receiver.py -- Trading System v2
+
+Purpose:
+    Flask-based HTTP entry point for Chartink scanner webhooks.
+    Validates payload, deduplicates, enforces backpressure/expiry,
+    and enqueues (signal_id, scanner_name, symbol, price, triggered_at)
+    tuples for downstream signal_processor. Never blocks on heavy work.
+
+Locked Design Decisions:
+    WR1  -- HTTP-facing gateway; no heavy work in request thread
+    WR2  -- Flask, single file; POST /webhook/<scanner_name> + GET /health
+    WR3  -- Constructor: signal_queue, state_store, config, market_windows,
+             kill_switch, logger, secret_token=None
+    WR4  -- Payload: stocks, trigger_prices, triggered_at, scan_name
+    WR5  -- Response codes: 200/400/401/403/404/503/500
+    WR6  -- Backpressure (503) + per-signal expiry check
+    WR7  -- SHA-256 fingerprint dedup at minute precision
+    WR8  -- Optional HMAC validation via X-Webhook-Signature header
+    WR9  -- Insert into signals table then push to queue
+    WR10 -- Per-signal status: ACCEPTED/DUPLICATE/EXPIRED/INVALID_SYMBOL/
+             INVALID_PRICE/QUEUE_FULL/STORE_ERROR/OUTSIDE_HOURS/IN_PROCESS
+    WR11 -- Thread-safe; each Flask request in its own thread
+    WR12 -- stop() for graceful shutdown
+    WR13 -- webhook_audit row per POST regardless of outcome
+    WR14 -- signal_queue.expiry_sec + webhook config section
+    WR15 -- Layer 5 (signals/)
+    WR16 -- NOT in scope: screening, strategy lookup, order placement
+    WR17 -- In-flight symbol tracking to prevent concurrent processing
+
+What This Module Does NOT Do:
+    - Does not screen or score signals (signals/signal_processor)
+    - Does not look up strategies or map scanner to order parameters
+    - Does not place orders
+    - Does not send Telegram alerts on rejection
+"""
+from __future__ import annotations
+
+import hashlib
+import hmac as _hmac
+import json
+import queue
+import re
+import sqlite3
+import threading
+import time
+from datetime import datetime, timedelta
+from pathlib import Path
+from typing import Any, Optional
+
+import yaml
+from cachetools import TTLCache
+from flask import Flask, request, jsonify
+
+from core.ids import new_signal_id
+from core.time_authority import ist_timezone, now_ist
+from core.account_registry import primary_account_tag
+
+# P3-s14 (2026-07-17): per-signal statuses meaning "the system did not take this signal,
+# and it is NOT a duplicate — send it again". The batch answers 503 if any symbol returns
+# one of these, so the sender (Chartink) retries. Every status listed here MUST have
+# released both the in-flight claim and the fast-path dedup claim before returning:
+# a retry is only useful if it can get past the claims the failed attempt took out.
+# Response-only — these never reach signals.status (QUEUE_FULL's DB row is written by a
+# separate UPDATE; a STORE_ERROR has no row at all, because its INSERT is what failed).
+_RETRYABLE_STATUSES = frozenset({"QUEUE_FULL", "STORE_ERROR"})
+
+
+class _PerIpRateLimiter:
+    """Thread-safe per-source-IP token bucket (C-2, 02-Jul-2026).
+
+    Bounds request flooding from a single IP while tolerating Chartink's
+    legitimate open-bell burst (~40 signals from one IP): each IP gets ``burst``
+    tokens, refilled at ``refill_per_sec`` (one token per request; empty -> deny).
+    ``now`` is injectable for deterministic tests. Idle, fully-refilled buckets are
+    evicted lazily so the map can't grow unbounded under a spoofed-IP flood.
+    """
+
+    def __init__(self, burst: int, refill_per_sec: float, *, max_ips: int = 8192) -> None:
+        self._burst: float = float(max(1, int(burst)))
+        self._refill: float = max(0.0, float(refill_per_sec))
+        self._max_ips: int = max_ips
+        self._buckets: dict[str, list[float]] = {}   # ip -> [tokens, last_ts]
+        self._lock = threading.Lock()
+
+    def allow(self, ip: str, *, now: Optional[float] = None) -> bool:
+        ts = time.monotonic() if now is None else now
+        with self._lock:
+            b = self._buckets.get(ip)
+            if b is None:
+                if len(self._buckets) >= self._max_ips:
+                    self._evict_idle(ts)
+                self._buckets[ip] = [self._burst - 1.0, ts]
+                return True
+            tokens = min(self._burst, b[0] + (ts - b[1]) * self._refill)
+            if tokens < 1.0:
+                b[0], b[1] = tokens, ts
+                return False
+            b[0], b[1] = tokens - 1.0, ts
+            return True
+
+    def _evict_idle(self, now: float) -> None:
+        # Evict on IDLE TIME, not token count (the stored count is stale — it
+        # doesn't reflect refill-since-last). A bucket untouched for >60s is idle;
+        # if that IP returns it simply starts full again (harmless, it was quiet).
+        stale = [ip for ip, (_tok, last) in self._buckets.items() if (now - last) > 60.0]
+        for ip in stale:
+            self._buckets.pop(ip, None)
+
+
+def _strip_account_prefix(normalized: str) -> str:
+    """Remove a leading ``<primary account tag><sep>`` from an ALREADY-normalised
+    scan_name, where sep is ``-`` or ``_`` (WR4b, 09-Sep-2026).
+
+    WHY. Chartink alert names are per-account on a shared Chartink login, so the
+    testing VM's alerts are named "VBB097-GAP FADE SHORT" while the webhook path
+    stays ``gap_fade_short``. WR4 compares the two and 400s, which stopped every
+    signal on that machine. The account name cannot be dropped in the Chartink
+    UI, so the receiver absorbs it.
+
+    The tag comes from accounts.csv via AR12 -- NOT hardcoded. Production's tag
+    is LFL836 and no alert carries an ``lfl836-`` prefix, so this is a no-op
+    there; the testing VM's tag is VBB097 and the prefix is removed.
+
+    PREFIX ONLY. Whatever remains must still equal the path segment exactly, so
+    a URL pointed at the wrong scanner is still rejected -- that is the whole
+    purpose of WR4 and it is preserved.
+    """
+    tag = (primary_account_tag() or "").strip().lower()
+    # "unknown" is AR12's fallback when accounts.csv is unreadable -- never a
+    # real account, and stripping it would be a silent widening of the check.
+    if not tag or tag == "unknown":
+        return normalized
+    for sep in ("-", "_"):
+        prefix = tag + sep
+        if normalized.startswith(prefix):
+            return normalized[len(prefix):]
+    return normalized
+
+
+class WebhookReceiver:
+    """
+    Thin validating HTTP gateway for Chartink scanner webhooks.
+
+    Usage::
+        receiver = WebhookReceiver(signal_queue, state_store, config,
+                                   market_windows, kill_switch, logger)
+        receiver.app.run(host=config.webhook.bind_host,
+                         port=config.webhook.bind_port)
+    """
+
+    def __init__(
+        self,
+        signal_queue: queue.Queue,
+        state_store: Any,
+        config: Any,          # SystemConfig (duck-typed for testability)
+        market_windows: Any,  # MarketWindows
+        kill_switch: Any,     # KillSwitch (may be None in tests)
+        logger: Any,
+        secret_token: Optional[str] = None,
+        eod_capture: Any = None,   # V3 Step 10b: WatchlistCaptureWorker (None → EOD alerts are a fail-safe miss)
+    ) -> None:
+        # BL-18: if the deployed config declares require_hmac=True, refuse to
+        # construct without a secret. Prevents silent downgrade where config
+        # claims HMAC is enforced but the receiver silently accepts unsigned
+        # requests because secret_token was None.
+        #
+        # Shape-tolerant resolution: production passes AppConfig (has .system
+        # .webhook.require_hmac), tests pass a flat SimpleNamespace (may or
+        # may not have .webhook). Absent -> treated as non-strict.
+        _webhook_cfg = getattr(config, "webhook", None)
+        if _webhook_cfg is None:
+            _system_cfg = getattr(config, "system", None)
+            if _system_cfg is not None:
+                _webhook_cfg = getattr(_system_cfg, "webhook", None)
+        _require_hmac = bool(getattr(_webhook_cfg, "require_hmac", False))
+        if _require_hmac and not secret_token:
+            raise ValueError(
+                "WebhookReceiver: config.webhook.require_hmac=True but "
+                "secret_token is empty. Set WEBHOOK_SECRET env var or "
+                "flip require_hmac to False for non-prod deployments."
+            )
+
+        self._queue = signal_queue
+        self._store = state_store
+        self._config = config
+        self._mw = market_windows
+        self._ks = kill_switch
+        self._log = logger
+        self._secret = secret_token
+        # V3 Step 10b: the EOD-capture worker. An "eod" scanner routes here ONLY (never
+        # the intraday signal_queue). None (default / watchlist disabled) → an EOD alert
+        # is a fail-SAFE miss (logged, never silent). Purely additive: intraday scanners
+        # never touch this, so the live path is byte-identical.
+        self._eod_capture = eod_capture
+        # G.1 (2026-04-25): persist for request-time enforcement. When True
+        # the token-param fallback is disabled -- HMAC is the sole accepted
+        # auth surface (token in URL is logged by nginx and weaker than
+        # HMAC over the body).
+        self._require_hmac = _require_hmac
+
+        # WR17: in-flight symbol set (thread-safe)
+        # FIX-011: heartbeat-aware lock tracking. Each entry stores:
+        #   {'acquired_at': monotonic_ts, 'heartbeat_at': monotonic_ts}
+        # Sweeper evicts if (now - heartbeat_at) > 60s, NOT (now - acquired_at).
+        self._in_flight: dict[str, dict[str, float]] = {}
+        self._in_flight_lock = threading.Lock()
+        self._in_flight_timeout_sec: float = 60.0  # evict if no heartbeat for 60s
+
+        # H-16: set during graceful shutdown to reject new webhooks with 503
+        # before signal_processor is stopped. In-flight requests drain
+        # naturally; only NEW requests see the flag.
+        self._shutting_down = threading.Event()
+
+        # HIGH #9: background sweeper evicts stuck in_flight entries
+        self._sweeper_stop = threading.Event()
+        self._sweeper_thread = threading.Thread(
+            target=self._run_sweeper, name="in_flight_sweeper", daemon=True
+        )
+        self._sweeper_thread.start()
+
+        # FIX-032: Load symbol aliases once at startup
+        # Chartink webhook sends alternate symbol names (e.g., TVSSCS) that don't
+        # match Zerodha's trading symbols (TVSSRICHAK). Load the mapping from
+        # config/symbol_aliases.yaml to resolve at webhook edge before any DB write
+        # or in-flight check uses the wrong symbol name.
+        self._alias_map = self._load_symbol_aliases()
+
+        # FIX-036: TTL-based deduplication cache
+        # FIX-131 Item 17: TTL driven by dedup_window_seconds (default 300s / 5 min).
+        # Key: (symbol, scanner_name). Thread-safe via lock wrapper.
+        try:
+            _dedup_sec = int(getattr(_webhook_cfg, "dedup_window_seconds", 300))
+        except (TypeError, ValueError):
+            _dedup_sec = 300
+        self._dedup_window_seconds: int = max(60, _dedup_sec)
+        self._dedup_cache = TTLCache(maxsize=10000, ttl=self._dedup_window_seconds)
+        self._dedup_lock = threading.Lock()
+
+        # C-2 (02-Jul-2026): per-source-IP rate limiter (token bucket). Disabled -> None.
+        _rl_on = bool(getattr(_webhook_cfg, "per_ip_rate_limit_enabled", True))
+        if _rl_on:
+            _burst = int(getattr(_webhook_cfg, "per_ip_burst", 60) or 60)
+            _refill = float(getattr(_webhook_cfg, "per_ip_refill_per_sec", 5.0) or 5.0)
+            self._ip_limiter: Optional[_PerIpRateLimiter] = _PerIpRateLimiter(_burst, _refill)
+        else:
+            self._ip_limiter = None
+
+        self.app = Flask(__name__)
+        self.app.config["TESTING"] = False
+        self.app.config["MAX_CONTENT_LENGTH"] = 1 * 1024 * 1024  # FIX-077: 1MB hard limit prevents OOM
+        self._register_routes()
+
+    # ------------------------------------------------------------------
+    # FIX-032: Symbol alias loading
+    # ------------------------------------------------------------------
+
+    def _load_symbol_aliases(self) -> dict[str, str]:
+        """
+        FIX-032: Load symbol name aliases from config/symbol_aliases.yaml.
+
+        Returns dict mapping Chartink symbol names to Zerodha trading symbols.
+        Empty dict if file doesn't exist or is empty (fail-open: no aliases = passthrough).
+        """
+        alias_path = Path("config/symbol_aliases.yaml")
+        if not alias_path.exists():
+            self._log.warning(
+                "webhook_receiver: symbol_aliases.yaml not found at %s - "
+                "no alias translation will occur", alias_path
+            )
+            return {}
+
+        try:
+            with open(alias_path, encoding="utf-8") as f:
+                data = yaml.safe_load(f) or {}
+            # Normalize: keys and values to uppercase strings
+            alias_map = {
+                str(k).upper(): str(v).upper()
+                for k, v in data.items()
+                if k and v
+            }
+            self._log.info(
+                "webhook_receiver: loaded %d symbol aliases from %s",
+                len(alias_map), alias_path
+            )
+            return alias_map
+        except Exception as exc:
+            self._log.error(
+                "webhook_receiver: failed to load symbol_aliases.yaml: %s - "
+                "no alias translation will occur", exc
+            )
+            return {}
+
+    # ------------------------------------------------------------------
+    # Auth (C6, 2026-07-25): ONE decision, one call site per route
+    # ------------------------------------------------------------------
+
+    def _authenticate(self, hmac_payload: bytes) -> tuple[bool, str]:
+        """The single auth decision every route makes.
+
+        Returns (True, "") when the request authenticates, else (False, reason).
+
+        WR8 accepted methods:
+          1. X-Webhook-Signature: sha256=<hex>  -- HMAC over `hmac_payload`
+          2. ?token=<secret>                    -- query-param bearer
+             (Chartink-compatible; ONLY accepted when require_hmac=False)
+        G.1 (2026-04-25): when require_hmac=True the token-param path is
+        disabled. Tokens in URL are logged by nginx and weaker than HMAC
+        over the body; allowing token fallback in a "strict HMAC" deploy
+        contradicts the config's stated security posture.
+
+        C6 collapsed two spellings of THIS decision into one place: /webhook
+        returned early from each branch, /health accumulated an `ok` boolean and
+        issued a single 401. Same three-way decision, written twice, patched
+        separately (G.1 on /webhook 2026-04-25, the /health parity fix later).
+        Two things stay per-route ON PURPOSE and must not be flattened:
+
+        * `hmac_payload` -- what the signature is computed over. The raw body on
+          POST /webhook; b"" on GET /health, because a GET carries no body. A
+          valid /health signature is therefore a CONSTANT for a given secret and
+          indefinitely replayable; /webhook's is body-bound and is not.
+        * `reason` -- /webhook's granular message. /health DISCARDS it and
+          answers with a uniform string: naming the reason there would tell an
+          anonymous caller whether require_hmac is on. See both callers.
+        """
+        # No secret configured -> no auth surface to enforce; preserve old behaviour
+        # rather than hard-fail a deployment that never had a secret. Unreachable in
+        # production (WEBHOOK_SECRET is a required startup secret -- main.py:226 /
+        # run_all_startup_checks), so this is a test-only path, not dead code.
+        if not self._secret:
+            return True, ""
+
+        sig_header: str = request.headers.get("X-Webhook-Signature", "")
+        token_param: str = request.args.get("token", "")
+
+        if sig_header.startswith("sha256="):
+            expected_hex = _hmac.new(
+                self._secret.encode(), hmac_payload, hashlib.sha256
+            ).hexdigest()
+            if not _hmac.compare_digest(sig_header[7:], expected_hex):
+                return False, "HMAC signature mismatch"
+            return True, ""
+        if self._require_hmac:
+            # G.1: HMAC required, no signature header -> reject. Do not consult
+            # token_param; deployments that flip require_hmac=True have
+            # explicitly opted out of the legacy token fallback. A bad signature
+            # is NOT rescued by a valid token either -- that is the branch above.
+            return False, ("HMAC signature required (require_hmac=True); "
+                           "token param is not accepted")
+        if token_param:
+            if not _hmac.compare_digest(token_param, self._secret):
+                return False, "Invalid token"
+            return True, ""
+        return False, "Missing auth: provide X-Webhook-Signature header or ?token= param"
+
+    # ------------------------------------------------------------------
+    # Route registration
+    # ------------------------------------------------------------------
+
+    def _register_routes(self) -> None:
+        app = self.app
+        receiver = self  # closure reference
+
+        @app.route("/health", methods=["GET"])
+        def health():
+            # AB-910 §1.7: this endpoint sits on 0.0.0.0:5000 (open for Chartink), and it
+            # used to hand ANY anonymous caller kill_switch_active + queue depth — i.e. a
+            # free oracle for "is the trading system halted right now, and how loaded is
+            # it". That is reconnaissance and timing intel, unauthenticated, from the
+            # internet. It also bypassed the per-IP limiter that /webhook is behind.
+            #
+            # Now: same rate limiter, same secret, and same require_hmac posture as
+            # /webhook. Scope is deliberately this ONE route — /webhook's handler is not
+            # touched, because this is the signal entry path and a health endpoint is not
+            # worth risking it.
+            source_ip: str = request.remote_addr or "unknown"
+
+            # Limit BEFORE auth, exactly as /webhook does, so a flood is cheap to reject.
+            if receiver._ip_limiter is not None and not receiver._ip_limiter.allow(source_ip):
+                return jsonify({"error": "rate limit exceeded"}), 429
+
+            # C6 (2026-07-25): the SAME decision /webhook makes, one call site.
+            # /health signs an EMPTY body because a GET carries none. G.1 parity
+            # (require_hmac disables the token fallback here too) now comes for
+            # free from the shared helper instead of being re-spelled as an `ok`
+            # boolean — that re-spelling is what C6 removed.
+            authed, _reason = receiver._authenticate(b"")
+            if not authed:
+                # Deliberately says nothing about system state — including in the
+                # failure path, which is where oracles usually leak. `_reason` (the
+                # granular /webhook message) is DISCARDED on purpose: naming it here
+                # would tell an anonymous caller whether require_hmac is on.
+                return jsonify({"error": "authentication required"}), 401
+
+            ks_active = bool(receiver._ks.is_active()) if receiver._ks else False
+            q_size = receiver._queue.qsize()
+            q_cap = receiver._config.system.signal_queue.capacity
+            return jsonify({
+                "status": "ok",
+                "kill_switch_active": ks_active,
+                "queue_size": q_size,
+                "queue_capacity": q_cap,
+                "queue_depth": f"{q_size}/{q_cap}",
+            }), 200
+
+        @app.route("/webhook/<scanner_name>", methods=["POST"])
+        def webhook(scanner_name: str):
+            return receiver._handle_webhook(scanner_name)
+
+        @app.errorhandler(500)
+        def internal_error(exc):
+            receiver._log.critical(f"Unhandled exception in webhook handler: {exc}")
+            return jsonify({"error": "Internal server error"}), 500
+
+    # ------------------------------------------------------------------
+    # FIX-074: Type-cast numeric fields at ingestion
+    # ------------------------------------------------------------------
+
+    def _cast_numeric_fields(self, signal: dict[str, Any]) -> tuple[bool, str]:
+        """
+        FIX-074: Cast known numeric fields from strings to float/int.
+
+        Chartink sends numeric values as strings. Cast them before queueing
+        to prevent downstream TypeError in PositionSizer or other components.
+
+        Returns (success, error_msg):
+        - (True, "") if all critical fields cast successfully
+        - (False, "reason") if a critical field failed to cast
+
+        Critical fields: price, entry_price (must be castable or reject)
+        Non-critical fields: trigger_price, sl_pct, target_pct (set to None on failure)
+        """
+        # Float fields (non-critical by default)
+        float_fields = ["trigger_price", "sl_pct", "target_pct"]
+        # Critical float fields (must cast successfully)
+        critical_float_fields = ["price", "entry_price"]
+
+        # Try casting critical fields first
+        for field in critical_float_fields:
+            if field in signal and signal[field] is not None:
+                try:
+                    signal[field] = float(signal[field])
+                except (ValueError, TypeError) as exc:
+                    return False, f"critical field {field}={signal[field]!r} cannot be cast to float: {exc}"
+
+        # Non-critical float fields: set to None on failure
+        for field in float_fields:
+            if field in signal and signal[field] is not None:
+                try:
+                    signal[field] = float(signal[field])
+                except (ValueError, TypeError):
+                    self._log.warning(
+                        "webhook_receiver: could not cast %s=%r to float - setting to None",
+                        field, signal[field]
+                    )
+                    signal[field] = None
+
+        # Integer fields (e.g., qty) - currently none in Chartink format, but prepare for future
+        int_fields = ["qty"]
+        for field in int_fields:
+            if field in signal and signal[field] is not None:
+                try:
+                    signal[field] = int(signal[field])
+                except (ValueError, TypeError):
+                    self._log.warning(
+                        "webhook_receiver: could not cast %s=%r to int - setting to None",
+                        field, signal[field]
+                    )
+                    signal[field] = None
+
+        return True, ""
+
+    # ------------------------------------------------------------------
+    # Main request handler (WR4, WR5)
+    # ------------------------------------------------------------------
+
+    def _handle_webhook(self, scanner_name: str):
+        start_mono = time.monotonic()
+        source_ip: str = request.remote_addr or "unknown"
+        raw_body: bytes = request.get_data()
+        payload_size: int = len(raw_body)
+
+        # H-16: reject NEW requests during graceful shutdown. In-flight
+        # requests continue to completion; only newly arriving ones get 503.
+        if self._shutting_down.is_set():
+            duration_ms = int((time.monotonic() - start_mono) * 1000)
+            self._write_audit(
+                scanner_name, source_ip, payload_size, 503, 0, 0, duration_ms,
+            )
+            return jsonify({"error": "Service shutting down; retry later"}), 503
+
+        # C-2 (02-Jul-2026): per-source-IP rate limit. Bounds a single IP flooding
+        # /webhook; Chartink's open-bell burst is absorbed by the token bucket. On
+        # exceed -> 429 (before auth/parse/queue work, so a flood is cheap to reject).
+        if self._ip_limiter is not None and not self._ip_limiter.allow(source_ip):
+            duration_ms = int((time.monotonic() - start_mono) * 1000)
+            self._write_audit(
+                scanner_name, source_ip, payload_size, 429, 0, 0, duration_ms,
+            )
+            self._log.warning(
+                "webhook/%s: per-IP rate limit exceeded for %s -> 429",
+                scanner_name, source_ip,
+            )
+            return jsonify({"error": "Rate limit exceeded; slow down"}), 429
+
+        response_code = 500
+        accepted_count = 0
+        rejected_count = 0
+
+        try:
+            resp = self._process_request(scanner_name, raw_body)
+            response_code = resp[1] if isinstance(resp, tuple) else 200
+            # Extract accepted/rejected from 200 responses
+            if response_code == 200 and isinstance(resp, tuple):
+                data = resp[0].get_json(silent=True) or {}
+                accepted_count = data.get("accepted", 0)
+                rejected_count = data.get("rejected", 0)
+            # Log raw body on 400 errors for debugging Chartink format
+            if response_code == 400:
+                self._log.warning(
+                    "webhook/%s: 400 response | raw_body=%r",
+                    scanner_name, raw_body[:1000],
+                )
+            return resp
+        except Exception as exc:
+            self._log.critical(f"Unhandled exception processing /webhook/{scanner_name}: {exc}")
+            response_code = 500
+            return jsonify({"error": "Internal server error"}), 500
+        finally:
+            duration_ms = int((time.monotonic() - start_mono) * 1000)
+            self._write_audit(
+                scanner_name, source_ip, payload_size,
+                response_code, accepted_count, rejected_count, duration_ms,
+            )
+
+    def _process_request(self, scanner_name: str, raw_body: bytes):
+        sq_cfg = self._config.system.signal_queue
+
+        # WR8: auth validation (when secret configured). C6 (2026-07-25): the
+        # three-way decision (HMAC → require_hmac → token) moved verbatim into
+        # _authenticate() and is now shared with /health. Unchanged here: the
+        # payload the signature covers (the raw body) and the granular failure
+        # message /webhook has always returned. Position in the gate order is
+        # unchanged too — shutting-down and the per-IP limiter still run first
+        # (in _handle_webhook), and the unknown-scanner 404 and the EOD route
+        # still run AFTER this, so neither can be reached unauthenticated.
+        authed, auth_error = self._authenticate(raw_body)
+        if not authed:
+            return jsonify({"error": auth_error}), 401
+
+        # WR4: scanner_name must be in scan_webhook_map
+        known_scanners: dict[str, Any] = self._config.scan_webhook_map.scanners
+        if scanner_name not in known_scanners:
+            return jsonify({"error": f"Unknown scanner: {scanner_name!r}"}), 404
+
+        # V3 Step 10b — STRUCTURAL EOD ROUTING. An "eod" scanner (a DAILY/EOD alert) is
+        # captured to the WATCHLIST only: it SKIPS the intraday entry-window gate (a
+        # post-close alert is legitimate) and is NEVER enqueued to the intraday
+        # signal_queue — so it is structurally INCAPABLE of the intraday order path
+        # (constraint #1). Default "intraday" → this is a single skipped attribute read
+        # → the live path is BYTE-IDENTICAL.
+        _entry = known_scanners.get(scanner_name)
+        if getattr(_entry, "scanner_type", "intraday") == "eod":
+            return self._handle_eod(scanner_name, raw_body)
+
+        # WR5: kill_switch active -> 403
+        if self._ks and self._ks.is_active():
+            return jsonify({"error": "Kill switch active; signals rejected"}), 403
+
+        # WR6 / FIX-134 Item 35: graduated backpressure
+        capacity: int = sq_cfg.capacity
+        q_size = self._queue.qsize()
+        bp_threshold = int(capacity * sq_cfg.backpressure_pct)
+        warn_threshold = int(capacity * getattr(sq_cfg, "warning_pct", 0.60))
+        if q_size >= bp_threshold:
+            resp = jsonify({"error": "Signal queue at capacity; retry later"})
+            resp.headers["X-Queue-Depth"] = f"{q_size}/{capacity}"
+            return resp, 503
+
+        # WR5: outside entry window -> 403
+        now = now_ist()
+        if not self._mw.is_entry_allowed(now):
+            return jsonify({"error": "Outside entry window"}), 403
+
+        # Parse JSON body
+        try:
+            body: dict = json.loads(raw_body)
+        except (json.JSONDecodeError, ValueError) as exc:
+            self._log.warning(
+                "webhook/%s: Malformed JSON: %s | raw=%r",
+                scanner_name, exc, raw_body[:500],
+            )
+            return jsonify({"error": f"Malformed JSON: {exc}"}), 400
+
+        if not isinstance(body, dict):
+            return jsonify({"error": "Request body must be a JSON object"}), 400
+
+        # FIX-074: Cast numeric fields before processing
+        # Handles both top-level numeric fields and per-signal fields if present
+        cast_ok, cast_err = self._cast_numeric_fields(body)
+        if not cast_ok:
+            self._log.warning(
+                "webhook/%s: Type cast failed: %s | body_keys=%r",
+                scanner_name, cast_err, list(body.keys()),
+            )
+            return jsonify({"error": f"Invalid payload: {cast_err}"}), 400
+
+        # Required field presence (scan_name optional - derive from URL if missing)
+        for field in ("stocks", "trigger_prices", "triggered_at"):
+            if field not in body:
+                self._log.warning(
+                    "webhook/%s: Missing field %r | body_keys=%r",
+                    scanner_name, field, list(body.keys()),
+                )
+                return jsonify({"error": f"Missing required field: {field!r}"}), 400
+
+        # WR4: scan_name in body is optional; if present, validate it matches
+        # Chartink sends "GAP FADE LONG" but URL uses "gap_fade_long", so we
+        # normalize both to lowercase with underscores before comparing
+        body_scan_name = body.get("scan_name")
+        if body_scan_name is not None:
+            normalized_body = body_scan_name.lower().replace(" ", "_")
+            # WR4b: an account-tag prefix is stripped before comparing (see
+            # _strip_account_prefix). Prefix only -- the remainder must still
+            # match the path exactly.
+            compared = _strip_account_prefix(normalized_body)
+            if compared != scanner_name:
+                self._log.warning(
+                    "webhook/%s: scan_name mismatch: body=%r (normalized=%r, "
+                    "after account-prefix strip=%r) vs path=%r",
+                    scanner_name, body_scan_name, normalized_body, compared, scanner_name,
+                )
+                return jsonify({"error": "scan_name in body does not match scanner_name path param"}), 400
+
+        # Parse triggered_at - Chartink sends "HH:MM am/pm", we also accept "YYYY-MM-DD HH:MM:SS"
+        # FIX-022: Immediately localize to IST after parsing to prevent timezone-naive/aware subtraction errors
+        triggered_at_raw = str(body["triggered_at"]).strip()
+        triggered_at: datetime | None = None
+        # Try multiple formats
+        for fmt in ("%Y-%m-%d %H:%M:%S", "%I:%M %p", "%H:%M"):
+            try:
+                parsed = datetime.strptime(triggered_at_raw, fmt)
+                if fmt in ("%I:%M %p", "%H:%M"):
+                    # Time-only format: use today's date
+                    today = now.date()
+                    triggered_at = datetime(today.year, today.month, today.day,
+                                            parsed.hour, parsed.minute, 0)
+                else:
+                    triggered_at = parsed
+                # FIX-022: Apply IST timezone immediately after parsing
+                # Chartink sends naive strings; we assume IST and make them aware
+                if triggered_at.tzinfo is None:
+                    triggered_at = triggered_at.replace(tzinfo=ist_timezone())
+                    self._log.debug("webhook/%s: localized naive triggered_at to IST", scanner_name)
+                break
+            except ValueError:
+                continue
+        if triggered_at is None:
+            self._log.warning(
+                "webhook/%s: Invalid triggered_at=%r", scanner_name, triggered_at_raw,
+            )
+            return jsonify({"error": "Invalid triggered_at; expected HH:MM am/pm or YYYY-MM-DD HH:MM:SS"}), 400
+
+        # Parse stocks / trigger_prices
+        stocks_raw = body["stocks"]
+        prices_raw = body["trigger_prices"]
+        if not isinstance(stocks_raw, str) or not isinstance(prices_raw, str):
+            return jsonify({"error": "stocks and trigger_prices must be comma-separated strings"}), 400
+
+        symbols = [s.strip() for s in stocks_raw.split(",")]
+        price_strs = [p.strip() for p in prices_raw.split(",")]
+
+        if len(symbols) != len(price_strs):
+            return jsonify({"error": "stocks and trigger_prices list length mismatch"}), 400
+
+        # Process each stock independently (WR6, WR10)
+        received_at = now_ist()
+        today_iso: str = received_at.date().isoformat()
+        expiry_sec: int = sq_cfg.expiry_sec
+
+        # S-1B.1 (2026-07-05): sanitize the copy PERSISTED to
+        # signals.webhook_payload so the webhook secret never lands at rest.
+        # Chartink echoes the configured URL (incl. ?token=<SECRET>) inside the
+        # body's `webhook_url` field, and the raw body is stored verbatim below.
+        # STORAGE-ONLY: the parsed `body` used for signal processing (stocks/
+        # trigger_prices/triggered_at/scan_name, already extracted above) is
+        # untouched, and auth (:410-432) ran before this — redaction is post-auth.
+        stored_payload = self._sanitize_payload_for_storage(
+            raw_body.decode("utf-8", errors="replace")
+        )
+
+        results = []
+        accepted_count = 0
+        rejected_count = 0
+
+        for raw_symbol, price_str in zip(symbols, price_strs):
+            # FIX-032: Apply symbol alias at webhook edge BEFORE any operation
+            # (DB write, in-flight check, queue push). Chartink sends alternate
+            # names (e.g., TVSSCS) that must be resolved to Zerodha symbols
+            # (TVSSRICHAK) to prevent ghost locks and instrument cache misses.
+            symbol = self._alias_map.get(raw_symbol.upper(), raw_symbol)
+            if symbol != raw_symbol:
+                self._log.debug(
+                    "webhook_receiver: symbol alias applied: raw=%s → resolved=%s",
+                    raw_symbol, symbol
+                )
+
+            # FIX-C: Check excluded symbols after alias resolution
+            excluded_symbols = getattr(self._config.system, "excluded_symbols", [])
+            if symbol.upper() in [s.upper() for s in excluded_symbols]:
+                self._log.debug(
+                    "webhook_receiver: symbol %s rejected (in excluded_symbols list)",
+                    symbol
+                )
+                results.append({"symbol": symbol, "status": "REJECTED_EXCLUDED_SYMBOL"})
+                rejected_count += 1
+                continue
+
+            item = self._process_signal(
+                scanner_name, symbol, price_str,
+                triggered_at, received_at, today_iso, expiry_sec,
+                webhook_payload=stored_payload,
+            )
+            results.append(item)
+            if item["status"] == "ACCEPTED":
+                accepted_count += 1
+            else:
+                rejected_count += 1
+
+        # HIGH #6: return 503 when queue is full so client knows to retry.
+        # P3-s14: STORE_ERROR joins it -- same contract (the signal was not taken, it is
+        # not a duplicate, retry it), so the same retryable 5xx. See _RETRYABLE_STATUSES.
+        any_retryable = any(r["status"] in _RETRYABLE_STATUSES for r in results)
+        http_status = 503 if any_retryable else 200
+        resp = jsonify({
+            "accepted": accepted_count,
+            "rejected": rejected_count,
+            "results": results,
+        })
+        # FIX-134 Item 35: graduated backpressure headers
+        current_depth = self._queue.qsize()
+        resp.headers["X-Queue-Depth"] = f"{current_depth}/{capacity}"
+        if current_depth >= warn_threshold:
+            resp.headers["X-Queue-Warning"] = "high"
+        return resp, http_status
+
+    # ------------------------------------------------------------------
+    # V3 Step 10b — EOD route (watchlist capture; NEVER the intraday order path)
+    # ------------------------------------------------------------------
+
+    def _handle_eod(self, scanner_name: str, raw_body: bytes):
+        """Route a DAILY/EOD scanner alert to the watchlist capture worker. Self-contained
+        (does NOT touch the intraday parse, so that path stays byte-identical). Parses the
+        Chartink payload, then hands each symbol to `eod_capture.submit()` — which does the
+        heavy LEVEL fetch/compute OFF the request thread (WR1). NEVER enqueues to the
+        intraday signal_queue. Auth already ran in _process_request before this."""
+        try:
+            body = json.loads(raw_body)
+        except (json.JSONDecodeError, ValueError) as exc:
+            return jsonify({"error": f"Malformed JSON: {exc}"}), 400
+        if not isinstance(body, dict):
+            return jsonify({"error": "Request body must be a JSON object"}), 400
+        for field in ("stocks", "trigger_prices", "triggered_at"):
+            if field not in body:
+                return jsonify({"error": f"Missing required field: {field!r}"}), 400
+
+        triggered_at = self._parse_eod_triggered_at(str(body["triggered_at"]).strip())
+        if triggered_at is None:
+            return jsonify({"error": "Invalid triggered_at"}), 400
+
+        stocks_raw = body["stocks"]
+        if not isinstance(stocks_raw, str):
+            return jsonify({"error": "stocks must be a comma-separated string"}), 400
+        symbols = [s.strip() for s in stocks_raw.split(",") if s.strip()]
+
+        # watchlist disabled (no capture worker) → a fail-SAFE miss (logged, never silent):
+        # an empty watchlist = no PB-01 next day, never a bad trade.
+        if self._eod_capture is None:
+            self._log.warning(
+                "EOD alert %s: watchlist disabled (no capture worker) → fail-safe miss "
+                "for %d symbol(s)", scanner_name, len(symbols))
+            # C3 (25-Jul-2026): THIS is the branch that used to be invisible. A boot-wiring
+            # failure leaves _eod_capture None, the 17:00 alert still answers 200, and next
+            # morning an empty pb01_watchlist looks exactly like "no breakouts". FAILED +
+            # func=DISABLED makes the two distinguishable in one query.
+            self._record_eod_heartbeat(scanner_name, len(symbols), 0,
+                                       status="FAILED", functional_status="DISABLED")
+            return jsonify({"accepted": 0, "captured": 0, "detail": "watchlist disabled"}), 200
+
+        captured = 0
+        for raw_symbol in symbols:
+            symbol = self._alias_map.get(raw_symbol.upper(), raw_symbol)
+            try:
+                if self._eod_capture.submit(
+                        scanner_name=scanner_name, symbol=symbol, triggered_at=triggered_at):
+                    captured += 1
+            except Exception as exc:   # a capture-submit error must never break the response
+                self._log.error("EOD capture submit failed for %s: %s", symbol, exc)
+        self._log.info("EOD alert %s: %d symbol(s) → %d queued for capture",
+                       scanner_name, len(symbols), captured)
+        self._record_eod_heartbeat(
+            scanner_name, len(symbols), captured,
+            functional_status=("EMPTY_NO_DATA" if captured == 0 else None))
+        return jsonify({"accepted": len(symbols), "captured": captured}), 200
+
+    def _record_eod_heartbeat(self, scanner_name: str, symbols: int, queued: int,
+                              status: str = "SUCCESS",
+                              functional_status: Optional[str] = None) -> None:
+        """C3 (25-Jul-2026): one cron_heartbeat row per EOD alert, so the 17:00 capture
+        stops being invisible.
+
+        ⚠️ RECORDS *QUEUED*, NOT CAPTURED. `submit()` hands the symbol to the capture
+        worker, which does the LEVEL fetch/compute OFF the request thread (WR1). So
+        `queued=N` proves the alert ARRIVED, authenticated, parsed, and was accepted —
+        it does NOT prove any row reached `pb01_watchlist`. The watchlist row count
+        remains the only proof the worker finished. The message says `queued=` and not
+        `captured=` precisely so nobody later reads this as capture confirmation.
+
+        ⛔ THIS IS THE SIGNAL INGRESS. Every failure mode is swallowed: `record_heartbeat`
+        already returns False rather than raising, and this adds a belt-and-braces except
+        so that no DB hiccup, no import error and no bad argument can turn a 200 into a
+        500. Observability must never be able to break the thing it observes.
+        """
+        try:
+            from utils.cron_heartbeat import record_heartbeat
+            record_heartbeat(
+                "pb01_capture", status=status, functional_status=functional_status,
+                message=f"scanner={scanner_name} symbols={symbols} queued={queued}",
+            )
+        except Exception as exc:   # never let observability break the request path
+            try:
+                self._log.warning("pb01_capture heartbeat failed (ignored): %s", exc)
+            except Exception:
+                pass
+
+    def _parse_eod_triggered_at(self, raw: str):
+        """Parse the EOD alert's triggered_at → IST-aware datetime. Accepts the same
+        formats the intraday path does; for an EOD daily scan the DATE is what matters
+        (breakout_date). None on an unparseable value."""
+        now = now_ist()
+        for fmt in ("%Y-%m-%d %H:%M:%S", "%Y-%m-%d", "%I:%M %p", "%H:%M"):
+            try:
+                parsed = datetime.strptime(raw, fmt)
+                if fmt in ("%I:%M %p", "%H:%M"):
+                    parsed = datetime(now.year, now.month, now.day, parsed.hour, parsed.minute, 0)
+                if parsed.tzinfo is None:
+                    parsed = parsed.replace(tzinfo=ist_timezone())
+                return parsed
+            except ValueError:
+                continue
+        return None
+
+    # ------------------------------------------------------------------
+    # Persisted-payload sanitizer (S-1B.1)
+    # ------------------------------------------------------------------
+
+    def _sanitize_payload_for_storage(self, payload: str) -> str:
+        """S-1B.1: redact the webhook secret from the copy persisted to
+        signals.webhook_payload. Chartink echoes the configured webhook URL --
+        including ``?token=<SECRET>`` -- inside the body's ``webhook_url`` field,
+        so storing the raw body verbatim would leak the secret plaintext at rest.
+
+        STORAGE-ONLY: the argument is only ever written to the DB; the parsed
+        ``body`` used for signal processing is never passed here, and auth
+        (:410-432) runs before this and is unchanged. Belt-and-suspenders, all
+        applied to the stored copy:
+          (a) replace the literal secret value wherever it appears;
+          (b) regex-redact any ``token=<value>`` query param;
+          (c) blank the ``webhook_url`` field value (ignored by parsing).
+        Useful audit fields (stocks/trigger_prices/triggered_at/scan_name) are
+        preserved.
+        """
+        sanitized = payload
+        # (a) literal secret anywhere -> placeholder
+        if self._secret:
+            sanitized = sanitized.replace(self._secret, "<REDACTED>")
+        # (b) any token=<value> (value up to & " ' whitespace or end-of-string)
+        sanitized = re.sub(r"token=[^&\"'\s]+", "token=<REDACTED>", sanitized)
+        # (c) blank the webhook_url field value entirely (JSON string, tolerant
+        #     of escaped chars); it is ignored by parsing
+        sanitized = re.sub(
+            r'("webhook_url"\s*:\s*)"(?:[^"\\]|\\.)*"',
+            r'\1"<REDACTED>"',
+            sanitized,
+        )
+        return sanitized
+
+    # ------------------------------------------------------------------
+    # Per-signal processing (WR9, WR10, WR17)
+    # ------------------------------------------------------------------
+
+    def _process_signal(
+        self,
+        scanner_name: str,
+        symbol: str,
+        price_str: str,
+        triggered_at: datetime,
+        received_at: datetime,
+        today_iso: str,
+        expiry_sec: int,
+        webhook_payload: Optional[str] = None,
+    ) -> dict[str, Any]:
+
+        # WR10: validate symbol
+        if not symbol:
+            return {"symbol": symbol, "status": "INVALID_SYMBOL"}
+
+        # WR10: validate price
+        try:
+            price = float(price_str)
+        except (ValueError, TypeError):
+            return {"symbol": symbol, "status": "INVALID_PRICE"}
+        if price <= 0:
+            return {"symbol": symbol, "status": "INVALID_PRICE"}
+
+        # WR6: signal expiry
+        # FIX-022: triggered_at is now guaranteed IST-aware from parsing,
+        # but handle legacy naive datetimes defensively
+        now = now_ist()
+        if triggered_at.tzinfo is None:
+            triggered_at_aware = triggered_at.replace(tzinfo=ist_timezone())
+        else:
+            triggered_at_aware = triggered_at
+        age_sec = (now - triggered_at_aware).total_seconds()
+        if age_sec > expiry_sec:
+            return {"symbol": symbol, "status": "EXPIRED"}
+
+        # M-1: atomically claim the symbol as in-flight. Closes the TOCTOU
+        # gap where the legacy check-then-add admitted concurrent same-symbol
+        # signals with DIFFERENT fingerprints (e.g., different minute-rollup)
+        # that would both pass the in_flight check and both get enqueued.
+        # From here every reject path MUST release; every accepted path lets
+        # signal_processor release at completion via release_in_flight().
+        if not self._claim_in_flight(symbol):
+            return {"symbol": symbol, "status": "IN_PROCESS"}
+
+        # FIX-036: TTLCache deduplication (replaces minute-string fingerprint)
+        # Check if (symbol, scanner_name) was seen within last 300 seconds.
+        # Thread-safe via lock wrapper.
+        dedup_key = (symbol, scanner_name)
+        with self._dedup_lock:
+            if dedup_key in self._dedup_cache:
+                # Duplicate within TTL window
+                self._release_in_flight(symbol)
+                return {"symbol": symbol, "status": "DUPLICATE"}
+            # Mark as seen in cache
+            self._dedup_cache[dedup_key] = True
+
+        # WR7 / FIX-131 Item 17: compute dedup fingerprint using configurable bucket.
+        # floor(unix_ts / dedup_window_seconds) gives same bucket for all signals
+        # within the same N-second window, surviving minute/hour boundaries.
+        epoch_bucket = int(triggered_at.timestamp() // self._dedup_window_seconds)
+        fp_raw = f"{scanner_name}|{symbol}|{epoch_bucket}"
+        fingerprint = hashlib.sha256(fp_raw.encode()).hexdigest()
+
+        # WR9: insert signal row, then push to queue
+        signal_id = new_signal_id()
+        triggered_at_iso = triggered_at.isoformat()
+        received_at_iso = received_at.isoformat()
+        expires_at_dt = received_at + timedelta(seconds=expiry_sec)
+        expires_at_iso = expires_at_dt.isoformat()
+
+        try:
+            with self._store.transaction() as cur:
+                cur.execute(
+                    """
+                    INSERT INTO signals
+                      (signal_id, symbol, scanner, strategy,
+                       triggered_at, received_at, expires_at,
+                       status, fingerprint, fingerprint_date, trigger_price,
+                       webhook_payload)
+                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    """,
+                    (
+                        signal_id, symbol, scanner_name, scanner_name,
+                        triggered_at_iso, received_at_iso, expires_at_iso,
+                        "QUEUED", fingerprint, today_iso, price,
+                        webhook_payload,
+                    ),
+                )
+        except sqlite3.IntegrityError:
+            # A row with this (fingerprint, fingerprint_date) already exists.
+            # M-S2: if it is a QUEUE_FULL backpressure row (inserted, but never queued
+            # because the queue was full), THIS request is a legitimate 503 retry — flip that
+            # row back to QUEUED and re-queue it, reusing its signal_id (audit row preserved).
+            # Otherwise it is a genuine concurrent duplicate.
+            existing = self._store.fetch_one(
+                "SELECT signal_id, status FROM signals "
+                "WHERE fingerprint = ? AND fingerprint_date = ?",
+                (fingerprint, today_iso),
+            )
+            if existing is not None and existing["status"] == "QUEUE_FULL":
+                requeue = (existing["signal_id"], scanner_name, symbol, price, triggered_at)
+                try:
+                    self._queue.put_nowait(requeue)
+                except queue.Full:
+                    # still backpressured — roll the cache claim back so the NEXT retry works
+                    with self._dedup_lock:
+                        self._dedup_cache.pop(dedup_key, None)
+                    self._release_in_flight(symbol)
+                    return {"symbol": symbol, "status": "QUEUE_FULL"}
+                try:
+                    with self._store.transaction() as cur:
+                        cur.execute(
+                            "UPDATE signals SET status = 'QUEUED' WHERE signal_id = ?",
+                            (existing["signal_id"],),
+                        )
+                except Exception as upd_exc:
+                    self._log.error(
+                        f"Failed to flip re-queued signal {existing['signal_id']} "
+                        f"to QUEUED: {upd_exc}")
+                return {"symbol": symbol, "status": "ACCEPTED",
+                        "signal_id": existing["signal_id"]}
+            self._release_in_flight(symbol)
+            return {"symbol": symbol, "status": "DUPLICATE"}
+        except Exception as exc:
+            # P3-s14: the INSERT failed for a reason that is NOT a constraint violation
+            # (sqlite3.OperationalError on a full disk is the likeliest). transaction()
+            # rolls back on any exception, so the DB-side dedup layer releases itself --
+            # but the two claims taken above are IN-MEMORY and a rollback cannot touch
+            # them. Left held, they bounce this (symbol, scanner) as DUPLICATE for the
+            # whole dedup window, so the sender's retry is silently dropped.
+            #
+            # Same reasoning as the M-S2 QUEUE_FULL path below: a store failure is not a
+            # duplicate, so roll BOTH claims back. Double-entry stays impossible without
+            # the cache -- _claim_in_flight serialises same-symbol concurrency, and
+            # UNIQUE(fingerprint, fingerprint_date) is the authoritative within-window
+            # dedup (a retry inside the same bucket recomputes the same fingerprint).
+            with self._dedup_lock:
+                self._dedup_cache.pop(dedup_key, None)
+            self._release_in_flight(symbol)
+            # CRITICAL, not ERROR: this used to escape to _handle_webhook, which logged
+            # CRITICAL and returned 500. Catching it here must not make a store failure
+            # quieter than it was -- and the 503 below no longer distinguishes it from
+            # QUEUE_FULL backpressure, so THIS line is now the fingerprint to alert on.
+            self._log.critical(
+                "webhook_receiver: signal store FAILED for %s/%s: %s -- claims released, "
+                "returning STORE_ERROR so the sender retries", scanner_name, symbol, exc,
+            )
+            # Returning instead of raising also keeps the rest of the batch alive: the
+            # caller's per-symbol loop has no try/except, so a raise here abandoned every
+            # symbol after this one. STORE_ERROR makes the batch answer 503 -- releasing
+            # the claims is only meaningful if a retry actually arrives.
+            return {"symbol": symbol, "status": "STORE_ERROR"}
+
+        # Push to signal_queue
+        entry = (signal_id, scanner_name, symbol, price, triggered_at)
+        try:
+            self._queue.put_nowait(entry)
+        except queue.Full:
+            # Mark QUEUE_FULL in DB so the signal is not silently lost (audit row kept).
+            try:
+                with self._store.transaction() as cur:
+                    cur.execute(
+                        "UPDATE signals SET status = 'QUEUE_FULL' WHERE signal_id = ?",
+                        (signal_id,),
+                    )
+            except Exception as upd_exc:
+                self._log.error(f"Failed to mark QUEUE_FULL for {signal_id}: {upd_exc}")
+            # M-S2: QUEUE_FULL is backpressure, NOT a duplicate. Roll back the fast-path
+            # dedup CACHE claim written above so the sender's 503 retry passes the cache
+            # check and reaches the re-accept path (the DB QUEUE_FULL row is recognised
+            # there and re-queued). Without this the retry is bounced as DUPLICATE for the
+            # whole dedup window and backpressure recovery is impossible.
+            with self._dedup_lock:
+                self._dedup_cache.pop(dedup_key, None)
+            self._release_in_flight(symbol)
+            return {"symbol": symbol, "status": "QUEUE_FULL"}
+
+        # Claim already recorded atomically above; signal_processor will
+        # release on completion.
+        return {"symbol": symbol, "status": "ACCEPTED", "signal_id": signal_id}
+
+    def _claim_in_flight(self, symbol: str) -> bool:
+        """
+        M-1 / FIX-011: atomically claim `symbol` as in-flight. Returns True if
+        newly claimed; False if already present. Stores a dict with both
+        acquired_at and heartbeat_at timestamps. Caller MUST call
+        _release_in_flight(symbol) on any reject path after a successful
+        claim (DUPLICATE / QUEUE_FULL / IntegrityError). On accepted path,
+        signal_processor's release_in_flight() handles cleanup.
+        """
+        with self._in_flight_lock:
+            if symbol in self._in_flight:
+                return False
+            now_mono = time.monotonic()
+            self._in_flight[symbol] = {
+                'acquired_at': now_mono,
+                'heartbeat_at': now_mono,
+            }
+            return True
+
+    def _release_in_flight(self, symbol: str) -> None:
+        """Internal: remove symbol from the in-flight dict (M-1)."""
+        with self._in_flight_lock:
+            self._in_flight.pop(symbol, None)
+
+    # ------------------------------------------------------------------
+    # In-flight management (WR17)
+    # ------------------------------------------------------------------
+
+    def release_in_flight(self, symbol: str) -> None:
+        """
+        Remove symbol from the in-flight set.
+        Called by signal_processor when it finishes processing a signal.
+        """
+        with self._in_flight_lock:
+            self._in_flight.pop(symbol, None)
+
+    def update_heartbeat(self, symbol: str) -> None:
+        """
+        FIX-011: Update the heartbeat timestamp for an in-flight symbol.
+        Called by signal_processor at checkpoints during processing to prove
+        the worker is still alive. If symbol is not in-flight (already released
+        or never claimed), silently no-op.
+        """
+        with self._in_flight_lock:
+            entry = self._in_flight.get(symbol)
+            if entry is not None:
+                entry['heartbeat_at'] = time.monotonic()
+
+    # ------------------------------------------------------------------
+    # Audit logging (WR13)
+    # ------------------------------------------------------------------
+
+    def _write_audit(
+        self,
+        scanner_name: str,
+        source_ip: str,
+        payload_size_bytes: int,
+        response_code: int,
+        signals_accepted: int,
+        signals_rejected: int,
+        duration_ms: int,
+    ) -> None:
+        ts = now_ist().isoformat()
+        try:
+            with self._store.transaction() as cur:
+                cur.execute(
+                    """
+                    INSERT INTO webhook_audit
+                      (ts, scanner_name, source_ip, payload_size_bytes,
+                       response_code, signals_accepted, signals_rejected,
+                       duration_ms)
+                    VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+                    """,
+                    (
+                        ts, scanner_name, source_ip, payload_size_bytes,
+                        response_code, signals_accepted, signals_rejected,
+                        duration_ms,
+                    ),
+                )
+        except Exception as exc:
+            self._log.error(f"Failed to write webhook_audit row: {exc}")
+
+    def set_eod_capture(self, eod_capture) -> None:
+        """V3 Step 10b: late-bind the WatchlistCaptureWorker (built after the receiver,
+        once the shared fetch closure exists — same late-binding pattern as
+        signal_processor.set_v3_chain). None keeps EOD alerts a fail-safe miss."""
+        self._eod_capture = eod_capture
+
+    # ------------------------------------------------------------------
+    # Shutdown (WR12)
+    # ------------------------------------------------------------------
+
+    def stop(self) -> None:
+        """
+        Graceful shutdown hook. Called by main.py shutdown handler BEFORE
+        signal_processor.stop() so new webhooks see 503 while in-flight
+        requests drain naturally (H-16).
+        """
+        self._shutting_down.set()
+        self._sweeper_stop.set()
+        self._log.info(
+            "WebhookReceiver.stop() called; new requests will return 503"
+        )
+
+    # ------------------------------------------------------------------
+    # In-flight sweeper (HIGH #9)
+    # ------------------------------------------------------------------
+
+    def _run_sweeper(self) -> None:
+        """
+        FIX-011: Background daemon that evicts in_flight entries with no
+        heartbeat for >60s. Runs every 60s. A lock that has been held for
+        400s but continues heartbeating is NOT evicted (active processing).
+        A lock with no heartbeat for 60s IS evicted (stalled worker).
+        """
+        while not self._sweeper_stop.wait(timeout=60.0):
+            now_mono = time.monotonic()
+            evicted = []
+            with self._in_flight_lock:
+                for sym, entry in list(self._in_flight.items()):
+                    heartbeat_at = entry['heartbeat_at']
+                    if now_mono - heartbeat_at > self._in_flight_timeout_sec:
+                        evicted.append((sym, entry['acquired_at'], heartbeat_at))
+                for sym, _, _ in evicted:
+                    del self._in_flight[sym]
+            for sym, acquired_at, heartbeat_at in evicted:
+                held_sec = now_mono - acquired_at
+                stall_sec = now_mono - heartbeat_at
+                self._log.critical(
+                    "in_flight_sweeper: evicted STALLED symbol %s "
+                    "(held=%.0fs, no heartbeat for %.0fs); "
+                    "signal_processor worker likely crashed or deadlocked",
+                    sym, held_sec, stall_sec,
+                )

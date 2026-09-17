@@ -1,0 +1,96 @@
+# ──────────────────────────────────────────────────────────────────────────────
+# Trading System v2 — .gitignore
+# ──────────────────────────────────────────────────────────────────────────────
+
+# Credentials — NEVER commit
+.env
+env
+# Rotated-credential spreadsheet — plaintext seeds, must NEVER be committable
+# (the C-1 secret scanner does not scan .xlsx; gitignore + deletion are the controls)
+credentials.xlsx
+
+# SQLite databases
+*.db
+*.db-journal
+*.db-shm
+*.db-wal
+data_store/
+
+# Logs
+logs/
+*.log
+
+# Generated reports
+reports/daily/
+reports/output/*.xlsx
+# A base64-of-XLSX .txt walked straight past the *.xlsx rule above and committed a
+# 1.44 MB report — with real trade data in it — into the repo. Ignore the ENCODED forms
+# too, not just the extension: the rule protects the DATA, not the suffix.
+reports/output/*_b64.txt
+reports/output/*.b64
+reports/output/*.xlsx.txt
+reports/system_manager/
+reports/cron_officer/
+
+# Generated data (regenerated on the VM daily by refresh_instruments.py;
+# must NOT be git-tracked or the deploy hook's `git checkout -f` silently
+# reverts the VM's fresh copy to the committed version — instruments staleness
+# incident 21-Jun-2026).
+config/instruments.csv
+
+# System manuals (Word docs synced to VM out-of-band, not via git)
+docs/system_manuals/*.docx
+
+# Python
+__pycache__/
+*.py[cod]
+*.pyo
+*.pyd
+.Python
+*.egg-info/
+dist/
+build/
+*.egg
+
+# Virtual environments
+venv/
+.venv/
+env/
+.env/
+
+# pytest cache
+.pytest_cache/
+.coverage
+htmlcov/
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Temporary files
+*.tmp
+*.bak
+
+# Claude Code internals
+memory/
+# RETIRED 04-Aug-2026 (D5 / R13) — but the ignore STAYS, deliberately.
+# The file is still on disk and is PC-local; dropping this line would surface it
+# as untracked in every `git status` and risk committing it by accident.
+# ⛔ Retiring an artifact is NOT the same act as making it committable.
+# Its one piece of unique content (F1–F9) was migrated verbatim first, to
+# ops_dashboard/docs/F_BACKLOG.md — that migration is what made the retirement safe.
+mempalace.yaml
+CLAUDE_md_and_explanations.txt
+.claude/settings.local.json
+
+sats/
+
+# GUI redesign design-spec source .txt (consumed by the completed G5 redesign;
+# Audit-B Phase-1 flagged gui/ as untracked debt). Kept local, not deployed.
+gui/
